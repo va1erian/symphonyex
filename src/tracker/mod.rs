@@ -1,5 +1,7 @@
 //! Issue tracker adapter boundary (Section 11): a small portable read kernel.
 
+pub mod depends_on;
+pub mod github;
 pub mod local;
 
 use crate::domain::Issue;
@@ -13,9 +15,8 @@ pub enum TrackerError {
     UnsupportedTrackerKind(String),
     #[error("invalid_tracker_config: {0}")]
     InvalidTrackerConfig(String),
-    /// Reserved for adapters with secrets (Section 15.3); the bundled `local` adapter
-    /// has none.
-    #[allow(dead_code)]
+    /// Section 15.3: an adapter with a secret (e.g. `github`'s API token) that's
+    /// missing/empty. The bundled `local` adapter has no secrets and never returns this.
     #[error("missing_tracker_secret: {0}")]
     MissingTrackerSecret(String),
     #[error("tracker_request: {0}")]
@@ -98,8 +99,9 @@ pub fn build(
             provider,
             workflow_dir,
         )?)),
+        "github" => Ok(Box::new(github::GithubTrackerAdapter::new(provider)?)),
         other => Err(TrackerError::UnsupportedTrackerKind(other.to_string())),
     }
 }
 
-pub const SUPPORTED_TRACKER_KINDS: &[&str] = &["local"];
+pub const SUPPORTED_TRACKER_KINDS: &[&str] = &["local", "github"];

@@ -628,6 +628,28 @@ async fn abort_and_run_after_run(
     handle.abort();
     let _ = handle.await; // resolves once the task has truly finished, Err(Cancelled) is expected
 
+    // No live `Workspace` handle here (only `identifier`), so the container -- if
+    // Docker mode is enabled -- is re-derived by name rather than looked up; this is
+    // safe because the name is deterministic (`container::derive_container_name`) and
+    // the container's lifecycle is still owned by `WorkspaceManager`, which hasn't
+    // torn it down yet at this point in `terminate_running`/`reconcile_stalled`.
+    let container = docker_container_for(shared, identifier);
+
+    // In container mode, `handle.await` above only guarantees the *task* finished --
+    // the agent turn's own `ContainerKillGuard` cleanup (for the in-container `claude`
+    // process, as opposed to the host-side `docker exec` client `kill_on_drop`
+    // already handles) runs from that guard's `Drop`, which can only `tokio::spawn` a
+    // detached fire-and-forget kill since `Drop` can't be `async`. That gives no
+    // guarantee the in-container process is actually dead yet -- issue our own
+    // explicitly-awaited kill here too before touching anything that assumes it is
+    // (namely `after_run` below, e.g. `git commit && git push`), closing the same
+    // class of race this function's own `handle.await` above already closes at the
+    // host level (see this function's top-level doc comment and the AR-8 incident it
+    // references).
+    if let Some(c) = &container {
+        container::kill_process_by_name(&c.name, shared.config.effective_command()).await;
+    }
+
     let Some(script) = &shared.config.hook_after_run else {
         return;
     };
@@ -635,12 +657,6 @@ async fn abort_and_run_after_run(
     if !path.is_dir() {
         return;
     }
-    // No live `Workspace` handle here (only `identifier`), so the container -- if
-    // Docker mode is enabled -- is re-derived by name rather than looked up; this is
-    // safe because the name is deterministic (`container::derive_container_name`) and
-    // the container's lifecycle is still owned by `WorkspaceManager`, which hasn't
-    // torn it down yet at this point in `terminate_running`/`reconcile_stalled`.
-    let container = docker_container_for(shared, identifier);
     if let Err(e) = hooks::run_hook_maybe_containerized(
         "after_run",
         script,

@@ -22,6 +22,18 @@ pub enum ConfigError {
         "invalid_config: workspace.docker.image is required when workspace.docker.enabled is true"
     )]
     MissingDockerImage,
+    #[error(
+        "invalid_config: repo.token must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidRepoToken,
+    #[error("invalid_config: repo.url is required when the repo block is present")]
+    MissingRepoUrl,
+    #[error(
+        "invalid_config: workspace.docker.enabled is not supported with agent.backend=codex yet \
+         (Docker mode only runs the Claude backend's turns inside the container -- Codex always \
+         runs on the host regardless -- so enabling both silently doesn't do what it looks like)"
+    )]
+    DockerNotSupportedForCodex,
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -79,6 +91,25 @@ pub struct DockerConfig {
     pub cpus: Option<String>,
 }
 
+/// Extension: git-repo-as-first-class-input (see README.md "Git repo as first-class
+/// input"). When set, and a project hasn't supplied its own `hooks.after_create` /
+/// `before_run` / `after_run`, `resolve()` synthesizes the clone/pull/commit-push
+/// sequence a project would otherwise have to hand-write (as bsky-archiver's
+/// `WORKFLOW.md` originally did) -- see `synthesize_repo_hooks` below. An explicit
+/// `hooks.*` entry always wins over the synthesized default.
+#[derive(Debug, Clone)]
+pub struct RepoConfig {
+    pub url: String,
+    pub default_branch: String,
+    /// Name of an env var holding the git credential (no leading `$`), e.g.
+    /// `GITHUB_TOKEN`. Deliberately *not* resolved to its value here: the synthesized
+    /// hook script references the var by name in a generated `git config
+    /// credential.helper`, so the secret value only ever needs to exist in the hook's
+    /// own process environment (which it already inherits from Symphony's), never as
+    /// a value Symphony itself holds or embeds in a URL/script body.
+    pub token_env: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker_kind: String,
@@ -95,6 +126,12 @@ pub struct EffectiveConfig {
 
     pub workspace_root: PathBuf,
     pub docker: DockerConfig,
+    /// Only consumed by hook synthesis (`synthesize_repo_hooks`) so far -- kept on the
+    /// resolved config too since daemonized Symphony (Docker-outside-of-Docker mode)
+    /// will also need `repo.url` directly to know what to clone into its own
+    /// named-volume mount at startup.
+    #[allow(dead_code)]
+    pub repo: Option<RepoConfig>,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -205,6 +242,39 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         return Err(ConfigError::InvalidHookTimeout);
     }
 
+    let repo_cfg = get(config, "repo")
+        .map(|r| -> Result<RepoConfig, ConfigError> {
+            let url = get_str(r, "url").ok_or(ConfigError::MissingRepoUrl)?;
+            let default_branch = get_str(r, "default_branch").unwrap_or_else(|| "main".to_string());
+            let token_env = get_str(r, "token")
+                .map(|t| {
+                    envsub::var_name_of(&t)
+                        .map(|s| s.to_string())
+                        .ok_or(ConfigError::InvalidRepoToken)
+                })
+                .transpose()?;
+            Ok(RepoConfig {
+                url,
+                default_branch,
+                token_env,
+            })
+        })
+        .transpose()?;
+
+    // An explicit `hooks.*` entry always wins, per-hook (not all-or-nothing) -- a
+    // project can override just one of the three and still get the synthesized
+    // defaults for the others.
+    let (synth_after_create, synth_before_run, synth_after_run) = match &repo_cfg {
+        Some(repo) => {
+            let (c, b, a) = synthesize_repo_hooks(repo);
+            (Some(c), Some(b), Some(a))
+        }
+        None => (None, None, None),
+    };
+    let hook_after_create = get_str(hooks, "after_create").or(synth_after_create);
+    let hook_before_run = get_str(hooks, "before_run").or(synth_before_run);
+    let hook_after_run = get_str(hooks, "after_run").or(synth_after_run);
+
     let max_turns = get_u64(agent, "max_turns", 20);
     if max_turns == 0 {
         return Err(ConfigError::InvalidMaxTurns);
@@ -264,10 +334,11 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
 
         workspace_root,
         docker: docker_cfg,
+        repo: repo_cfg,
 
-        hook_after_create: get_str(hooks, "after_create"),
-        hook_before_run: get_str(hooks, "before_run"),
-        hook_after_run: get_str(hooks, "after_run"),
+        hook_after_create,
+        hook_before_run,
+        hook_after_run,
         hook_before_remove: get_str(hooks, "before_remove"),
         hook_timeout_ms,
 
@@ -282,6 +353,70 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     };
 
     Ok(cfg)
+}
+
+/// Synthesize `(after_create, before_run, after_run)` hook scripts for `repo` --
+/// always a per-ticket branch (`issue-$name`, `$name` = the workspace directory name,
+/// i.e. the sanitized identifier: see `workspace::derive_workspace_key`), never
+/// pushed straight to `default_branch`. A generic daemon can't know in advance
+/// whether tickets are safely sequential or genuinely parallel the way a
+/// hand-authored WORKFLOW.md can (see bsky-archiver's own hooks, which *did* push
+/// directly to `main` for its known-sequential chain) -- always branching is the
+/// conservative default that's safe either way; merging back is left to the operator
+/// or a future PR-automation feature, not this synthesis.
+///
+/// Mirrors every hard-won lesson from this session's hand-written hooks: a loud
+/// `exit 1` on push failure (never `|| true` on that specific line -- a failed push
+/// must not report success), and an `is-inside-work-tree` guard so a silently-failed
+/// `after_create` fails loudly on the next hook instead of quietly no-op'ing.
+///
+/// Credential handling: `-c credential.helper=...` scoped to just the `clone`
+/// invocation (no `.git` exists yet to scope a repo-local config value to), then
+/// persisted as a repo-local (not `--global`) config value so `before_run`/`after_run`
+/// -- separate hook invocations against the same already-cloned workspace -- pick it
+/// up automatically. The helper script references the credential by *env var name*,
+/// never embeds the resolved secret value in the generated script text.
+fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
+    let branch = &repo.default_branch;
+    let url = &repo.url;
+
+    let after_create = match &repo.token_env {
+        Some(var) => format!(
+            "name=\"$(basename \"$PWD\")\"\n\
+             cred_helper='!f() {{ echo username=x-access-token; echo \"password=${var}\"; }}; f'\n\
+             git -c credential.helper=\"$cred_helper\" clone \"{url}\" .\n\
+             git config credential.helper \"$cred_helper\"\n\
+             git checkout -b \"issue-$name\" \"origin/{branch}\"\n"
+        ),
+        None => format!(
+            "name=\"$(basename \"$PWD\")\"\n\
+             git clone \"{url}\" .\n\
+             git checkout -b \"issue-$name\" \"origin/{branch}\"\n"
+        ),
+    };
+
+    let before_run = "name=\"$(basename \"$PWD\")\"\n\
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n\
+        \x20\x20echo \"FATAL: workspace is not a git repository (after_create must have failed silently)\" >&2\n\
+        \x20\x20exit 1\n\
+        fi\n\
+        git pull --ff-only origin \"issue-$name\" || true\n"
+        .to_string();
+
+    let after_run = "name=\"$(basename \"$PWD\")\"\n\
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n\
+        \x20\x20echo \"FATAL: workspace is not a git repository (after_create must have failed silently)\" >&2\n\
+        \x20\x20exit 1\n\
+        fi\n\
+        git add -A\n\
+        git commit -m \"symphony: $name\" -q --allow-empty-message || true\n\
+        if ! git push origin \"HEAD:refs/heads/issue-$name\" -q; then\n\
+        \x20\x20echo \"FATAL: git push failed -- this attempt's work did NOT reach the shared repo\" >&2\n\
+        \x20\x20exit 1\n\
+        fi\n"
+        .to_string();
+
+    (after_create, before_run, after_run)
 }
 
 fn default_workspace_root() -> String {
@@ -311,8 +446,13 @@ pub fn validate_for_dispatch(
             backend: backend.to_string(),
         });
     }
-    if cfg.docker.enabled && cfg.docker.image.as_deref().unwrap_or("").trim().is_empty() {
-        return Err(ConfigError::MissingDockerImage);
+    if cfg.docker.enabled {
+        if cfg.docker.image.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(ConfigError::MissingDockerImage);
+        }
+        if cfg.agent_backend == AgentBackendKind::Codex {
+            return Err(ConfigError::DockerNotSupportedForCodex);
+        }
     }
     Ok(())
 }
@@ -320,6 +460,20 @@ pub fn validate_for_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    /// `C:\Users\x` -> `/mnt/c/Users/x`, for handing a local path to WSL's `git` in
+    /// tests (see `synthesized_hooks_actually_clone_branch_commit_and_push`).
+    fn to_wsl_path(p: &Path) -> String {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if let Some(drive) = s.chars().next()
+            && s.as_bytes().get(1) == Some(&b':')
+        {
+            format!("/mnt/{}{}", drive.to_ascii_lowercase(), &s[2..])
+        } else {
+            s
+        }
+    }
 
     fn parse_yaml(s: &str) -> Value {
         serde_yaml::from_str(s).unwrap()
@@ -364,6 +518,189 @@ mod tests {
     }
 
     #[test]
+    fn repo_absent_by_default_and_hooks_stay_unset() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.repo.is_none());
+        assert!(cfg.hook_after_create.is_none());
+        assert!(cfg.hook_before_run.is_none());
+        assert!(cfg.hook_after_run.is_none());
+    }
+
+    #[test]
+    fn repo_synthesizes_all_three_hooks_with_credential_helper() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             default_branch: main\n  token: $GITHUB_TOKEN\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let create = cfg.hook_after_create.unwrap();
+        assert!(create.contains("clone \"https://github.com/o/r.git\""));
+        assert!(create.contains("origin/main"));
+        assert!(create.contains("$GITHUB_TOKEN"));
+        assert!(create.contains("credential.helper"));
+
+        let before = cfg.hook_before_run.unwrap();
+        assert!(before.contains("is-inside-work-tree"));
+        assert!(before.contains("git pull --ff-only origin \"issue-$name\""));
+
+        let after = cfg.hook_after_run.unwrap();
+        assert!(after.contains("git push origin \"HEAD:refs/heads/issue-$name\" -q"));
+        assert!(after.contains("is-inside-work-tree"));
+        // FATAL guard comes before the push, not after.
+        assert!(after.find("is-inside-work-tree").unwrap() < after.find("git push").unwrap());
+    }
+
+    #[test]
+    fn repo_without_token_synthesizes_hooks_with_no_credential_helper() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://example.com/r.git\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let create = cfg.hook_after_create.unwrap();
+        assert!(!create.contains("credential.helper"));
+        assert!(create.contains("origin/main")); // default_branch defaults to "main"
+    }
+
+    #[test]
+    fn explicit_hook_wins_over_synthesized_default_per_hook() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n\
+             hooks:\n  before_run: echo custom\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        // before_run explicitly overridden...
+        assert_eq!(cfg.hook_before_run.as_deref(), Some("echo custom"));
+        // ...but after_create/after_run still get synthesized since they weren't set.
+        assert!(cfg.hook_after_create.unwrap().contains("git clone"));
+        assert!(cfg.hook_after_run.unwrap().contains("git push"));
+    }
+
+    #[test]
+    fn repo_token_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  token: not-a-var\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidRepoToken)
+        ));
+    }
+
+    /// End-to-end: actually *run* the synthesized hooks (via `hooks::run_hook`, the
+    /// same execution path the orchestrator uses) against a real local git repo --
+    /// string-content assertions above prove the scripts *look* right, this proves
+    /// they *work*: clone, branch, commit+push, pull-into-existing-clone all actually
+    /// succeed as real git operations, not just plausible-looking bash.
+    #[tokio::test]
+    async fn synthesized_hooks_actually_clone_branch_commit_and_push() {
+        let origin = tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::fs::write(origin.path().join("README.md"), "hello\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        // Accept a push into the currently checked-out branch (this "origin" repo is
+        // acting as a bare-ish shared remote for the test, mirroring how the real
+        // mainline `app/` repo is configured -- see workspace.rs's Docker-mode test
+        // for the same pattern).
+        std::process::Command::new("git")
+            .args(["config", "receive.denyCurrentBranch", "updateInstead"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+
+        // hooks.rs's `bash` resolves to WSL on this machine (see hooks.rs's own module
+        // doc comment) -- WSL's git has no concept of Windows drive letters, so the
+        // clone source has to be spelled as a `/mnt/c/...` path, not the Windows-style
+        // path `tempdir()` returns (see README.md's "ssh: Could not resolve hostname
+        // c" note; this is the exact same class of bug, just hit by this test's setup
+        // rather than by a real `https://` `repo.url`, which has no such ambiguity).
+        let origin_wsl_path = to_wsl_path(origin.path());
+        let cfg_yaml = parse_yaml(&format!(
+            "tracker:\n  kind: local\nrepo:\n  url: {origin_wsl_path:?}\n  default_branch: main\n"
+        ));
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let ws_named = origin.path().parent().unwrap().join("42");
+        std::fs::create_dir_all(&ws_named).unwrap();
+
+        crate::hooks::run_hook(
+            "after_create",
+            cfg.hook_after_create.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+        assert!(ws_named.join("README.md").exists());
+
+        std::fs::write(ws_named.join("new_file.txt"), "work\n").unwrap();
+
+        crate::hooks::run_hook(
+            "after_run",
+            cfg.hook_after_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+
+        crate::hooks::run_hook(
+            "before_run",
+            cfg.hook_before_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+
+        // The push in after_run must have actually reached "origin" on the per-ticket
+        // branch (not "main" -- updateInstead only refreshes the working tree for
+        // pushes to the *currently checked-out* branch, which stays "main" here, so
+        // check the pushed branch's own content directly instead).
+        let show = std::process::Command::new("git")
+            .args(["show", "issue-42:new_file.txt"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        assert!(
+            show.status.success(),
+            "after_run's push should have created branch issue-42 on origin with new_file.txt: {}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+
+        let _ = std::fs::remove_dir_all(&ws_named);
+    }
+
+    #[test]
+    fn repo_missing_url_errors() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nrepo:\n  default_branch: main\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::MissingRepoUrl)
+        ));
+    }
+
+    #[test]
     fn docker_disabled_by_default() {
         let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
@@ -392,6 +729,19 @@ mod tests {
         assert!(matches!(
             validate_for_dispatch(&cfg, &["local"]),
             Err(ConfigError::MissingDockerImage)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_docker_enabled_with_codex_backend() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: codex\nworkspace:\n  docker:\n    \
+             enabled: true\n    image: some-image:latest\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(matches!(
+            validate_for_dispatch(&cfg, &["local"]),
+            Err(ConfigError::DockerNotSupportedForCodex)
         ));
     }
 

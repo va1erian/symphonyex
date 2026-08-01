@@ -36,25 +36,19 @@
 //! `update_issue_state`, so the coding agent can move an issue forward (e.g. to `done`)
 //! without touching tracker files directly (Section 11.5) — see `execute_agent_tool`.
 
+use super::depends_on::{RawIssue, resolve_dependencies};
 use super::{ToolResult, ToolSpec, TrackerAdapter, TrackerError};
-use crate::domain::{BlockerRef, Issue};
+use crate::domain::Issue;
 use crate::envsub;
 use crate::frontmatter;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use serde_yaml::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub struct LocalTrackerAdapter {
     dir: PathBuf,
-}
-
-/// One successfully parsed file, before cross-issue `depends_on` resolution.
-struct RawIssue {
-    issue: Issue,
-    depends_on: Vec<String>,
 }
 
 /// `(filename stem, parsed issue or error message)` for one candidate file.
@@ -336,44 +330,6 @@ fn parse_issue_file(path: &Path) -> Result<RawIssue, String> {
         },
         depends_on,
     })
-}
-
-/// Second pass: AND `dispatchable` with "every `depends_on` target is at state `done`",
-/// and populate `blocked_by` for whichever dependencies aren't satisfied yet.
-fn resolve_dependencies(raw: Vec<(String, Result<RawIssue, String>)>) -> Vec<ParsedEntry> {
-    let state_by_identifier: HashMap<String, String> = raw
-        .iter()
-        .filter_map(|(_, r)| r.as_ref().ok())
-        .map(|r| (r.issue.identifier.clone(), r.issue.normalized_state()))
-        .collect();
-
-    raw.into_iter()
-        .map(|(key, r)| {
-            let r = r.map(|mut raw_issue| {
-                if raw_issue.depends_on.is_empty() {
-                    return raw_issue.issue;
-                }
-                let mut blockers = Vec::new();
-                let mut all_satisfied = true;
-                for dep in &raw_issue.depends_on {
-                    let dep_state = state_by_identifier.get(dep.as_str()).cloned();
-                    let satisfied = dep_state.as_deref() == Some("done");
-                    if !satisfied {
-                        all_satisfied = false;
-                        blockers.push(BlockerRef {
-                            id: None,
-                            identifier: Some(dep.clone()),
-                            state: dep_state,
-                        });
-                    }
-                }
-                raw_issue.issue.blocked_by = blockers;
-                raw_issue.issue.dispatchable = raw_issue.issue.dispatchable && all_satisfied;
-                raw_issue.issue
-            });
-            (key, r)
-        })
-        .collect()
 }
 
 #[cfg(test)]

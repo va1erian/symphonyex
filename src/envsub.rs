@@ -17,6 +17,15 @@ pub fn resolve_var(value: &str) -> Option<String> {
     }
 }
 
+/// If `value` is exactly `$VAR_NAME`-shaped, return the bare name (no `$`). Exposed
+/// (not just used internally by `resolve_var`) for callers that need the *name* of an
+/// env var rather than its resolved value -- e.g. `config::RepoConfig`'s synthesized
+/// git hooks reference the var by name in a generated shell script rather than
+/// resolving and embedding the secret value directly.
+pub fn var_name_of(value: &str) -> Option<&str> {
+    var_name(value)
+}
+
 fn var_name(value: &str) -> Option<&str> {
     let rest = value.strip_prefix('$')?;
     if !rest.is_empty()

@@ -53,7 +53,18 @@ pub async fn run_hook(
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Without this, a hook that times out (or whose future is otherwise dropped
+        // before completion) leaves its `bash` process running orphaned and
+        // undetected -- `tokio::time::timeout` racing `wait_with_output()` only stops
+        // *waiting* on the child, it doesn't touch the child itself. `kill_on_drop`
+        // makes dropping the `Child` (which happens on this function's every early
+        // return) actually terminate it. Note this still can't reach a *grandchild*
+        // the script backgrounded with `&`, and on this machine `bash` may resolve to
+        // WSL's launcher (see this module's own doc comment) -- killing the Windows-
+        // side launcher process doesn't necessarily terminate what's running inside
+        // the WSL VM. A real, if partial, improvement over killing nothing at all.
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| HookError::Spawn(e.to_string()))?;
 

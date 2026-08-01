@@ -280,7 +280,14 @@ pub async fn exec(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Kills the *local* `docker exec` client on drop/timeout -- necessary but not
+        // sufficient. Unlike a host process tree, though, we can reliably finish the
+        // job here: on the timeout path below, `kill_process_by_name` reaches into the
+        // container's own PID namespace via a second `docker exec ... pkill`, so the
+        // program actually running inside the container gets killed too, not just the
+        // client that was attached to it.
+        .kill_on_drop(true);
 
     let mut child = cmd
         .spawn()
@@ -320,7 +327,16 @@ pub async fn exec(
             }
         }
         Ok(Err(e)) => Err(ContainerError::Spawn(e.to_string())),
-        Err(_) => Err(ContainerError::Timeout(timeout_ms)),
+        Err(_) => {
+            // `kill_on_drop` above only kills the local `docker exec` client, which
+            // does not terminate the process it was attached to inside the container
+            // -- explicitly reach in and kill that too before reporting the timeout,
+            // so a caller that treats a returned error as "it's stopped now" (e.g.
+            // `hooks::run_hook_maybe_containerized`'s callers) isn't racing a
+            // still-running in-container process.
+            kill_process_by_name(container, program).await;
+            Err(ContainerError::Timeout(timeout_ms))
+        }
     }
 }
 
@@ -465,6 +481,49 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("marker.txt")).unwrap();
         assert_eq!(contents.trim(), "hi");
+
+        remove(name).await;
+    }
+
+    /// Regression test for a real bug: `exec` used to return `Timeout` without killing
+    /// anything, leaving the in-container process running orphaned. Proves the fix
+    /// actually works, not just that it compiles: start a long-`sleep`, let it time
+    /// out quickly, then independently check *inside the container* that the process
+    /// is actually gone shortly after.
+    #[tokio::test]
+    #[ignore]
+    async fn exec_timeout_actually_kills_the_in_container_process() {
+        assert!(
+            docker_available().await,
+            "docker must be available for this test"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let name = "symphony-test-exec-timeout-kill";
+        remove(name).await;
+
+        let handle = ensure_running(
+            "debian:bookworm-slim",
+            name,
+            dir.path(),
+            Path::new("/project"),
+            "bridge",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = exec_script(&handle, Path::new("/project"), "sleep 30", 1_000).await;
+        assert!(matches!(result, Err(ContainerError::Timeout(_))));
+
+        // Give the follow-up pkill a brief moment to land, then check independently
+        // (not via exec_script, to avoid testing the fix with the same mechanism).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let still_running = run_docker(&["exec", name, "pgrep", "-f", "sleep 30"], "pgrep").await;
+        assert!(
+            still_running.is_err(),
+            "the sleep process should have been killed inside the container after the exec timeout"
+        );
 
         remove(name).await;
     }

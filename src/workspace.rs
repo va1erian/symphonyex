@@ -92,6 +92,17 @@ fn validate_containment(root: &Path, path: &Path) -> Result<(), WorkspaceError> 
     }
 }
 
+/// Marks a workspace directory as having successfully completed `after_create`, so
+/// `create_for_issue` can tell "already initialized" apart from "directory exists but
+/// was never actually set up" (e.g. left behind by a crash between `create_dir_all`
+/// and a completed `after_create`, or stale debris from an earlier run). Directory
+/// existence alone isn't a safe signal for this: a real production incident this
+/// session (bsky-archiver's `AR-12`) hit exactly this case -- a stale empty directory
+/// caused `after_create` to be silently skipped forever, so every subsequent
+/// `before_run` failed identically on every retry with no path to recovery short of
+/// manual intervention.
+const INIT_MARKER: &str = ".symphony-initialized";
+
 pub struct WorkspaceManager {
     root: PathBuf,
     docker: Option<DockerContext>,
@@ -118,10 +129,12 @@ impl WorkspaceManager {
     }
 
     /// Create or reuse the workspace for `identifier` (Section 9.2). Runs `after_create`
-    /// only when the directory did not already exist; hook failure removes the
-    /// partially-prepared directory and fails workspace creation. In Docker mode, also
-    /// ensures the ticket's container is running (idempotent, safe to call on every
-    /// dispatch/retry, not just first creation) before `after_create` runs inside it.
+    /// only when it hasn't successfully completed before (tracked via a marker file,
+    /// not directory existence -- see `INIT_MARKER`'s doc comment for why); hook
+    /// failure removes the partially-prepared directory and fails workspace creation.
+    /// In Docker mode, also ensures the ticket's container is running (idempotent,
+    /// safe to call on every dispatch/retry, not just first creation) before
+    /// `after_create` runs inside it.
     pub async fn create_for_issue(
         &self,
         identifier: &str,
@@ -132,14 +145,16 @@ impl WorkspaceManager {
         let path = self.root.join(&workspace_key);
         validate_containment(&self.root, &path)?;
 
-        let created_now = !path.exists();
-        if created_now {
+        if !path.exists() {
             tokio::fs::create_dir_all(&path)
                 .await
                 .map_err(|e| WorkspaceError::Create(path.clone(), e.to_string()))?;
         } else if !path.is_dir() {
             return Err(WorkspaceError::NotADirectory(path));
         }
+
+        let marker = path.join(INIT_MARKER);
+        let created_now = !marker.exists();
 
         let container = match &self.docker {
             None => None,
@@ -160,28 +175,39 @@ impl WorkspaceManager {
             }
         };
 
-        if created_now && let Some(script) = after_create_hook {
-            let result = match &container {
-                None => hooks::run_hook("after_create", script, &path, hook_timeout_ms).await,
-                Some(c) => {
-                    let docker_ctx = self
-                        .docker
-                        .as_ref()
-                        .expect("container implies docker context");
-                    hooks::run_hook_maybe_containerized(
-                        "after_create",
-                        script,
-                        &docker_ctx.workflow_dir,
-                        &path,
-                        hook_timeout_ms,
-                        Some(c),
-                    )
-                    .await
+        if created_now {
+            if let Some(script) = after_create_hook {
+                let result = match &container {
+                    None => hooks::run_hook("after_create", script, &path, hook_timeout_ms).await,
+                    Some(c) => {
+                        let docker_ctx = self
+                            .docker
+                            .as_ref()
+                            .expect("container implies docker context");
+                        hooks::run_hook_maybe_containerized(
+                            "after_create",
+                            script,
+                            &docker_ctx.workflow_dir,
+                            &path,
+                            hook_timeout_ms,
+                            Some(c),
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = result {
+                    let _ = tokio::fs::remove_dir_all(&path).await;
+                    return Err(WorkspaceError::HookFailed(e));
                 }
-            };
-            if let Err(e) = result {
-                let _ = tokio::fs::remove_dir_all(&path).await;
-                return Err(WorkspaceError::HookFailed(e));
+            }
+            // Only written after a successful after_create (or immediately if there's
+            // no hook configured) -- a failed hook removes the directory above instead,
+            // so there's nothing to mark. Best-effort: a failed write just means
+            // after_create may run again next time, which is safe (if not perfectly
+            // idempotent for every possible hook script) and far better than the
+            // alternative of silently never running it again.
+            if let Err(e) = tokio::fs::write(&marker, b"").await {
+                tracing::warn!(?marker, error = %e, "failed to write workspace init marker (ignored)");
             }
         }
 
@@ -304,6 +330,39 @@ mod tests {
         let ws2 = mgr.create_for_issue("ABC-1", None, 5000).await.unwrap();
         assert!(!ws2.created_now);
         assert_eq!(ws1.path, ws2.path);
+    }
+
+    /// Regression test for a real production incident (bsky-archiver's `AR-12`, this
+    /// session): a workspace directory that exists but was never actually initialized
+    /// (crash between `create_dir_all` and a completed `after_create`, or -- as
+    /// happened -- leftover debris from an earlier run) must still run `after_create`
+    /// on the next `create_for_issue` call. The old `created_now = !path.exists()`
+    /// check treated "the directory exists" as "it's already initialized", so a
+    /// stale/incomplete directory silently skipped `after_create` forever, and every
+    /// subsequent `before_run` failed the same way on every retry with no path to
+    /// recovery short of manual intervention.
+    #[tokio::test]
+    async fn pre_existing_uninitialized_directory_still_runs_after_create() {
+        let root = tempdir().unwrap();
+        let mgr = WorkspaceManager::new(root.path().to_path_buf());
+
+        // Simulate the AR-12 scenario directly: the workspace directory already
+        // exists (as it would after a `create_dir_all` that succeeded but whose
+        // `after_create` never got the chance to run or complete), but is otherwise
+        // empty -- nothing marks it as initialized.
+        let key = derive_workspace_key("ABC-3");
+        std::fs::create_dir_all(root.path().join(&key)).unwrap();
+        assert!(root.path().join(&key).exists());
+
+        let ws = mgr
+            .create_for_issue("ABC-3", Some("echo initialized >> marker.txt"), 5000)
+            .await
+            .unwrap();
+
+        assert!(
+            ws.path.join("marker.txt").exists(),
+            "after_create should have run against the pre-existing but uninitialized directory"
+        );
     }
 
     /// End-to-end Docker-mode check against a real daemon: `after_create` must run
