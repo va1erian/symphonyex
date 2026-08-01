@@ -91,25 +91,71 @@ async fn run_visible(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Copy just the host's current WORKFLOW.md into its corresponding path inside the
+/// volume. Unlike the rest of the volume's contents (repo clones, workspace state,
+/// `.symphony-initialized` markers -- real work product that must survive daemon
+/// restarts untouched), WORKFLOW.md is pure config: it should always reflect what's on
+/// the host, on every `daemon start`, not just the volume's very first seeding.
+/// Otherwise an edit to WORKFLOW.md (a changed setting, a new tracker config) silently
+/// has no effect on a resumed or restarted daemon, which keeps running off the stale
+/// in-volume copy.
+async fn sync_workflow_file(
+    volume: &str,
+    host_workflow_path: &Path,
+    workflow_rel: &str,
+    image: &str,
+    user: Option<&str>,
+) -> anyhow::Result<()> {
+    let host_mount = format!(
+        "{}:/host-workflow.md:ro",
+        to_docker_path(host_workflow_path)
+    );
+    let volume_mount = format!("{volume}:/project");
+    let dest = format!("/project/{workflow_rel}");
+    let script = match user {
+        Some(u) => format!(
+            "mkdir -p \"$(dirname '{dest}')\" && cp /host-workflow.md '{dest}' && chown {u} '{dest}'"
+        ),
+        None => format!("mkdir -p \"$(dirname '{dest}')\" && cp /host-workflow.md '{dest}'"),
+    };
+    run_visible(&[
+        "run",
+        "--rm",
+        "-v",
+        &host_mount,
+        "-v",
+        &volume_mount,
+        image,
+        "bash",
+        "-lc",
+        &script,
+    ])
+    .await
+}
+
 /// First `daemon start` for a project: the named volume starts empty, so seed it with
 /// whatever's currently on the host at `workflow_dir` (the same directory a
 /// non-daemonized run would use directly) via a one-shot helper container. Later
-/// starts see the volume already exists and leave it alone -- the whole point of a
-/// persistent named volume is that it survives across daemon restarts, so silently
-/// overwriting it with the host's current state every time would throw away whatever
-/// the daemon itself has since committed/pushed inside the container.
+/// starts see the volume already exists and leave the rest of it alone -- the whole
+/// point of a persistent named volume is that it survives across daemon restarts, so
+/// silently overwriting it with the host's current state every time would throw away
+/// whatever the daemon itself has since committed/pushed inside the container. The one
+/// exception is WORKFLOW.md itself, refreshed by `sync_workflow_file` even on this
+/// early-return path -- see its doc comment.
 async fn ensure_volume_seeded(
     volume: &str,
     workflow_dir: &Path,
+    host_workflow_path: &Path,
+    workflow_rel: &str,
     image: &str,
     user: Option<&str>,
 ) -> anyhow::Result<()> {
     if exists(&["volume", "inspect", volume]).await {
         tracing::info!(
             volume,
-            "daemon volume already exists, leaving its contents as-is"
+            "daemon volume already exists, leaving its contents as-is (except WORKFLOW.md, which is always refreshed)"
         );
-        return Ok(());
+        return sync_workflow_file(volume, host_workflow_path, workflow_rel, image, user).await;
     }
     tracing::info!(
         volume,
@@ -169,6 +215,22 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
              stop it first with `symphony daemon stop`"
         );
     }
+    // The workflow file's path *inside* the volume, mirroring its position relative
+    // to workflow_dir on the host -- almost always just "WORKFLOW.md" at the project
+    // root, but this stays correct if it's nested. Computed up front since both the
+    // resume branch below and volume seeding need it to keep the volume's copy of
+    // WORKFLOW.md in sync with the host.
+    let canonical_workflow_path = workflow_path
+        .canonicalize()
+        .unwrap_or_else(|_| workflow_path.to_path_buf());
+    let workflow_rel = canonical_workflow_path
+        .strip_prefix(&workflow_dir)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| "WORKFLOW.md".to_string());
+    let workflow_in_container = format!("/project/{workflow_rel}");
+
+    let volume = daemon_volume_name(&workflow_dir);
+
     // A container can exist-but-not-be-running after a previous `daemon stop` (which
     // only stops it, deliberately leaving it -- and its named volume -- intact rather
     // than removing it). `docker run --name` would fail with a name conflict against
@@ -176,26 +238,31 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
     // new one. This does mean a stopped daemon resumes with whatever port/env it was
     // originally started with, not any new flags passed to this `start` call -- to
     // pick up a changed image or port, remove the old container first (`docker rm
-    // <name>`) rather than just `daemon start` again.
+    // <name>`) rather than just `daemon start` again. WORKFLOW.md itself is still
+    // refreshed from the host on this path -- see `sync_workflow_file`.
     if exists(&["inspect", &name]).await {
+        sync_workflow_file(
+            &volume,
+            &canonical_workflow_path,
+            &workflow_rel,
+            image,
+            cfg.docker.user.as_deref(),
+        )
+        .await?;
         run_visible(&["start", &name]).await?;
         println!("Resumed existing daemon '{name}' (was stopped, not removed).");
         return Ok(());
     }
 
-    let volume = daemon_volume_name(&workflow_dir);
-    ensure_volume_seeded(&volume, &workflow_dir, image, cfg.docker.user.as_deref()).await?;
-
-    // The workflow file's path *inside* the volume, mirroring its position relative
-    // to workflow_dir on the host -- almost always just "WORKFLOW.md" at the project
-    // root, but this stays correct if it's nested.
-    let workflow_rel = workflow_path
-        .canonicalize()
-        .unwrap_or_else(|_| workflow_path.to_path_buf())
-        .strip_prefix(&workflow_dir)
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| "WORKFLOW.md".to_string());
-    let workflow_in_container = format!("/project/{workflow_rel}");
+    ensure_volume_seeded(
+        &volume,
+        &workflow_dir,
+        &canonical_workflow_path,
+        &workflow_rel,
+        image,
+        cfg.docker.user.as_deref(),
+    )
+    .await?;
 
     let volume_mount = format!("{volume}:/project");
     let daemon_env = format!("SYMPHONY_DAEMON_VOLUME={volume}");
@@ -333,5 +400,85 @@ mod tests {
         let a = daemon_container_name(Path::new("/project/a"));
         let b = daemon_container_name(Path::new("/project/b"));
         assert_ne!(a, b);
+    }
+
+    // Requires a real `docker` daemon; `#[ignore]`d by default, run explicitly with
+    // `cargo test -- --ignored`, matching the pattern in container.rs's integration
+    // tests.
+
+    /// Regression test for the real bug this fixes: a resumed/restarted daemon kept
+    /// running off a stale in-volume WORKFLOW.md after the host's copy was edited,
+    /// because `ensure_volume_seeded` skipped all seeding -- including WORKFLOW.md --
+    /// once the volume already existed. Proves that a second call, after the host file
+    /// changes, still refreshes WORKFLOW.md inside the volume even though the rest of
+    /// the (skipped) seeding is left alone.
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_volume_seeded_refreshes_workflow_md_on_existing_volume() {
+        assert!(
+            crate::container::docker_available().await,
+            "docker must be available for this test"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path();
+        let workflow_path = workflow_dir.join("WORKFLOW.md");
+        std::fs::write(&workflow_path, "version: 1\n").unwrap();
+
+        let volume = "symphony-test-sync-workflow-volume";
+        let _ = Command::new("docker")
+            .args(["volume", "rm", "-f", volume])
+            .status()
+            .await;
+        let image = "debian:bookworm-slim";
+
+        // First call: volume doesn't exist yet, so it's created and fully seeded from
+        // workflow_dir (including WORKFLOW.md).
+        ensure_volume_seeded(
+            volume,
+            workflow_dir,
+            &workflow_path,
+            "WORKFLOW.md",
+            image,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Simulate the host's WORKFLOW.md changing after the volume was first seeded
+        // (e.g. the operator edits it, then restarts the daemon).
+        std::fs::write(&workflow_path, "version: 2\n").unwrap();
+
+        // Second call: volume already exists, so the bulk of seeding is skipped -- but
+        // WORKFLOW.md must still come back updated.
+        ensure_volume_seeded(
+            volume,
+            workflow_dir,
+            &workflow_path,
+            "WORKFLOW.md",
+            image,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &format!("{volume}:/project"),
+                image,
+                "cat",
+                "/project/WORKFLOW.md",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "version: 2");
+
+        let _ = Command::new("docker")
+            .args(["volume", "rm", "-f", volume])
+            .status()
+            .await;
     }
 }
