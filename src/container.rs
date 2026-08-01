@@ -221,6 +221,10 @@ pub struct RunOptions<'a> {
     pub network: &'a str,
     pub mem_limit: Option<&'a str>,
     pub cpus: Option<&'a str>,
+    /// `docker run --user` value, e.g. `"1000:1000"`. `None` runs as the image's own
+    /// default. `docker exec` inherits this from the container's creation-time
+    /// setting automatically, so this only needs setting here, not on every exec call.
+    pub user: Option<&'a str>,
     /// Env var *names* to forward via `docker run -e NAME` (see
     /// `envsub::collect_var_refs`'s doc comment for why this list exists and how it's
     /// built -- the value is never passed here, only the name).
@@ -279,6 +283,10 @@ pub async fn ensure_running(
     if let Some(cpus) = options.cpus {
         args.push("--cpus".into());
         args.push(cpus.into());
+    }
+    if let Some(user) = options.user {
+        args.push("--user".into());
+        args.push(user.into());
     }
     for var_name in options.env_passthrough {
         // `-e VAR_NAME` with no `=value`: Docker reads the value from *its own*
@@ -496,6 +504,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &["SYMPHONY_TEST_ENV_PASSTHROUGH".to_string()],
             },
         )
@@ -540,6 +549,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &[],
             },
         )
@@ -554,6 +564,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &[],
             },
         )
@@ -592,6 +603,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &[],
             },
         )
@@ -650,6 +662,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &[],
             },
         )
@@ -696,6 +709,7 @@ mod tests {
                 network: "bridge",
                 mem_limit: None,
                 cpus: None,
+                user: None,
                 env_passthrough: &[],
             },
         )

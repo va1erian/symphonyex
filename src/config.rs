@@ -89,6 +89,11 @@ pub struct DockerConfig {
     pub network: String,
     pub mem_limit: Option<String>,
     pub cpus: Option<String>,
+    /// `docker run --user` value, e.g. `"1000:1000"`. `None` runs as the image's own
+    /// default (root, unless the image itself sets `USER`). Needed for the Claude
+    /// backend specifically: `claude` refuses `bypassPermissions` when running as
+    /// root -- see the Symphony base `Dockerfile`'s own doc comment on this.
+    pub user: Option<String>,
 }
 
 /// Extension: git-repo-as-first-class-input (see README.md "Git repo as first-class
@@ -235,6 +240,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         network: get_str(docker, "network").unwrap_or_else(|| "bridge".to_string()),
         mem_limit: get_str(docker, "mem_limit"),
         cpus: get_str(docker, "cpus"),
+        user: get_str(docker, "user"),
     };
 
     let hook_timeout_ms = get_u64(hooks, "timeout_ms", 60_000);
@@ -380,17 +386,27 @@ fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
     let branch = &repo.default_branch;
     let url = &repo.url;
 
+    // Repo-local (not --global) identity for the automatic after_run commit -- without
+    // this, `git commit` fails outright with "Author identity unknown". That failure
+    // was previously swallowed by the `|| true` on the commit line in after_run, so it
+    // looked "harmless" in isolation, but it meant *nothing the safety-net hook does*
+    // ever actually got committed, silently, on every single run.
+    let identity = "git config user.email \"symphony@local\"\n\
+        git config user.name \"Symphony Agent\"\n";
+
     let after_create = match &repo.token_env {
         Some(var) => format!(
             "name=\"$(basename \"$PWD\")\"\n\
              cred_helper='!f() {{ echo username=x-access-token; echo \"password=${var}\"; }}; f'\n\
              git -c credential.helper=\"$cred_helper\" clone \"{url}\" .\n\
              git config credential.helper \"$cred_helper\"\n\
+             {identity}\
              git checkout -b \"issue-$name\" \"origin/{branch}\"\n"
         ),
         None => format!(
             "name=\"$(basename \"$PWD\")\"\n\
              git clone \"{url}\" .\n\
+             {identity}\
              git checkout -b \"issue-$name\" \"origin/{branch}\"\n"
         ),
     };
@@ -539,6 +555,8 @@ mod tests {
         assert!(create.contains("origin/main"));
         assert!(create.contains("$GITHUB_TOKEN"));
         assert!(create.contains("credential.helper"));
+        assert!(create.contains("git config user.email"));
+        assert!(create.contains("git config user.name"));
 
         let before = cfg.hook_before_run.unwrap();
         assert!(before.contains("is-inside-work-tree"));
@@ -593,6 +611,20 @@ mod tests {
     /// succeed as real git operations, not just plausible-looking bash.
     #[tokio::test]
     async fn synthesized_hooks_actually_clone_branch_commit_and_push() {
+        // Isolate from any real global/system git config (e.g. this machine's own
+        // `user.email`/`user.name`, set for this session's own commits) so the
+        // synthesized hooks' *own* `git config user.email`/`user.name` lines are what
+        // actually get exercised here, not silently masked by ambient config the way
+        // they were the first time this test was written -- it passed then too, but
+        // only because a real identity happened to already be configured locally; a
+        // genuinely fresh container (no ~/.gitconfig at all) had no such fallback and
+        // hit "Author identity unknown" for real. `git` respects these two env vars
+        // (2.32+) to redirect where it looks, without touching $HOME itself.
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+        }
+
         let origin = tempdir().unwrap();
         std::process::Command::new("git")
             .args(["init", "--initial-branch=main"])
@@ -689,6 +721,10 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&ws_named);
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+            std::env::remove_var("GIT_CONFIG_SYSTEM");
+        }
     }
 
     #[test]

@@ -178,6 +178,7 @@ impl WorkspaceManager {
                     network: &ctx.config.network,
                     mem_limit: ctx.config.mem_limit.as_deref(),
                     cpus: ctx.config.cpus.as_deref(),
+                    user: ctx.config.user.as_deref(),
                     env_passthrough: &ctx.env_passthrough,
                 };
                 let handle = container::ensure_running(
@@ -407,6 +408,7 @@ mod tests {
                 network: "bridge".to_string(),
                 mem_limit: None,
                 cpus: None,
+                user: None,
             },
         }));
 

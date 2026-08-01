@@ -42,8 +42,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/symphony /usr/local/bin/symphony
 
+# `claude` refuses `--dangerously-skip-permissions`/bypassPermissions when running as
+# root ("cannot be used with root/sudo privileges for security reasons") -- found by
+# actually running this against a real project, not something caught by any earlier
+# testing. A fixed uid/gid (1000:1000, the conventional "first real user" on Debian)
+# rather than a name: `workspace.docker.user: "1000:1000"` in a project's WORKFLOW.md
+# passes this straight through to `docker run --user`, and a project Dockerfile that
+# layers on a toolchain (rustup, etc., typically installed as root during `docker
+# build`) just needs to make sure whatever paths that toolchain writes to at runtime
+# (e.g. `$CARGO_HOME`) are readable/writable by this same uid -- see this repo's own
+# bsky-archiver-agent Dockerfile for the pattern.
+RUN groupadd -g 1000 agent && useradd -u 1000 -g 1000 -m -s /bin/bash agent
+ENV HOME=/home/agent
+
 # Every workspace hook and the coding agent itself run with a container bind-mount at
 # this path (`container::CONTAINER_PROJECT_ROOT`) -- create it so `docker run -v
 # <host>:/project -w /project` has somewhere to land even before the first mount.
-RUN mkdir -p /project
+RUN mkdir -p /project && chown 1000:1000 /project
 WORKDIR /project

@@ -102,6 +102,7 @@ async fn ensure_volume_seeded(
     volume: &str,
     workflow_dir: &Path,
     image: &str,
+    user: Option<&str>,
 ) -> anyhow::Result<()> {
     if exists(&["volume", "inspect", volume]).await {
         tracing::info!(
@@ -118,6 +119,15 @@ async fn ensure_volume_seeded(
     run_visible(&["volume", "create", volume]).await?;
     let host_mount = format!("{}:/src:ro", to_docker_path(workflow_dir));
     let volume_mount = format!("{volume}:/project");
+    // Copy runs as root regardless of `workspace.docker.user` (root can always read
+    // the read-only host mount and write the fresh volume), then chowns the result to
+    // that configured user -- so content created by per-ticket containers later
+    // (which run *as* that user from the start, per `workspace.docker.user`) isn't
+    // blocked from writing into root-owned seed content.
+    let script = match user {
+        Some(u) => format!("cp -a /src/. /project/ && chown -R {u} /project"),
+        None => "cp -a /src/. /project/".to_string(),
+    };
     run_visible(&[
         "run",
         "--rm",
@@ -128,7 +138,7 @@ async fn ensure_volume_seeded(
         image,
         "bash",
         "-lc",
-        "cp -a /src/. /project/",
+        &script,
     ])
     .await
 }
@@ -174,7 +184,7 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
     }
 
     let volume = daemon_volume_name(&workflow_dir);
-    ensure_volume_seeded(&volume, &workflow_dir, image).await?;
+    ensure_volume_seeded(&volume, &workflow_dir, image, cfg.docker.user.as_deref()).await?;
 
     // The workflow file's path *inside* the volume, mirroring its position relative
     // to workflow_dir on the host -- almost always just "WORKFLOW.md" at the project
