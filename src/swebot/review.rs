@@ -34,6 +34,17 @@ pub async fn poll_once(
         let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
         git::clone_branch(repo, scratch.path(), &pr.head_ref).await?;
         let diff = git::diff_against(scratch.path(), &repo.default_branch).await?;
+        // Written to a file and *referenced* in the prompt, not embedded in it: a
+        // real PR's diff hit Windows' ~32K command-line length limit in practice
+        // (`claude` is launched with the prompt as a literal argv entry -- see
+        // `agent::claude::ClaudeSession::run_turn`), failing with "The filename or
+        // extension is too long" (os error 206) before the review could even start.
+        // The agent already has Bash/Read access to this same checked-out clone, so
+        // pointing it at the file costs nothing it doesn't already have.
+        let diff_path = scratch.path().join(".swebot-review.diff");
+        tokio::fs::write(&diff_path, &diff)
+            .await
+            .map_err(|e| format!("PR #{}: failed to write diff file: {e}", pr.number))?;
 
         let issue_context = match extract_closes_issue_number(&pr.body) {
             Some(n) => match tracker.fetch_issues_by_ids(&[n.to_string()]).await {
@@ -54,10 +65,12 @@ pub async fn poll_once(
         };
 
         let prompt = format!(
-            "{PERSONA}\n\nReview this pull request.\n\n{issue_context}\n\nDiff against \
-             {}:\n{diff}\n\nYou have Bash access to run tests/lints in the checked-out repo \
-             at {} -- judge the code, don't fix it (file-editing tools are disabled for \
-             this session). Check: correctness against the original ticket's acceptance \
+            "{PERSONA}\n\nReview this pull request.\n\n{issue_context}\n\nThe diff against \
+             {} is at {} in this checked-out repo (read it with your Read/Bash tools -- it \
+             wasn't inlined here since a large diff can exceed the command-line length this \
+             prompt is passed with). You also have Bash access to run tests/lints in this \
+             checkout at {} -- judge the code, don't fix it (file-editing tools are disabled \
+             for this session). Check: correctness against the original ticket's acceptance \
              criteria, security (input handling, secrets, auth/authz boundaries), \
              performance (obvious inefficiency, unbounded loops/queries), and whether it \
              matches this project's own conventions and includes tests. \
@@ -67,6 +80,7 @@ pub async fn poll_once(
              {{\"verdict\": \"approve\"|\"request_changes\"|\"comment\", \
              \"summary\": \"<your reasoning, written for the human who'll read this review>\"}}.",
             repo.default_branch,
+            diff_path.display(),
             scratch.path().display(),
         );
 
@@ -232,10 +246,105 @@ mod tests {
 
         let prompts = backend.prompts_seen.lock().unwrap();
         assert_eq!(prompts.len(), 1);
+        // The diff is written to a file and *referenced* by path, not embedded in
+        // the prompt directly (a real diff exceeded Windows' command-line length
+        // limit when it was inlined -- see the write-then-reference comment at the
+        // call site). Only a structural check here (the actual diff *content* isn't
+        // re-checked -- by the time this assertion runs, `poll_once` has already
+        // returned and dropped the scratch tempdir the file lived in; the dedicated
+        // large-diff test below is what actually exercises the write-then-read path
+        // at a size that would have broken the old inlined-prompt approach).
         assert!(
-            prompts[0].contains("println"),
-            "prompt should include the actual diff content: {}",
+            prompts[0].contains(".swebot-review.diff"),
+            "prompt should reference the diff file, not embed diff content: {}",
             prompts[0]
+        );
+        assert!(!prompts[0].contains("println"));
+    }
+
+    /// Regression test for a real bug found running this live: with the diff
+    /// embedded directly in the prompt, `claude` (launched with the prompt as a
+    /// literal command-line argument -- see `agent::claude::ClaudeSession::run_turn`)
+    /// failed outright on a real PR's diff with "The filename or extension is too
+    /// long" (Windows' ~32K command-line length limit, os error 206). The prompt
+    /// must stay small regardless of diff size now that the diff is written to a
+    /// file and only referenced by path.
+    #[tokio::test]
+    async fn prompt_stays_small_even_for_a_diff_that_would_have_blown_the_command_line_limit() {
+        let origin = real_repo_with_a_ticket_branch();
+        // Simulate a diff far larger than Windows' ~32K command-line limit by adding
+        // a second, much bigger change on the same branch.
+        std::process::Command::new("git")
+            .args(["checkout", "issue-42"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::fs::write(origin.path().join("big.rs"), "x".repeat(200_000)).unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "big file",
+            ])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+                "number": 43, "html_url": "https://github.com/owner/name/pull/43",
+                "body": "", "head": {"ref": "issue-42", "sha": "fakesha456"}
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls/43/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/43/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg(origin.path());
+        let host = test_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"verdict\": \"comment\", \"summary\": \"n/a\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+
+        poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
+
+        let prompts = backend.prompts_seen.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        // Comfortably under Windows' ~32K command-line limit regardless of how big
+        // the underlying diff (200KB+ here) actually is.
+        assert!(
+            prompts[0].len() < 4_000,
+            "prompt should stay small regardless of diff size, was {} bytes",
+            prompts[0].len()
         );
     }
 
