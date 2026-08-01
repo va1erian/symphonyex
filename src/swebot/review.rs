@@ -84,6 +84,11 @@ pub async fn poll_once(
             scratch.path().display(),
         );
 
+        // The turn itself streams no progress (see run_turn_collect_text's doc
+        // comment) and a real review -- reading a real diff, running tests/lints --
+        // can take minutes, so without this a running review looks indistinguishable
+        // from a stuck one in the logs.
+        tracing::info!(pr = pr.number, url = %pr.html_url, "swebot: reviewing PR");
         let mut session = backend
             .start_session(
                 scratch.path(),
@@ -118,9 +123,34 @@ pub async fn poll_once(
             _ => "COMMENT",
         };
 
-        host.post_pr_review(pr.number, &pr.head_sha, event, summary)
-            .await?;
-        tracing::info!(pr = pr.number, url = %pr.html_url, verdict, "swebot: posted PR review");
+        match host
+            .post_pr_review(pr.number, &pr.head_sha, event, summary)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(pr = pr.number, url = %pr.html_url, verdict, "swebot: posted PR review");
+            }
+            // GitHub refuses to let an account approve its own pull request. When
+            // the same token authenticates both the coding agent (PR author) and
+            // SweBot (reviewer) -- the common case for a single-operator setup --
+            // an "approve" verdict always hits this. Falling back to a plain
+            // comment with the same reasoning means the review still gets posted
+            // and recorded (has_reviewed_sha becomes true), rather than retrying
+            // and 422ing again on every single poll forever -- a real failure mode
+            // hit running this live: it silently burned a full review turn on
+            // every cycle with nothing ever actually landing.
+            Err(e) if event == "APPROVE" && e.contains("Can not approve your own pull request") => {
+                let note = format!(
+                    "(SweBot would approve this, but GitHub doesn't allow approving your own \
+                     pull request -- the coding agent and SweBot are using the same token \
+                     here. Posting as a comment instead.)\n\n{summary}"
+                );
+                host.post_pr_review(pr.number, &pr.head_sha, "COMMENT", &note)
+                    .await?;
+                tracing::info!(pr = pr.number, url = %pr.html_url, verdict, "swebot: posted PR review (as comment -- self-approval not permitted)");
+            }
+            Err(e) => return Err(format!("PR #{}: {e}", pr.number)),
+        }
     }
     Ok(())
 }
@@ -346,6 +376,63 @@ mod tests {
             "prompt should stay small regardless of diff size, was {} bytes",
             prompts[0].len()
         );
+    }
+
+    /// Regression test for a real bug found running this live: when the coding
+    /// agent and SweBot authenticate as the same token (a single-operator setup),
+    /// GitHub rejects an "approve" verdict with 422 "Can not approve your own pull
+    /// request". Without a fallback, that error propagated straight out of
+    /// `poll_once`, `has_reviewed_sha` never got a chance to become true, and the
+    /// exact same PR got a full (real, costly) review turn re-run on every single
+    /// poll forever with nothing ever actually landing.
+    #[tokio::test]
+    async fn approve_on_own_pr_falls_back_to_a_comment_instead_of_looping_forever() {
+        let origin = real_repo_with_a_ticket_branch();
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+                "number": 42, "html_url": "https://github.com/owner/name/pull/42",
+                "body": "", "head": {"ref": "issue-42", "sha": "fakesha123"}
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls/42/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/42/reviews"))
+            .and(body_string_contains("APPROVE"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "Unprocessable Entity",
+                "errors": ["Review Can not approve your own pull request"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/42/reviews"))
+            .and(body_string_contains("COMMENT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg(origin.path());
+        let host = test_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"verdict\": \"approve\", \"summary\": \"Looks correct.\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+
+        // Must succeed overall (the COMMENT fallback lands) rather than propagating
+        // the 422 as a poll failure.
+        poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
     }
 
     #[tokio::test]
