@@ -34,6 +34,13 @@ pub struct DockerContext {
     /// daemonized (see README.md "Daemonizing Symphony" and `container::MountSource`'s
     /// own doc comment for why a bind-mount can't be used in that case).
     pub mount: MountSource,
+    /// Env var *names* (e.g. `repo.token`'s referenced var) to forward into each
+    /// per-ticket container via `docker run -e NAME` -- see
+    /// `envsub::collect_var_refs`'s doc comment for why this exists: without it, a
+    /// container-mode `repo:` hook's credential helper finds its referenced var unset
+    /// inside the container, since Docker doesn't inherit the host environment into a
+    /// container automatically the way a plain child process would.
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,14 +174,18 @@ impl WorkspaceManager {
             Some(ctx) => {
                 let name = container::derive_container_name(&ctx.workflow_dir, identifier);
                 let container_root = Path::new(container::CONTAINER_PROJECT_ROOT);
+                let options = container::RunOptions {
+                    network: &ctx.config.network,
+                    mem_limit: ctx.config.mem_limit.as_deref(),
+                    cpus: ctx.config.cpus.as_deref(),
+                    env_passthrough: &ctx.env_passthrough,
+                };
                 let handle = container::ensure_running(
                     ctx.config.image.as_deref().unwrap_or_default(),
                     &name,
                     &ctx.mount,
                     container_root,
-                    &ctx.config.network,
-                    ctx.config.mem_limit.as_deref(),
-                    ctx.config.cpus.as_deref(),
+                    &options,
                 )
                 .await?;
                 Some(handle)
@@ -389,6 +400,7 @@ mod tests {
         let mgr = WorkspaceManager::new(root).with_docker(Some(DockerContext {
             workflow_dir: workflow_dir.path().to_path_buf(),
             mount: MountSource::HostPath(workflow_dir.path().to_path_buf()),
+            env_passthrough: Vec::new(),
             config: crate::config::DockerConfig {
                 enabled: true,
                 image: Some("debian:bookworm-slim".to_string()),

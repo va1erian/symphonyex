@@ -200,9 +200,16 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             Ok(volume) if !volume.trim().is_empty() => container::MountSource::NamedVolume(volume),
             _ => container::MountSource::HostPath(cfg.workflow_dir.clone()),
         };
+        // Forward exactly the secrets this config references (repo.token, the
+        // tracker's own token, anything else `$VAR`-shaped) into per-ticket
+        // containers -- see `envsub::collect_var_refs`'s doc comment for why this is
+        // necessary at all: Docker doesn't inherit the host environment into a
+        // container the way a plain child process would.
+        let env_passthrough = envsub::collect_var_refs(&wf.config);
         Some(DockerContext {
             workflow_dir: cfg.workflow_dir.clone(),
             mount,
+            env_passthrough,
             config: cfg.docker.clone(),
         })
     } else {

@@ -41,6 +41,43 @@ fn var_name(value: &str) -> Option<&str> {
     }
 }
 
+/// Recursively walk a parsed WORKFLOW.md config tree and collect every distinct
+/// `$VAR_NAME`-shaped string value found anywhere in it (bare names, no `$`, sorted
+/// and deduplicated). Used to forward exactly the secrets a config actually
+/// references into a container's environment (`docker run -e VAR_NAME`, no `=value` --
+/// Docker reads the value from *its own* invoking process's environment, so the
+/// secret's value never appears in the `docker run`/`docker exec` command line
+/// itself) rather than either guessing at field names ad hoc or forwarding the host's
+/// entire environment wholesale.
+pub fn collect_var_refs(v: &serde_yaml::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_var_refs_into(v, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_var_refs_into(v: &serde_yaml::Value, out: &mut Vec<String>) {
+    match v {
+        serde_yaml::Value::String(s) => {
+            if let Some(name) = var_name(s) {
+                out.push(name.to_string());
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                collect_var_refs_into(item, out);
+            }
+        }
+        serde_yaml::Value::Mapping(m) => {
+            for (_, val) in m {
+                collect_var_refs_into(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Expand `~` (home directory) and `$VAR` indirection for a path-shaped value,
 /// then resolve relative paths against `base_dir` and normalize (without
 /// requiring the path to exist).
@@ -107,6 +144,19 @@ mod tests {
     #[test]
     fn non_var_value_passes_through() {
         assert_eq!(resolve_var("plain-value").as_deref(), Some("plain-value"));
+    }
+
+    #[test]
+    fn collects_var_refs_from_nested_config_deduped_and_sorted() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  provider:\n    token: $GITHUB_TOKEN\nrepo:\n  token: $GITHUB_TOKEN\n\
+             other:\n  - plain-value\n  - $ANOTHER_VAR\n",
+        )
+        .unwrap();
+        assert_eq!(
+            collect_var_refs(&yaml),
+            vec!["ANOTHER_VAR".to_string(), "GITHUB_TOKEN".to_string()]
+        );
     }
 
     #[test]

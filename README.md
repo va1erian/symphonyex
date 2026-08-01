@@ -169,6 +169,42 @@ is a real hardening step for a single trusted operator running their own
 `WORKFLOW.md` locally — **not** sufficient for multi-tenant or untrusted-input
 production use.
 
+## Git repo as first-class input
+
+A project can hand-write `hooks.after_create`/`before_run`/`after_run` to clone/pull/
+commit/push itself (see `WORKFLOW.md`'s own hooks in this repo's demo, or
+bsky-archiver's original hand-written version). A `repo:` block does it for you:
+
+```yaml
+repo:
+  url: https://github.com/owner/name.git
+  default_branch: main
+  token: $GITHUB_TOKEN   # name of an env var holding a git credential; optional
+```
+
+When `repo.url` is set and a project hasn't supplied its own `hooks.after_create` /
+`before_run` / `after_run` (per-hook, not all-or-nothing -- an explicit `hooks.*`
+entry always wins), Symphony synthesizes them: always a fresh per-ticket branch
+(`issue-<workspace-key>`, never pushed straight to `default_branch` -- a generic
+daemon can't know in advance whether tickets are safely sequential the way a
+hand-written WORKFLOW.md can), a loud failure on push (not swallowed), and an
+`is-inside-work-tree` guard so a silently-failed `after_create` fails loudly on the
+next hook instead of quietly no-op'ing forever.
+
+**Credentials**: `repo.token` names an env var (not a literal value) holding a git
+credential; the synthesized hooks reference it by name in a generated `git config
+credential.helper`, so the secret's actual value never gets embedded in the hook
+script text or the git remote URL. In **Docker mode**, that named var also needs to
+actually reach the per-ticket container's own environment -- `docker run` doesn't
+inherit the host environment into a container the way a plain child process would, so
+Symphony scans the whole resolved `WORKFLOW.md` config for every `$VAR`-shaped
+reference (`repo.token`, the tracker's own token, anything else) and forwards exactly
+those via `docker run -e VAR_NAME` (name only, no `=value` -- Docker reads the value
+from *its own* invoking process's environment, so the secret never appears in the
+`docker run`/`docker exec` command line itself). The same list gets forwarded into a
+daemonized Symphony's own container too (see below), since the orchestrator process
+running inside it needs these just as much as a per-ticket container does.
+
 ## Daemonizing Symphony
 
 Everything above assumes a human launches `symphony` and watches it. `symphony

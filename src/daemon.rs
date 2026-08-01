@@ -35,15 +35,23 @@ fn to_docker_path(p: &Path) -> String {
 /// Resolve `workflow_path` the same way `orchestrator::build_shared` does (absolute,
 /// normalized directory), then load its config -- daemon subcommands need
 /// `docker.image`/`docker.enabled` and the project directory to derive names from.
-fn load(workflow_path: &Path) -> anyhow::Result<(std::path::PathBuf, EffectiveConfig)> {
+/// Also returns every `$VAR`-shaped secret reference in the raw config (see
+/// `envsub::collect_var_refs`): the daemon container needs these forwarded into
+/// *itself* too, since the orchestrator running inside it (e.g. the GitHub tracker
+/// adapter resolving `tracker.provider.token`) is subject to the exact same
+/// Docker-doesn't-inherit-the-host-environment gap as per-ticket containers are.
+fn load(
+    workflow_path: &Path,
+) -> anyhow::Result<(std::path::PathBuf, EffectiveConfig, Vec<String>)> {
     let wf = crate::workflow::load(workflow_path)?;
+    let env_passthrough = crate::envsub::collect_var_refs(&wf.config);
     let workflow_dir_raw = workflow_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let workflow_dir = crate::envsub::normalize(&std::env::current_dir()?.join(workflow_dir_raw));
     let cfg = config::resolve(&wf.config, &workflow_dir)?;
-    Ok((workflow_dir, cfg))
+    Ok((workflow_dir, cfg, env_passthrough))
 }
 
 async fn is_running(name: &str) -> bool {
@@ -126,7 +134,7 @@ async fn ensure_volume_seeded(
 }
 
 pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()> {
-    let (workflow_dir, cfg) = load(workflow_path)?;
+    let (workflow_dir, cfg, env_passthrough) = load(workflow_path)?;
     if !cfg.docker.enabled {
         anyhow::bail!(
             "daemon mode requires workspace.docker.enabled: true in WORKFLOW.md -- \
@@ -197,6 +205,14 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
         "-e",
         &daemon_env,
     ];
+    // Same secrets a per-ticket container would need (see
+    // orchestrator::build_shared's identical use of collect_var_refs) -- the
+    // orchestrator running *inside* this daemon container needs them too, e.g. to
+    // resolve tracker.provider.token for the GitHub adapter.
+    for var_name in &env_passthrough {
+        args.push("-e");
+        args.push(var_name);
+    }
     let port_arg;
     if let Some(p) = &port_str {
         port_arg = format!("{p}:{p}");
@@ -223,7 +239,7 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
 }
 
 pub async fn stop(workflow_path: &Path) -> anyhow::Result<()> {
-    let (workflow_dir, _cfg) = load(workflow_path)?;
+    let (workflow_dir, _cfg, _env) = load(workflow_path)?;
     let name = daemon_container_name(&workflow_dir);
     if !exists(&["inspect", &name]).await {
         println!("No daemon found for this project (container '{name}' doesn't exist).");
@@ -235,7 +251,7 @@ pub async fn stop(workflow_path: &Path) -> anyhow::Result<()> {
 }
 
 pub async fn status(workflow_path: &Path) -> anyhow::Result<()> {
-    let (workflow_dir, _cfg) = load(workflow_path)?;
+    let (workflow_dir, _cfg, _env) = load(workflow_path)?;
     let name = daemon_container_name(&workflow_dir);
     if !exists(&["inspect", &name]).await {
         println!("No daemon found for this project (container '{name}' doesn't exist).");
@@ -253,7 +269,7 @@ pub async fn status(workflow_path: &Path) -> anyhow::Result<()> {
 }
 
 pub async fn logs(workflow_path: &Path, follow: bool) -> anyhow::Result<()> {
-    let (workflow_dir, _cfg) = load(workflow_path)?;
+    let (workflow_dir, _cfg, _env) = load(workflow_path)?;
     let name = daemon_container_name(&workflow_dir);
     if !exists(&["inspect", &name]).await {
         anyhow::bail!("no daemon found for this project (container '{name}' doesn't exist)");

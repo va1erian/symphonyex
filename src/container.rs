@@ -214,6 +214,19 @@ pub async fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
+/// The parts of `docker run` beyond image/name/mount/mount-point that only matter at
+/// creation time (an already-running or resumed-from-stopped container keeps whatever
+/// it was created with -- see `ensure_running`'s doc comment).
+pub struct RunOptions<'a> {
+    pub network: &'a str,
+    pub mem_limit: Option<&'a str>,
+    pub cpus: Option<&'a str>,
+    /// Env var *names* to forward via `docker run -e NAME` (see
+    /// `envsub::collect_var_refs`'s doc comment for why this list exists and how it's
+    /// built -- the value is never passed here, only the name).
+    pub env_passthrough: &'a [String],
+}
+
 /// Idempotently ensure a named container exists, is running, has `host_mount`
 /// bind-mounted at `container_root`, and stays alive on its own (`tail -f /dev/null`)
 /// so repeated `docker exec` calls can target it across hook/turn invocations --
@@ -223,9 +236,7 @@ pub async fn ensure_running(
     name: &str,
     mount: &MountSource,
     container_root: &Path,
-    network: &str,
-    mem_limit: Option<&str>,
-    cpus: Option<&str>,
+    options: &RunOptions<'_>,
 ) -> Result<ContainerHandle, ContainerError> {
     let handle = ContainerHandle {
         name: name.to_string(),
@@ -259,15 +270,23 @@ pub async fn ensure_running(
         "-w".into(),
         to_container_path_str(container_root),
         "--network".into(),
-        network.into(),
+        options.network.into(),
     ];
-    if let Some(mem) = mem_limit {
+    if let Some(mem) = options.mem_limit {
         args.push("--memory".into());
         args.push(mem.into());
     }
-    if let Some(cpus) = cpus {
+    if let Some(cpus) = options.cpus {
         args.push("--cpus".into());
         args.push(cpus.into());
+    }
+    for var_name in options.env_passthrough {
+        // `-e VAR_NAME` with no `=value`: Docker reads the value from *its own*
+        // invoking process's environment (which inherits from ours the normal way,
+        // same as any child process) and forwards it into the container -- the
+        // secret's value never appears in this argv, only the var's name does.
+        args.push("-e".into());
+        args.push(var_name.clone());
     }
     args.push(image.into());
     args.push("tail".into());
@@ -448,6 +467,59 @@ mod tests {
     // default and meant to be run explicitly (`cargo test -- --ignored`) in an
     // environment that has Docker available, matching the plan's rollout step.
 
+    /// Regression test for a real gap: `docker run` doesn't inherit the host's
+    /// environment into a container the way a plain child process would, so a secret
+    /// referenced by name inside a container-mode hook (e.g. a `repo:` credential
+    /// helper) would find it unset unless explicitly forwarded. Proves the
+    /// `env_passthrough` plumbing actually delivers a real value into the container,
+    /// not just that the `-e` flag gets built.
+    #[tokio::test]
+    #[ignore]
+    async fn env_passthrough_actually_forwards_the_value_into_the_container() {
+        assert!(
+            docker_available().await,
+            "docker must be available for this test"
+        );
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_ENV_PASSTHROUGH", "secret-value-123");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let name = "symphony-test-env-passthrough";
+        remove(name).await;
+
+        let handle = ensure_running(
+            "debian:bookworm-slim",
+            name,
+            &MountSource::HostPath(dir.path().to_path_buf()),
+            Path::new("/project"),
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &["SYMPHONY_TEST_ENV_PASSTHROUGH".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        exec_script(
+            &handle,
+            Path::new("/project"),
+            "echo \"$SYMPHONY_TEST_ENV_PASSTHROUGH\" > seen.txt",
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        let contents = std::fs::read_to_string(dir.path().join("seen.txt")).unwrap();
+        assert_eq!(contents.trim(), "secret-value-123");
+
+        remove(name).await;
+        unsafe {
+            std::env::remove_var("SYMPHONY_TEST_ENV_PASSTHROUGH");
+        }
+    }
+
     #[tokio::test]
     #[ignore]
     async fn ensure_running_creates_then_reuses_a_container() {
@@ -464,9 +536,12 @@ mod tests {
             name,
             &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
-            "bridge",
-            None,
-            None,
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &[],
+            },
         )
         .await
         .unwrap();
@@ -475,9 +550,12 @@ mod tests {
             name,
             &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
-            "bridge",
-            None,
-            None,
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &[],
+            },
         )
         .await
         .unwrap();
@@ -510,9 +588,12 @@ mod tests {
             name,
             &MountSource::NamedVolume(volume.to_string()),
             Path::new("/project"),
-            "bridge",
-            None,
-            None,
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &[],
+            },
         )
         .await
         .unwrap();
@@ -565,9 +646,12 @@ mod tests {
             name,
             &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
-            "bridge",
-            None,
-            None,
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &[],
+            },
         )
         .await
         .unwrap();
@@ -608,9 +692,12 @@ mod tests {
             name,
             &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
-            "bridge",
-            None,
-            None,
+            &RunOptions {
+                network: "bridge",
+                mem_limit: None,
+                cpus: None,
+                env_passthrough: &[],
+            },
         )
         .await
         .unwrap();
