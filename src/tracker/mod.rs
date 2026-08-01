@@ -75,6 +75,25 @@ pub trait TrackerAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Create a new issue in `state` (a value from the same vocabulary
+    /// `tracker.active_states`/`update_issue_state` already use, e.g. `"todo"` --
+    /// *not* the terminal/closed state, since a freshly created issue is by
+    /// definition not yet done). OPTIONAL, like the other agent-tool-adjacent
+    /// capabilities on this trait: unimplemented by default. Added for SweBot's
+    /// ticket-drafting capability (README.md "SweBot"), but generically useful --
+    /// any caller that needs to hand a fully-formed, immediately-dispatchable issue
+    /// to a tracker can use it, not just SweBot.
+    async fn create_issue(
+        &self,
+        _title: &str,
+        _body: &str,
+        _state: &str,
+    ) -> Result<Issue, TrackerError> {
+        Err(TrackerError::Request(
+            "create_issue is not supported by this tracker adapter".to_string(),
+        ))
+    }
+
     /// Execute a provider-native tool call host-side, with the adapter's configured
     /// credential, for the given opaque dispatch `issue_id`. Default: unsupported.
     async fn execute_agent_tool(

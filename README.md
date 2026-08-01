@@ -226,6 +226,67 @@ Off by default: this is a real behavior change (a live PR gets opened on the rea
 repo, and "done" no longer means what it used to), so a project opts in
 deliberately, same posture as `workspace.docker.mount_claude_credentials`.
 
+## SweBot
+
+A software-engineering assistant with three capabilities, all GitHub-native (no new
+chat UI, no webhook receiver — just another poll loop, like everything else here):
+
+1. **Q&A**: answers questions asked in the repo's `Q&A`-category GitHub Discussions.
+2. **Ticket drafting**: turns a rough idea posted in the `Ideas`-category Discussions
+   into a properly scoped issue through a clarifying dialogue, then creates a **new**
+   issue via the tracker (Discussions stays the messy conversational space; Issues
+   stays the clean, actionable backlog Symphony's own dispatch loop watches).
+3. **PR review**: reviews the pull requests Symphony's own coding agents open
+   (branch name matching `issue-<identifier>`, not every PR a human might open by
+   hand) and posts an approve/request-changes/comment verdict. **Never merges** — a
+   human always does that.
+
+```yaml
+swebot:
+  enabled: true
+  qa:
+    discussion_category: "Q&A"        # default
+  drafting:
+    discussion_category: "Ideas"      # default
+  review:
+    enabled: true                     # defaults to `swebot.enabled`'s own value
+```
+
+Off by default, same posture as `repo.pull_request`: this posts real comments and
+reviews on a real GitHub repo. Requires `repo.url` to be a `github.com` URL and
+`repo.token` to be set — SweBot keys off `repo:` (the same source of truth
+`repo.pull_request` uses) rather than `tracker.provider.repo`, so it works the same
+regardless of `tracker.kind`.
+
+**Persona and quality bar**: every SweBot prompt shares one tone/rubric prefix
+(`swebot::PERSONA`) — friendly and direct, but holding a genuinely high bar
+(correctness against the original ticket's acceptance criteria, security, performance,
+matching the project's own conventions) rather than a rubber stamp. `request_changes`
+means something genuinely fails one of those; `approve` means "I'd merge this."
+
+**Why GitHub Discussions, not issue comments**: Discussions' built-in `Q&A`/`Ideas`
+categories are a much closer semantic fit for open-ended conversation than Issues,
+which are meant to be scoped, actionable work items. The trade-off: Discussions has no
+REST API, only GraphQL (`GithubRepoHost::graphql`, alongside the plain-REST calls
+everything else here uses) — see `src/repo_host.rs`'s own module doc comment.
+
+**No local persistence**: which comments SweBot has already answered, and which PR
+commits it has already reviewed, are both derived from hidden HTML-comment markers
+embedded in SweBot's own past replies/reviews (`<!-- swebot:answered:<id> -->`,
+`<!-- swebot:reviewed:<sha> -->`), scanned out of GitHub's own stored data on every
+poll. Nothing to lose on a restart, and no separate database. Ticket drafting doesn't
+use `claude`'s own `--resume` across poll cycles either (a human's next reply may come
+hours later, well past a restart) — each poll reconstructs the full transcript from
+the Discussion's own comment history and sends it fresh, which the model already needs
+context for anyway.
+
+**Isolation from the coding agent's own trust boundary**: SweBot's sessions run with
+`Edit`/`Write`/`NotebookEdit` explicitly disallowed (`--disallowedTools`, on top of
+the same `bypassPermissions` mode ticket dispatch uses so Bash/read tools still work
+freely for exploring code and running tests during review). It answers, drafts, and
+reviews — it never edits the repo directly. That stays the coding agent's job, gated
+by the normal ticket-dispatch flow this whole document is otherwise about.
+
 ## Daemonizing Symphony
 
 Everything above assumes a human launches `symphony` and watches it. `symphony

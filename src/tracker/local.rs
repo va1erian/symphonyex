@@ -152,6 +152,58 @@ impl TrackerAdapter for LocalTrackerAdapter {
         Ok(out)
     }
 
+    /// Generates an identifier from the current millisecond timestamp rather than a
+    /// real auto-increment (this adapter has no central sequence to draw from) --
+    /// collisions would require two `create_issue` calls in the same millisecond,
+    /// which doesn't happen given this adapter's own already-declared role (dev/test
+    /// iteration without a real tracker credential, not a production system of
+    /// record -- see this module's own doc comment).
+    async fn create_issue(
+        &self,
+        title: &str,
+        body: &str,
+        state: &str,
+    ) -> Result<Issue, TrackerError> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| {
+            TrackerError::Request(format!("failed to create tracker dir {:?}: {e}", self.dir))
+        })?;
+        let id = format!("draft-{}", Utc::now().timestamp_millis());
+        let now = Utc::now().to_rfc3339();
+        let escaped_title = title.replace('"', "\\\"");
+        let contents = format!(
+            "---\nidentifier: {id}\ntitle: \"{escaped_title}\"\nstate: {state}\n\
+             created_at: {now}\nupdated_at: {now}\n---\n{body}\n"
+        );
+        let path = self.dir.join(format!("{id}.md"));
+        std::fs::write(&path, contents)
+            .map_err(|e| TrackerError::Request(format!("failed to write {path:?}: {e}")))?;
+        Ok(Issue {
+            id: id.clone(),
+            native_ref: None,
+            identifier: id,
+            title: title.to_string(),
+            description: if body.is_empty() {
+                None
+            } else {
+                Some(body.to_string())
+            },
+            priority: None,
+            state: state.to_string(),
+            branch_name: None,
+            url: None,
+            assignee_id: None,
+            labels: Vec::new(),
+            blocked_by: Vec::new(),
+            dispatchable: true,
+            created_at: DateTime::parse_from_rfc3339(&now)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc)),
+            updated_at: DateTime::parse_from_rfc3339(&now)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc)),
+        })
+    }
+
     async fn fetch_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -419,6 +471,36 @@ mod tests {
         assert_eq!(issues[0].identifier, "C-1");
         assert_eq!(issues[0].labels, vec!["x".to_string()]);
         assert_eq!(issues[0].description.as_deref(), Some("Do the thing."));
+    }
+
+    #[tokio::test]
+    async fn create_issue_writes_a_file_and_is_immediately_fetchable() {
+        let dir = tempdir().unwrap();
+        let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
+        let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
+
+        let created = adapter
+            .create_issue(
+                "Export galleries as a zip",
+                "media only, per-account",
+                "todo",
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.title, "Export galleries as a zip");
+        assert_eq!(created.state, "todo");
+        assert!(created.dispatchable);
+
+        let fetched = adapter
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].identifier, created.identifier);
+        assert_eq!(
+            fetched[0].description.as_deref(),
+            Some("media only, per-account")
+        );
     }
 
     #[tokio::test]

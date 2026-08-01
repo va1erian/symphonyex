@@ -372,6 +372,29 @@ impl TrackerAdapter for GithubTrackerAdapter {
         Ok(resolved.into_iter().filter_map(|(_, r)| r.ok()).collect())
     }
 
+    async fn create_issue(
+        &self,
+        title: &str,
+        body: &str,
+        state: &str,
+    ) -> Result<Issue, TrackerError> {
+        let normalized = state.trim().to_lowercase();
+        let label = self.active_state_labels.get(&normalized).ok_or_else(|| {
+            TrackerError::Request(format!(
+                "unrecognized state '{state}' (not in active_state_labels -- create_issue \
+                 can only create an issue directly into an active state, never closed_state)"
+            ))
+        })?;
+        let url = format!("{}/repos/{}/issues", self.base_url, self.repo);
+        let req = self.auth_headers(self.client.post(&url).json(&json!({
+            "title": title,
+            "body": body,
+            "labels": [label],
+        })));
+        let gh: GhIssue = self.send_json(req).await?;
+        Ok(self.to_domain(gh))
+    }
+
     async fn fetch_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -689,6 +712,47 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(!issues[0].dispatchable);
         assert_eq!(issues[0].blocked_by[0].identifier.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn create_issue_posts_title_body_and_the_states_managed_label() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(gh_issue_json(
+                11,
+                "Export galleries as a zip",
+                "open",
+                &["state:todo"],
+                "media only, per-account",
+            )))
+            .mount(&server)
+            .await;
+
+        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let issue = adapter
+            .create_issue(
+                "Export galleries as a zip",
+                "media only, per-account",
+                "todo",
+            )
+            .await
+            .unwrap();
+        assert_eq!(issue.identifier, "11");
+        assert_eq!(issue.state, "todo");
+    }
+
+    #[tokio::test]
+    async fn create_issue_rejects_a_state_with_no_managed_label() {
+        let server = MockServer::start().await;
+        // No POST mock registered -- if the adapter tried to create anyway, the
+        // request would have nothing to match.
+        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let err = adapter
+            .create_issue("t", "b", "nonexistent-state")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TrackerError::Request(_)));
     }
 
     #[tokio::test]
