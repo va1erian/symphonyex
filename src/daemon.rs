@@ -220,9 +220,15 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
     // root, but this stays correct if it's nested. Computed up front since both the
     // resume branch below and volume seeding need it to keep the volume's copy of
     // WORKFLOW.md in sync with the host.
-    let canonical_workflow_path = workflow_path
-        .canonicalize()
-        .unwrap_or_else(|_| workflow_path.to_path_buf());
+    //
+    // Deliberately `envsub::normalize` (lexical, no filesystem access), not
+    // `Path::canonicalize()`: canonicalize returns Windows' extended-length `\\?\C:\...`
+    // form, which `to_docker_path`'s naive backslash-to-forward-slash swap turns into
+    // `//?/C:/...` -- a form `docker run -v` can't parse ("too many colons"), a real
+    // failure hit running this live. `workflow_dir` below already uses this same
+    // normalizer for the identical reason.
+    let canonical_workflow_path =
+        crate::envsub::normalize(&std::env::current_dir()?.join(workflow_path));
     let workflow_rel = canonical_workflow_path
         .strip_prefix(&workflow_dir)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
