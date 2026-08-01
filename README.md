@@ -205,6 +205,27 @@ from *its own* invoking process's environment, so the secret never appears in th
 daemonized Symphony's own container too (see below), since the orchestrator process
 running inside it needs these just as much as a per-ticket container does.
 
+**Pull requests instead of a silently pushed branch**: by default the synthesized
+`after_run` hook pushes each ticket's branch and leaves it there for a human to
+notice on their own. Set `repo.pull_request: true` (requires `repo.url` to be a
+`github.com` URL and `repo.token` to be set) to expose a second agent tool,
+`open_pull_request(title, body)`, alongside whatever the tracker itself exposes (see
+"Provider-native tracker tool" below) — the agent calls it once it's pushed and happy
+with the change, supplying its own title and rationale. Calling it again (a retry, or
+more work landing on the same branch) updates the existing PR in place rather than
+creating a duplicate.
+
+This changes how issues close: put `Closes #<issue-number>` in the PR body and GitHub
+closes the tracker issue automatically **when a human merges the PR**, not when the
+agent decides it's done. In this mode the agent should *not* call
+`update_issue_state` to close the issue itself — the existing GitHub tracker adapter
+already treats a closed issue as done regardless of how it got closed, so nothing
+else needs to change for the polling loop to pick this up.
+
+Off by default: this is a real behavior change (a live PR gets opened on the real
+repo, and "done" no longer means what it used to), so a project opts in
+deliberately, same posture as `workspace.docker.mount_claude_credentials`.
+
 ## Daemonizing Symphony
 
 Everything above assumes a human launches `symphony` and watches it. `symphony
@@ -301,6 +322,17 @@ redispatching it forever (continuation retries) once the agent thinks it's done.
 
 `codex` doesn't get this wiring yet — Codex's own dynamic-tool-call mechanism
 (Section 10.5) would need separate plumbing in the (already best-effort) Codex client.
+
+**A second, independent tool source**: when `repo.pull_request: true` (see "Git repo
+as first-class input" above), `open_pull_request({title, body})` from
+`src/repo_host.rs` is exposed the same way, *alongside* whatever the tracker itself
+exposes — `run_stdio_server` merges both tool lists and routes each `tools/call` by
+name to whichever side owns it. This is deliberately not a `TrackerAdapter` tool: a
+pull request is a property of `repo:` (the code host), not `tracker:` (the issue
+board), so it's kept as its own capability rather than folded into the tracker's own
+tool set. `repo.pull_request` also works with `tracker.kind: local` — the MCP
+subprocess gets spawned whenever *either* side has a tool to offer, not just when the
+tracker does.
 
 ## What's implemented (Section 18.1 core conformance)
 

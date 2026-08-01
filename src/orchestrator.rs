@@ -153,13 +153,23 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
     config::validate_for_dispatch(&cfg, tracker::SUPPORTED_TRACKER_KINDS)?;
 
     let tracker_adapter = tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, workflow_dir)?;
-    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty() {
+    // `repo.pull_request` needs the MCP subprocess spawned to expose open_pull_request
+    // even when the tracker itself has no tools of its own (e.g. tracker.kind: local),
+    // since a PR is a property of repo: config, not of the tracker.
+    let repo_pr_json = cfg
+        .repo
+        .as_ref()
+        .filter(|r| r.pull_request)
+        .map(serde_json::to_string)
+        .transpose()?;
+    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty() && repo_pr_json.is_none() {
         None
     } else {
         Some(claude::McpToolWiring {
             tracker_kind: cfg.tracker_kind.clone(),
             tracker_provider_json: serde_json::to_string(&cfg.tracker_provider)?,
             workflow_dir: cfg.workflow_dir.clone(),
+            repo_pr_json,
         })
     };
     let agent_backend: Arc<dyn AgentBackend> = match cfg.agent_backend {

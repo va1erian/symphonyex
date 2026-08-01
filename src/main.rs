@@ -9,6 +9,7 @@ mod hooks;
 mod mcp;
 mod metrics;
 mod orchestrator;
+mod repo_host;
 mod status;
 mod template;
 mod tracker;
@@ -58,6 +59,10 @@ enum Command {
         workflow_dir: PathBuf,
         #[arg(long)]
         issue_id: String,
+        /// `repo:` config as a JSON string, present only when `repo.pull_request` is
+        /// enabled -- see `agent::claude::McpToolWiring::repo_pr_json`.
+        #[arg(long)]
+        repo_pr: Option<String>,
     },
 
     /// Run Symphony itself as a long-lived, auto-restarting, single-instance Docker
@@ -113,9 +118,16 @@ async fn main() -> std::process::ExitCode {
             tracker_provider,
             workflow_dir,
             issue_id,
+            repo_pr,
         }) => {
-            return run_mcp_tool_server(&tracker_kind, &tracker_provider, &workflow_dir, &issue_id)
-                .await;
+            return run_mcp_tool_server(
+                &tracker_kind,
+                &tracker_provider,
+                &workflow_dir,
+                &issue_id,
+                repo_pr.as_deref(),
+            )
+            .await;
         }
         Some(Command::Daemon { action }) => return run_daemon_command(action).await,
         None => {}
@@ -183,6 +195,7 @@ async fn run_mcp_tool_server(
     tracker_provider_json: &str,
     workflow_dir: &std::path::Path,
     issue_id: &str,
+    repo_pr_json: Option<&str>,
 ) -> std::process::ExitCode {
     let provider: serde_yaml::Value = match serde_yaml::from_str(tracker_provider_json) {
         Ok(v) => v,
@@ -198,7 +211,20 @@ async fn run_mcp_tool_server(
             return std::process::ExitCode::FAILURE;
         }
     };
-    match mcp::run_stdio_server(adapter, issue_id).await {
+    let repo_host = match repo_pr_json {
+        Some(json) => match serde_json::from_str::<config::RepoConfig>(json)
+            .map_err(|e| e.to_string())
+            .and_then(|cfg| repo_host::GithubRepoHost::new(&cfg))
+        {
+            Ok(host) => Some(host),
+            Err(e) => {
+                tracing::error!(error = %e, "mcp tool server: failed to build repo host");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    match mcp::run_stdio_server(adapter, repo_host, issue_id).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");

@@ -40,6 +40,12 @@ pub struct McpToolWiring {
     /// `tracker.provider`, pre-serialized to a JSON string (parseable as YAML too).
     pub tracker_provider_json: String,
     pub workflow_dir: PathBuf,
+    /// `repo:` config, pre-serialized to a JSON string, present only when
+    /// `repo.pull_request` is enabled -- lets `__mcp_tool_server` build a
+    /// `repo_host::GithubRepoHost` alongside the tracker adapter (Section "PR-based
+    /// branch workflow"). Independent of `tracker_kind`/`tracker_provider_json`: a
+    /// pull request is a property of the code host, not the issue tracker.
+    pub repo_pr_json: Option<String>,
 }
 
 pub struct ClaudeBackend {
@@ -116,17 +122,26 @@ fn write_mcp_config(
             wiring.workflow_dir.to_string_lossy().to_string(),
         ),
     };
+    let mut args = vec![
+        "__mcp_tool_server".to_string(),
+        "--tracker-kind".to_string(),
+        wiring.tracker_kind.clone(),
+        "--tracker-provider".to_string(),
+        wiring.tracker_provider_json.clone(),
+        "--workflow-dir".to_string(),
+        workflow_dir_arg,
+        "--issue-id".to_string(),
+        issue_id.to_string(),
+    ];
+    if let Some(repo_pr_json) = &wiring.repo_pr_json {
+        args.push("--repo-pr".to_string());
+        args.push(repo_pr_json.clone());
+    }
     let config = json!({
         "mcpServers": {
             "symphony": {
                 "command": command,
-                "args": [
-                    "__mcp_tool_server",
-                    "--tracker-kind", wiring.tracker_kind,
-                    "--tracker-provider", wiring.tracker_provider_json,
-                    "--workflow-dir", workflow_dir_arg,
-                    "--issue-id", issue_id,
-                ]
+                "args": args
             }
         }
     });

@@ -30,6 +30,12 @@ pub enum ConfigError {
         "invalid_config: claude.api_key must be a $VAR_NAME reference (naming an env var), not a literal value"
     )]
     InvalidClaudeApiKey,
+    #[error(
+        "invalid_config: repo.pull_request requires repo.url to be a github.com URL (owner/name) -- open_pull_request only supports GitHub"
+    )]
+    PullRequestRequiresGithubRepo,
+    #[error("invalid_config: repo.pull_request requires repo.token to be set")]
+    PullRequestRequiresRepoToken,
     #[error("invalid_config: repo.url is required when the repo block is present")]
     MissingRepoUrl,
     #[error(
@@ -127,7 +133,13 @@ pub struct DockerConfig {
 /// sequence a project would otherwise have to hand-write (as bsky-archiver's
 /// `WORKFLOW.md` originally did) -- see `synthesize_repo_hooks` below. An explicit
 /// `hooks.*` entry always wins over the synthesized default.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize`: when `pull_request` is true, `orchestrator::build_shared`
+/// serializes this whole struct to pass to the `__mcp_tool_server` subprocess (see
+/// `agent::claude::McpToolWiring::repo_pr_json`, mirroring how `tracker_provider_json`
+/// already crosses that same boundary) -- the token *name*, never its resolved value,
+/// so nothing secret crosses in the argv.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RepoConfig {
     pub url: String,
     pub default_branch: String,
@@ -138,6 +150,13 @@ pub struct RepoConfig {
     /// own process environment (which it already inherits from Symphony's), never as
     /// a value Symphony itself holds or embeds in a URL/script body.
     pub token_env: Option<String>,
+    /// Opt-in: expose the `open_pull_request` agent tool (`src/repo_host.rs`) instead
+    /// of leaving each ticket's pushed branch for a human to notice on their own. Off
+    /// by default -- this changes what the agent does at the end of a turn (opens a
+    /// real PR on the real repo) and how issues close (on merge, not immediately), so
+    /// it's a real behavior change a project opts into deliberately, same posture as
+    /// `workspace.docker.mount_claude_credentials`.
+    pub pull_request: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -287,10 +306,22 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                         .ok_or(ConfigError::InvalidRepoToken)
                 })
                 .transpose()?;
+            let pull_request = get(r, "pull_request")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if pull_request {
+                if crate::repo_host::parse_github_owner_repo(&url).is_none() {
+                    return Err(ConfigError::PullRequestRequiresGithubRepo);
+                }
+                if token_env.is_none() {
+                    return Err(ConfigError::PullRequestRequiresRepoToken);
+                }
+            }
             Ok(RepoConfig {
                 url,
                 default_branch,
                 token_env,
+                pull_request,
             })
         })
         .transpose()?;
@@ -651,6 +682,48 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::InvalidRepoToken)
         ));
+    }
+
+    #[test]
+    fn pull_request_requires_a_github_repo_url() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://gitlab.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_PR_TOKEN\n  pull_request: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::PullRequestRequiresGithubRepo)
+        ));
+    }
+
+    #[test]
+    fn pull_request_requires_a_repo_token() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             pull_request: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::PullRequestRequiresRepoToken)
+        ));
+    }
+
+    #[test]
+    fn pull_request_true_with_valid_github_repo_and_token_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_PR_TOKEN\n  pull_request: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.repo.unwrap().pull_request);
+    }
+
+    #[test]
+    fn pull_request_defaults_to_false() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.repo.unwrap().pull_request);
     }
 
     #[test]
