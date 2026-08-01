@@ -93,9 +93,13 @@ impl GithubRepoHost {
                 rationale behind it. This is the way to submit work for review -- call it \
                 once your branch has been pushed and you're satisfied with the change. \
                 Include 'Closes #<issue-number>' in the body so the tracker issue closes \
-                automatically when this PR is merged; do not call update_issue_state to \
-                close the issue yourself in this workflow -- closing is a side effect of \
-                merge, not something to do before anyone has reviewed the code."
+                automatically when this PR is merged; do not call update_issue_state with a \
+                terminal/'done' state yourself in this workflow -- closing is a side effect \
+                of merge, not something to do before anyone has reviewed the code. After \
+                this succeeds, if the project's tracker config offers a non-terminal state \
+                for this (e.g. 'in review'), call update_issue_state with that -- otherwise \
+                the tracker keeps treating this ticket as active work still in progress and \
+                you'll keep being redispatched to it with nothing new to do."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

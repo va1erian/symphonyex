@@ -217,10 +217,24 @@ creating a duplicate.
 
 This changes how issues close: put `Closes #<issue-number>` in the PR body and GitHub
 closes the tracker issue automatically **when a human merges the PR**, not when the
-agent decides it's done. In this mode the agent should *not* call
-`update_issue_state` to close the issue itself — the existing GitHub tracker adapter
-already treats a closed issue as done regardless of how it got closed, so nothing
-else needs to change for the polling loop to pick this up.
+agent decides it's done. The existing GitHub tracker adapter already treats a closed
+issue as done regardless of how it got closed, so nothing else needs to change for
+the polling loop to pick this up.
+
+**Important operational detail, found running this live**: the agent must *not* call
+`update_issue_state` with `"done"` in this mode (that decision belongs to whoever
+reviews the PR) -- but it still needs to call `update_issue_state` with some
+*non-terminal, non-active* state (e.g. `"in review"`, added to the project's own
+`active_state_labels` but deliberately left out of `active_states`) once it's opened
+the PR. Without that, the issue stays in an active state indefinitely, and Symphony's
+own dispatcher keeps redispatching it forever with nothing new to do -- there's no
+mechanism to leave a ticket "paused, waiting on an external event" otherwise. This
+needs no Symphony code changes (an issue whose normalized state matches neither
+`active_states` nor `terminal_states` is already never dispatched, and an already-running
+one in that state is already cleanly stopped by `reconcile`'s "no longer
+active/routable" path) -- it's purely a `tracker.provider.active_state_labels` +
+prompt convention a project sets up itself, documented here so the next project
+enabling `repo.pull_request` doesn't rediscover this the same way.
 
 Off by default: this is a real behavior change (a live PR gets opened on the real
 repo, and "done" no longer means what it used to), so a project opts in
