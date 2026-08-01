@@ -360,7 +360,7 @@ impl GithubRepoHost {
             repository(owner: $owner, name: $name) { \
               discussions(first: 25, orderBy: {field: UPDATED_AT, direction: DESC}) { \
                 nodes { \
-                  id number title body \
+                  id number title body url \
                   category { name } \
                   comments(first: 50) { nodes { databaseId body author { login } } } \
                 } \
@@ -381,6 +381,7 @@ impl GithubRepoHost {
                 number: d.number,
                 title: d.title,
                 body: d.body,
+                url: d.url,
                 comments: d
                     .comments
                     .nodes
@@ -474,6 +475,7 @@ pub struct DiscussionThread {
     pub number: u64,
     pub title: String,
     pub body: String,
+    pub url: String,
     pub comments: Vec<DiscussionComment>,
 }
 
@@ -544,6 +546,7 @@ struct GhDiscussion {
     title: String,
     #[serde(default)]
     body: String,
+    url: String,
     category: GhCategory,
     comments: GhCommentsConnection,
 }
@@ -877,12 +880,14 @@ mod tests {
                                 {
                                     "id": "D_1", "number": 1, "title": "How does X work?",
                                     "body": "explain X please",
+                                    "url": "https://github.com/owner/name/discussions/1",
                                     "category": {"name": "Q&A"},
                                     "comments": {"nodes": []}
                                 },
                                 {
                                     "id": "D_2", "number": 2, "title": "A feature idea",
                                     "body": "would be nice",
+                                    "url": "https://github.com/owner/name/discussions/2",
                                     "category": {"name": "Ideas"},
                                     "comments": {"nodes": [
                                         {"id": "C_1", "databaseId": 111, "body": "tell me more",

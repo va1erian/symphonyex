@@ -98,6 +98,11 @@ pub async fn poll_once(
                 .unwrap_or("Could you say a bit more about what you're looking for?");
             let comment = format!("{marker}\n{reply}");
             host.post_discussion_comment(&thread.id, &comment).await?;
+            tracing::info!(
+                discussion = thread.number,
+                url = %thread.url,
+                "swebot: asked a clarifying question"
+            );
             continue;
         }
 
@@ -135,6 +140,11 @@ pub async fn poll_once(
             issue.url.as_deref().unwrap_or(&issue.identifier),
         );
         let comment_id = host.post_discussion_comment(&thread.id, &comment).await?;
+        tracing::info!(
+            discussion = thread.number,
+            issue = %issue.identifier,
+            "swebot: drafted and created issue"
+        );
         if let Err(e) = host.mark_discussion_comment_as_answer(&comment_id).await {
             tracing::debug!(discussion = thread.number, error = %e, "swebot: could not mark comment as answer (ignored)");
         }

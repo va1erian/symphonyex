@@ -328,6 +328,7 @@ mod tests {
             number: 1,
             title: "t".to_string(),
             body: body.to_string(),
+            url: "https://github.com/owner/name/discussions/1".to_string(),
             comments,
         }
     }

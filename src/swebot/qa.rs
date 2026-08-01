@@ -57,6 +57,7 @@ pub async fn poll_once(
 
         let reply = format!("{}\n{answer}", answered_marker(marker_id));
         let comment_id = host.post_discussion_comment(&thread.id, &reply).await?;
+        tracing::info!(discussion = thread.number, url = %thread.url, "swebot: answered discussion");
         if let Err(e) = host.mark_discussion_comment_as_answer(&comment_id).await {
             // Non-fatal: only Q&A-category discussions actually support this mutation,
             // and a project may have miscategorized one -- the reply itself already
@@ -112,7 +113,8 @@ mod tests {
                         "discussions": {
                             "nodes": [{
                                 "id": "D_1", "number": 1, "title": "How does auth work?",
-                                "body": "", "category": {"name": "Q&A"},
+                                "body": "", "url": "https://github.com/owner/name/discussions/1",
+                                "category": {"name": "Q&A"},
                                 "comments": {"nodes": [
                                     {"databaseId": 10, "body": "how does auth work?",
                                      "author": {"login": "alice"}}
@@ -165,7 +167,8 @@ mod tests {
                         "discussions": {
                             "nodes": [{
                                 "id": "D_1", "number": 1, "title": "How does auth work?",
-                                "body": "", "category": {"name": "Q&A"},
+                                "body": "", "url": "https://github.com/owner/name/discussions/1",
+                                "category": {"name": "Q&A"},
                                 "comments": {"nodes": [
                                     {"databaseId": 10, "body": "how does auth work?",
                                      "author": {"login": "alice"}},
