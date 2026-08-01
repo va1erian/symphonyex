@@ -179,14 +179,21 @@ async fn run_turn_collect_text(
 /// for a specific shape at the end of their prompt; this just locates and parses it,
 /// independent of what shape the caller expects.
 fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
-    let candidate = if let Some(start) = text.rfind("```json") {
-        let after = &text[start + "```json".len()..];
-        let end = after.find("```").ok_or("unterminated ```json block")?;
-        after[..end].trim()
-    } else {
-        text.trim()
+    let candidate = match text.rfind("```json") {
+        Some(start) => text[start + "```json".len()..].trim_start(),
+        None => text.trim(),
     };
-    serde_json::from_str(candidate)
+    // Deliberately *not* string-searching for a closing ``` fence: a drafted ticket
+    // or review summary can easily contain a markdown code block of its own inside
+    // a JSON string value (a real response hit this live -- a ticket body quoting a
+    // code snippet), and the naive "find the next ```" approach truncates the JSON
+    // right there, mid-string. A streaming deserializer parses exactly one JSON
+    // value and stops the moment it's structurally complete, ignoring whatever
+    // trailing text follows (a closing fence, more prose, anything) -- so an
+    // embedded ``` inside a properly JSON-escaped string is never mistaken for the
+    // end of the block.
+    let mut de = serde_json::Deserializer::from_str(candidate);
+    serde::Deserialize::deserialize(&mut de)
         .map_err(|e| format!("could not parse a JSON object from the response: {e}"))
 }
 
@@ -415,5 +422,18 @@ mod tests {
     fn extract_json_block_errors_clearly_on_malformed_output() {
         let err = extract_json_block("just some prose, no JSON at all").unwrap_err();
         assert!(err.contains("could not parse"));
+    }
+
+    /// Regression test for a real bug found running this live: a drafted ticket body
+    /// containing its own markdown code fence (e.g. quoting a code snippet) made the
+    /// old "find the next ```" logic truncate the JSON mid-string, right at that
+    /// *inner* fence rather than the real closing one.
+    #[test]
+    fn extract_json_block_handles_an_embedded_code_fence_inside_a_string_value() {
+        let text = "Some analysis.\n\n```json\n{\"ready\": true, \"title\": \"x\", \
+                     \"body\": \"See:\\n\\n```rust\\nfn f() {}\\n```\\n\\nDone.\"}\n```\n";
+        let v = extract_json_block(text).unwrap();
+        assert_eq!(v["ready"], serde_json::json!(true));
+        assert!(v["body"].as_str().unwrap().contains("fn f() {}"));
     }
 }
