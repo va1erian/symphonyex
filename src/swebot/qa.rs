@@ -6,7 +6,7 @@
 //! own past replies, scanned out of the thread itself on every poll -- so it survives
 //! a restart for free.
 
-use super::{PERSONA, answered_marker, is_swebot_reply, last_answered_id, run_turn_collect_text};
+use super::{PERSONA, answered_marker, next_to_answer, run_turn_collect_text, transcript_up_to};
 use crate::agent::AgentBackend;
 use crate::config::EffectiveConfig;
 use crate::repo_host::GithubRepoHost;
@@ -23,29 +23,10 @@ pub async fn poll_once(
         .await?;
 
     for thread in threads {
-        let last_answered = last_answered_id(&thread);
-        let Some(question) = thread
-            .comments
-            .iter()
-            .filter(|c| c.database_id > last_answered && !is_swebot_reply(&c.body))
-            .max_by_key(|c| c.database_id)
-        else {
-            continue; // nothing new since SweBot's last reply (or this thread has no comments yet)
+        let Some(marker_id) = next_to_answer(&thread) else {
+            continue; // nothing new since SweBot's last reply
         };
-
-        let transcript: String = thread
-            .comments
-            .iter()
-            .filter(|c| c.database_id <= question.database_id)
-            .map(|c| {
-                format!(
-                    "{}: {}",
-                    c.author_login.as_deref().unwrap_or("someone"),
-                    c.body
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let transcript = transcript_up_to(&thread, marker_id);
 
         let prompt = format!(
             "{PERSONA}\n\nAnswer the newest question in this GitHub Discussion (\"{}\"). \
@@ -74,7 +55,7 @@ pub async fn poll_once(
         };
         session.stop().await;
 
-        let reply = format!("{}\n{answer}", answered_marker(question.database_id));
+        let reply = format!("{}\n{answer}", answered_marker(marker_id));
         let comment_id = host.post_discussion_comment(&thread.id, &reply).await?;
         if let Err(e) = host.mark_discussion_comment_as_answer(&comment_id).await {
             // Non-fatal: only Q&A-category discussions actually support this mutation,

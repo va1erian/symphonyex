@@ -27,27 +27,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// `<!-- swebot:answered:<comment-id> -->`, embedded in every SweBot reply. Comment
-/// ids only ever increase, so "the max marker value found anywhere in the thread"
-/// is "the last comment SweBot has already responded to" -- no local persistence,
-/// no need to know which GitHub account SweBot itself posts as.
-fn answered_marker(comment_id: u64) -> String {
-    format!("<!-- swebot:answered:{comment_id} -->")
+/// `<!-- swebot:answered:<id> -->`, embedded in every SweBot reply. `id` is a real
+/// comment `database_id` in the normal case, or the reserved sentinel `0` when
+/// SweBot answered the discussion's own *opening body* -- GitHub Discussions store
+/// the opening question in `body`, not as a `comment`, so a fresh discussion with
+/// zero replies has an empty `comments` list and there's nothing else to key a
+/// marker off until a real comment exists. `0` is safe as a sentinel: real GitHub
+/// comment ids are always positive.
+fn answered_marker(id: u64) -> String {
+    format!("<!-- swebot:answered:{id} -->")
 }
 
 /// Whether `body` is SweBot's own reply (carries an `answered_marker`) rather than a
 /// human comment. Matters because SweBot's own reply necessarily gets a *higher*
-/// `database_id` than the marker value it embeds -- without excluding it here,
-/// `qa`/`drafting`'s "find the newest comment past `last_answered_id`" scan would
-/// treat SweBot's own just-posted reply as a fresh unanswered question on the very
-/// next poll, an infinite reply-to-itself loop.
+/// `database_id` than the marker value it embeds -- without excluding it, the "find
+/// the newest comment past the last marker" scan below would treat SweBot's own
+/// just-posted reply as a fresh unanswered question on the very next poll, an
+/// infinite reply-to-itself loop.
 fn is_swebot_reply(body: &str) -> bool {
     body.contains("<!-- swebot:answered:")
 }
 
-/// See `answered_marker`. `0` reads as "nothing answered yet" -- every real GitHub
-/// comment id is positive.
-fn last_answered_id(thread: &DiscussionThread) -> u64 {
+/// The highest `answered_marker` id found anywhere in the thread, or `None` if
+/// SweBot has never answered anything in it yet -- not even the opening body.
+/// Distinguishing `None` from `Some(0)` matters: `Some(0)` means "the body itself
+/// was already answered, don't answer it again," not "nothing has happened yet."
+fn last_answered_marker(thread: &DiscussionThread) -> Option<u64> {
     thread
         .comments
         .iter()
@@ -59,7 +64,50 @@ fn last_answered_id(thread: &DiscussionThread) -> u64 {
                 .and_then(|id| id.trim().parse::<u64>().ok())
         })
         .max()
-        .unwrap_or(0)
+}
+
+/// The marker id of the next thing in `thread` SweBot should respond to, if
+/// anything: a real (non-SweBot) comment past the last answered marker, or -- if
+/// nothing has ever been answered and no qualifying comment exists yet -- the
+/// sentinel `0` for the discussion's own opening body. `None` means there's nothing
+/// new since SweBot's last reply.
+fn next_to_answer(thread: &DiscussionThread) -> Option<u64> {
+    let last = last_answered_marker(thread);
+    if let Some(c) = thread
+        .comments
+        .iter()
+        .filter(|c| !is_swebot_reply(&c.body) && last.is_none_or(|l| c.database_id > l))
+        .max_by_key(|c| c.database_id)
+    {
+        return Some(c.database_id);
+    }
+    if last.is_none() {
+        return Some(0);
+    }
+    None
+}
+
+/// Everything in `thread` up to and including `marker_id`, as one prompt-ready
+/// block: the opening body is always included first (it's the original question and
+/// always relevant context, even once real comments exist), followed by comments
+/// with `database_id <= marker_id` (naturally none, for the `marker_id == 0`
+/// body-only case, since real comment ids are always positive).
+fn transcript_up_to(thread: &DiscussionThread, marker_id: u64) -> String {
+    let mut parts = vec![format!("(opening post) {}", thread.body)];
+    parts.extend(
+        thread
+            .comments
+            .iter()
+            .filter(|c| c.database_id <= marker_id)
+            .map(|c| {
+                format!(
+                    "{}: {}",
+                    c.author_login.as_deref().unwrap_or("someone"),
+                    c.body
+                )
+            }),
+    );
+    parts.join("\n\n")
 }
 
 /// Shared tone/rubric prefix for every SweBot prompt. The user asked for SweBot to be
@@ -266,43 +314,85 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
-    #[test]
-    fn last_answered_id_finds_the_highest_marker_across_any_comment() {
-        let thread = DiscussionThread {
+    fn comment(database_id: u64, body: &str, author: &str) -> crate::repo_host::DiscussionComment {
+        crate::repo_host::DiscussionComment {
+            database_id,
+            body: body.to_string(),
+            author_login: Some(author.to_string()),
+        }
+    }
+
+    fn thread(body: &str, comments: Vec<crate::repo_host::DiscussionComment>) -> DiscussionThread {
+        DiscussionThread {
             id: "D_1".to_string(),
             number: 1,
             title: "t".to_string(),
-            body: "b".to_string(),
-            comments: vec![
-                crate::repo_host::DiscussionComment {
-                    database_id: 10,
-                    body: "a human question".to_string(),
-                    author_login: Some("alice".to_string()),
-                },
-                crate::repo_host::DiscussionComment {
-                    database_id: 11,
-                    body: format!("{}\nhere's the answer", answered_marker(10)),
-                    author_login: Some("swebot".to_string()),
-                },
-            ],
-        };
-        assert_eq!(last_answered_id(&thread), 10);
+            body: body.to_string(),
+            comments,
+        }
     }
 
     #[test]
-    fn last_answered_id_is_zero_for_a_thread_with_no_swebot_reply_yet() {
-        let thread = DiscussionThread {
-            id: "D_2".to_string(),
-            number: 2,
-            title: "t".to_string(),
-            body: "b".to_string(),
-            comments: vec![crate::repo_host::DiscussionComment {
-                database_id: 5,
-                body: "first question, unanswered".to_string(),
-                author_login: Some("alice".to_string()),
-            }],
-        };
-        assert_eq!(last_answered_id(&thread), 0);
+    fn last_answered_marker_finds_the_highest_marker_across_any_comment() {
+        let t = thread(
+            "b",
+            vec![
+                comment(10, "a human question", "alice"),
+                comment(
+                    11,
+                    &format!("{}\nhere's the answer", answered_marker(10)),
+                    "swebot",
+                ),
+            ],
+        );
+        assert_eq!(last_answered_marker(&t), Some(10));
+    }
+
+    #[test]
+    fn last_answered_marker_is_none_for_a_thread_with_no_swebot_reply_yet() {
+        let t = thread("b", vec![comment(5, "first question, unanswered", "alice")]);
+        assert_eq!(last_answered_marker(&t), None);
+    }
+
+    /// Regression test for a real bug found running this live: GitHub Discussions
+    /// store the opening question in `body`, not as a `comment` -- a fresh
+    /// discussion with zero replies has an *empty* `comments` list, so the original
+    /// "only ever look at comments" logic found nothing to answer and silently did
+    /// nothing on every poll.
+    #[test]
+    fn next_to_answer_answers_the_opening_body_when_there_are_no_comments_yet() {
+        let t = thread("how does the dedup logic work?", vec![]);
+        assert_eq!(next_to_answer(&t), Some(0));
+        assert!(transcript_up_to(&t, 0).contains("how does the dedup logic work?"));
+    }
+
+    #[test]
+    fn next_to_answer_does_not_re_answer_the_body_once_marked() {
+        let t = thread(
+            "how does the dedup logic work?",
+            vec![comment(
+                100,
+                &format!("{}\nSee src/dedup.rs", answered_marker(0)),
+                "swebot",
+            )],
+        );
+        assert_eq!(next_to_answer(&t), None);
+    }
+
+    #[test]
+    fn next_to_answer_picks_up_a_real_reply_after_the_body_was_already_answered() {
+        let t = thread(
+            "how does the dedup logic work?",
+            vec![
+                comment(
+                    100,
+                    &format!("{}\nSee src/dedup.rs", answered_marker(0)),
+                    "swebot",
+                ),
+                comment(101, "thanks, but what about videos specifically?", "alice"),
+            ],
+        );
+        assert_eq!(next_to_answer(&t), Some(101));
     }
 
     #[test]

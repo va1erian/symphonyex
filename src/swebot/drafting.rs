@@ -16,8 +16,8 @@
 //! marker `qa.rs` already uses.
 
 use super::{
-    PERSONA, answered_marker, extract_json_block, is_swebot_reply, last_answered_id,
-    run_turn_collect_text,
+    PERSONA, answered_marker, extract_json_block, next_to_answer, run_turn_collect_text,
+    transcript_up_to,
 };
 use crate::agent::AgentBackend;
 use crate::config::EffectiveConfig;
@@ -37,29 +37,10 @@ pub async fn poll_once(
         .await?;
 
     for thread in threads {
-        let last_answered = last_answered_id(&thread);
-        let Some(latest) = thread
-            .comments
-            .iter()
-            .filter(|c| c.database_id > last_answered && !is_swebot_reply(&c.body))
-            .max_by_key(|c| c.database_id)
-        else {
+        let Some(marker_id) = next_to_answer(&thread) else {
             continue; // nothing new since SweBot's last reply, or already handed off to an issue
         };
-
-        let transcript: String = thread
-            .comments
-            .iter()
-            .filter(|c| c.database_id <= latest.database_id)
-            .map(|c| {
-                format!(
-                    "{}: {}",
-                    c.author_login.as_deref().unwrap_or("someone"),
-                    c.body
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let transcript = transcript_up_to(&thread, marker_id);
 
         let prompt = format!(
             "{PERSONA}\n\nHelp turn this GitHub Discussion idea (\"{}\") into a properly \
@@ -108,7 +89,7 @@ pub async fn poll_once(
             .get("ready")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let marker = answered_marker(latest.database_id);
+        let marker = answered_marker(marker_id);
 
         if !ready {
             let reply = parsed
