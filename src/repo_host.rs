@@ -356,13 +356,27 @@ impl GithubRepoHost {
         &self,
         category_name: &str,
     ) -> Result<Vec<DiscussionThread>, String> {
+        // Fetches each top-level comment's `replies` too, not just `comments` --
+        // GitHub's own "Reply" button on a specific comment creates a *threaded*
+        // reply, not a new top-level comment, and that's the natural way a human
+        // responds to one of SweBot's own questions. Missing this meant a human
+        // reply via that (very normal) path was invisible and SweBot looked stuck.
+        // Flattened into one list alongside top-level comments below -- ordering by
+        // `database_id` (GitHub assigns these sequentially regardless of nesting)
+        // is all `next_to_answer`/`transcript_up_to` need, so no separate
+        // reply-vs-comment distinction has to survive past this point.
         const QUERY: &str = "query($owner: String!, $name: String!) { \
             repository(owner: $owner, name: $name) { \
               discussions(first: 25, orderBy: {field: UPDATED_AT, direction: DESC}) { \
                 nodes { \
                   id number title body url \
                   category { name } \
-                  comments(first: 50) { nodes { databaseId body author { login } } } \
+                  comments(first: 50) { \
+                    nodes { \
+                      databaseId body author { login } \
+                      replies(first: 50) { nodes { databaseId body author { login } } } \
+                    } \
+                  } \
                 } \
               } \
             } \
@@ -386,10 +400,19 @@ impl GithubRepoHost {
                     .comments
                     .nodes
                     .into_iter()
-                    .map(|c| DiscussionComment {
-                        database_id: c.database_id.unwrap_or(0),
-                        body: c.body,
-                        author_login: c.author.map(|a| a.login),
+                    .flat_map(|c| {
+                        let reply_comments =
+                            c.replies.nodes.into_iter().map(|r| DiscussionComment {
+                                database_id: r.database_id.unwrap_or(0),
+                                body: r.body,
+                                author_login: r.author.map(|a| a.login),
+                            });
+                        std::iter::once(DiscussionComment {
+                            database_id: c.database_id.unwrap_or(0),
+                            body: c.body,
+                            author_login: c.author.map(|a| a.login),
+                        })
+                        .chain(reply_comments)
                     })
                     .collect(),
             })
@@ -556,7 +579,7 @@ struct GhCategory {
     name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct GhCommentsConnection {
     nodes: Vec<GhComment>,
 }
@@ -568,6 +591,8 @@ struct GhComment {
     #[serde(default)]
     body: String,
     author: Option<GhAuthor>,
+    #[serde(default)]
+    replies: GhCommentsConnection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -912,6 +937,56 @@ mod tests {
         assert_eq!(ideas[0].comments.len(), 1);
         assert_eq!(ideas[0].comments[0].database_id, 111);
         assert_eq!(ideas[0].comments[0].author_login.as_deref(), Some("alice"));
+    }
+
+    /// Regression test for a real bug found running this live: GitHub's own "Reply"
+    /// button on a comment creates a *threaded* reply, not a new top-level comment --
+    /// the natural way a human answers one of SweBot's own questions. The original
+    /// query only fetched top-level `comments`, so a threaded reply was invisible
+    /// and SweBot looked stuck forever waiting for an answer that had, in fact,
+    /// already arrived.
+    #[tokio::test]
+    async fn threaded_replies_are_flattened_in_alongside_top_level_comments() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "discussions": {
+                            "nodes": [{
+                                "id": "D_1", "number": 1, "title": "archive download feature",
+                                "body": "export pictures as a zip",
+                                "url": "https://github.com/owner/name/discussions/1",
+                                "category": {"name": "Ideas"},
+                                "comments": {"nodes": [{
+                                    "databaseId": 100, "body": "which selection?",
+                                    "author": {"login": "swebot"},
+                                    "replies": {"nodes": [{
+                                        "databaseId": 101, "body": "whole archive",
+                                        "author": {"login": "alice"}
+                                    }]}
+                                }]}
+                            }]
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let h = host(&server, "SYMPHONY_TEST_RH_THREADED_REPLIES");
+        let ideas = h.list_discussions_in_category("Ideas").await.unwrap();
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(
+            ideas[0].comments.len(),
+            2,
+            "expected both the comment and its reply"
+        );
+        assert_eq!(ideas[0].comments[0].database_id, 100);
+        assert_eq!(ideas[0].comments[1].database_id, 101);
+        assert_eq!(ideas[0].comments[1].body, "whole archive");
+        assert_eq!(ideas[0].comments[1].author_login.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
