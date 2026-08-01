@@ -26,6 +26,10 @@ pub enum ConfigError {
         "invalid_config: repo.token must be a $VAR_NAME reference (naming an env var), not a literal value"
     )]
     InvalidRepoToken,
+    #[error(
+        "invalid_config: claude.api_key must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidClaudeApiKey,
     #[error("invalid_config: repo.url is required when the repo block is present")]
     MissingRepoUrl,
     #[error(
@@ -75,6 +79,20 @@ pub struct ClaudeConfig {
     pub permission_mode: String,
     pub turn_timeout_ms: u64,
     pub stall_timeout_ms: i64,
+    /// Name of an env var holding an Anthropic API key (no leading `$`), e.g.
+    /// `ANTHROPIC_API_KEY`. An alternative to `workspace.docker.mount_claude_credentials`
+    /// for authenticating the `claude` CLI in Docker mode: some hosts (Windows in
+    /// particular) don't keep a portable session in `~/.claude/.credentials.json` at
+    /// all, so there's nothing to mount -- an API key sidesteps that entirely. Named,
+    /// not resolved to a value here, for the same reason as `RepoConfig::token_env`:
+    /// referencing it by name is enough for `envsub::collect_var_refs` to pick it up
+    /// and forward it into containers via `docker run -e`, without Symphony itself
+    /// ever needing to hold or embed the actual key value. Not read anywhere beyond
+    /// `resolve()`'s own validation (that it's a `$VAR_NAME` reference, not a literal)
+    /// -- `collect_var_refs` walks the raw config tree directly, so this field's real
+    /// job is documenting and validating the convention, not driving further logic.
+    #[allow(dead_code)]
+    pub api_key_env: Option<String>,
 }
 
 /// Extension: run workspace hooks and the coding agent inside a per-ticket Docker
@@ -331,6 +349,13 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         model: get_str(claude, "model"),
         permission_mode: get_str(claude, "permission_mode")
             .unwrap_or_else(|| "bypassPermissions".to_string()),
+        api_key_env: get_str(claude, "api_key")
+            .map(|k| {
+                envsub::var_name_of(&k)
+                    .map(|s| s.to_string())
+                    .ok_or(ConfigError::InvalidClaudeApiKey)
+            })
+            .transpose()?,
         turn_timeout_ms: get_u64(claude, "turn_timeout_ms", 3_600_000),
         stall_timeout_ms: get_i64(claude, "stall_timeout_ms", 300_000),
     };
@@ -626,6 +651,29 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::InvalidRepoToken)
         ));
+    }
+
+    #[test]
+    fn claude_api_key_must_be_var_reference_not_a_literal() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nclaude:\n  api_key: sk-not-a-var-reference\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidClaudeApiKey)
+        ));
+    }
+
+    #[test]
+    fn claude_api_key_var_reference_resolves_and_is_collected_for_passthrough() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nclaude:\n  api_key: $ANTHROPIC_API_KEY\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.claude.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(
+            envsub::collect_var_refs(&cfg_yaml).contains(&"ANTHROPIC_API_KEY".to_string()),
+            "collect_var_refs must pick up claude.api_key so it gets forwarded into \
+             Docker-mode containers via env_passthrough"
+        );
     }
 
     /// End-to-end: actually *run* the synthesized hooks (via `hooks::run_hook`, the
