@@ -11,6 +11,7 @@ mod metrics;
 mod orchestrator;
 mod repo_host;
 mod status;
+mod swebot;
 mod template;
 mod tracker;
 mod workflow;

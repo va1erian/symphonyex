@@ -36,6 +36,12 @@ pub enum ConfigError {
     PullRequestRequiresGithubRepo,
     #[error("invalid_config: repo.pull_request requires repo.token to be set")]
     PullRequestRequiresRepoToken,
+    #[error(
+        "invalid_config: swebot.enabled requires repo.url to be a github.com URL (owner/name) -- SweBot's Q&A/drafting/review capabilities are GitHub-specific"
+    )]
+    SwebotRequiresGithubRepo,
+    #[error("invalid_config: swebot.enabled requires repo.token to be set")]
+    SwebotRequiresRepoToken,
     #[error("invalid_config: repo.url is required when the repo block is present")]
     MissingRepoUrl,
     #[error(
@@ -159,6 +165,30 @@ pub struct RepoConfig {
     pub pull_request: bool,
 }
 
+/// Extension: SweBot (README.md "SweBot") -- answers questions and drafts tickets in
+/// GitHub Discussions, and reviews the pull requests Symphony's coding agents open.
+/// GitHub-specific for v1 (Discussions has no REST equivalent Symphony's other
+/// adapters could target), keyed off `repo:` -- the same "which GitHub repo" source
+/// of truth `repo.pull_request` already uses -- rather than `tracker.provider.repo`,
+/// so it works the same way regardless of `tracker.kind`. Off by default, same
+/// deliberate-opt-in posture as `repo.pull_request` and
+/// `workspace.docker.mount_claude_credentials`: this posts real comments and reviews
+/// on a real GitHub repo.
+#[derive(Debug, Clone)]
+pub struct SwebotConfig {
+    pub enabled: bool,
+    /// Discussion category name SweBot treats as incoming questions.
+    pub qa_discussion_category: String,
+    /// Discussion category name SweBot treats as ticket ideas to draft.
+    pub drafting_discussion_category: String,
+    /// Whether SweBot reviews the pull requests Symphony's own coding agents open
+    /// (branch name matching `issue-<identifier>`, the same convention
+    /// `synthesize_repo_hooks` produces). Independent toggle from `enabled` at large
+    /// so a project can run Q&A/drafting without also turning on review, or vice
+    /// versa, without a second top-level flag.
+    pub review_enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker_kind: String,
@@ -181,6 +211,7 @@ pub struct EffectiveConfig {
     /// named-volume mount at startup.
     #[allow(dead_code)]
     pub repo: Option<RepoConfig>,
+    pub swebot: SwebotConfig,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -326,6 +357,35 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         })
         .transpose()?;
 
+    let swebot_raw = get(config, "swebot").unwrap_or(&empty);
+    let swebot_enabled = get(swebot_raw, "enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let swebot_qa = get(swebot_raw, "qa").unwrap_or(&empty);
+    let swebot_drafting = get(swebot_raw, "drafting").unwrap_or(&empty);
+    let swebot_review = get(swebot_raw, "review").unwrap_or(&empty);
+    let swebot_cfg = SwebotConfig {
+        enabled: swebot_enabled,
+        qa_discussion_category: get_str(swebot_qa, "discussion_category")
+            .unwrap_or_else(|| "Q&A".to_string()),
+        drafting_discussion_category: get_str(swebot_drafting, "discussion_category")
+            .unwrap_or_else(|| "Ideas".to_string()),
+        review_enabled: get(swebot_review, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(swebot_enabled),
+    };
+    if swebot_cfg.enabled {
+        let repo = repo_cfg
+            .as_ref()
+            .ok_or(ConfigError::SwebotRequiresGithubRepo)?;
+        if crate::repo_host::parse_github_owner_repo(&repo.url).is_none() {
+            return Err(ConfigError::SwebotRequiresGithubRepo);
+        }
+        if repo.token_env.is_none() {
+            return Err(ConfigError::SwebotRequiresRepoToken);
+        }
+    }
+
     // An explicit `hooks.*` entry always wins, per-hook (not all-or-nothing) -- a
     // project can override just one of the three and still get the synthesized
     // defaults for the others.
@@ -407,6 +467,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         workspace_root,
         docker: docker_cfg,
         repo: repo_cfg,
+        swebot: swebot_cfg,
 
         hook_after_create,
         hook_before_run,
@@ -724,6 +785,70 @@ mod tests {
             parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n");
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert!(!cfg.repo.unwrap().pull_request);
+    }
+
+    #[test]
+    fn swebot_enabled_requires_a_repo_block() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nswebot:\n  enabled: true\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::SwebotRequiresGithubRepo)
+        ));
+    }
+
+    #[test]
+    fn swebot_enabled_requires_a_github_repo_url() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://gitlab.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN\nswebot:\n  enabled: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::SwebotRequiresGithubRepo)
+        ));
+    }
+
+    #[test]
+    fn swebot_enabled_requires_a_repo_token() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n\
+             swebot:\n  enabled: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::SwebotRequiresRepoToken)
+        ));
+    }
+
+    #[test]
+    fn swebot_disabled_by_default_and_needs_no_repo() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.swebot.enabled);
+    }
+
+    #[test]
+    fn swebot_review_enabled_defaults_to_the_top_level_flag_but_can_be_overridden() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_2\nswebot:\n  enabled: true\n  \
+             review:\n    enabled: false\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.swebot.enabled);
+        assert!(!cfg.swebot.review_enabled);
+    }
+
+    #[test]
+    fn swebot_discussion_categories_default_and_can_be_overridden() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_3\nswebot:\n  enabled: true\n  \
+             drafting:\n    discussion_category: Feature Requests\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.swebot.qa_discussion_category, "Q&A");
+        assert_eq!(cfg.swebot.drafting_discussion_category, "Feature Requests");
     }
 
     #[test]

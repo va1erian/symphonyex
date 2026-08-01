@@ -327,6 +327,17 @@ pub async fn run(
         });
     }
 
+    // Spawned once against this startup's config snapshot, like the status
+    // dashboard above -- a `swebot:` config change (unlike most of `EffectiveConfig`)
+    // needs a restart to take effect, not picked up by `maybe_reload`'s hot reload.
+    if shared.config.swebot.enabled {
+        let swebot_cfg = shared.config.clone();
+        let swebot_tracker = shared.tracker.clone();
+        tokio::spawn(async move {
+            crate::swebot::run(swebot_cfg, swebot_tracker).await;
+        });
+    }
+
     let mut interval = tokio::time::interval(Duration::from_millis(shared.config.poll_interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 

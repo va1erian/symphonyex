@@ -15,11 +15,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
+tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "io-util", "signal", "io-std", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
 wiremock = "0.6.5"
