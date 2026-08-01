@@ -22,6 +22,7 @@
 //! host-mediated and adapter-scoped, not raw command/file access.
 
 use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use crate::container::{self, ContainerHandle};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,9 @@ pub struct ClaudeBackend {
     pub permission_mode: String,
     pub turn_timeout_ms: u64,
     pub mcp_wiring: Option<McpToolWiring>,
+    /// Needed independent of `mcp_wiring` to map a host workspace path to its
+    /// in-container equivalent in Docker mode (see README.md "Docker mode").
+    pub workflow_dir: PathBuf,
 }
 
 #[async_trait]
@@ -57,9 +61,10 @@ impl AgentBackend for ClaudeBackend {
         workspace: &Path,
         issue_id: &str,
         _title: &str,
+        container: Option<&ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         let mcp_config_path = match &self.mcp_wiring {
-            Some(wiring) => match write_mcp_config(workspace, wiring, issue_id) {
+            Some(wiring) => match write_mcp_config(workspace, wiring, issue_id, container) {
                 Ok(path) => Some(path),
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to write MCP tool config; continuing without provider-native tools");
@@ -69,6 +74,9 @@ impl AgentBackend for ClaudeBackend {
             None => None,
         };
 
+        let container_workspace_path =
+            container.map(|c| c.to_container_path(&self.workflow_dir, workspace));
+
         Ok(Box::new(ClaudeSession {
             command: self.command.clone(),
             extra_args: self.extra_args.clone(),
@@ -76,6 +84,8 @@ impl AgentBackend for ClaudeBackend {
             permission_mode: self.permission_mode.clone(),
             turn_timeout_ms: self.turn_timeout_ms,
             workspace: workspace.to_path_buf(),
+            container: container.cloned(),
+            container_workspace_path,
             mcp_config_path,
             session_id: None,
         }))
@@ -84,18 +94,37 @@ impl AgentBackend for ClaudeBackend {
 
 /// Write `<workspace>/.symphony-mcp.json` pointing back at `symphony __mcp_tool_server`
 /// for this issue, bound once per session per Section 10.5's "one session snapshot"
-/// requirement (not re-derived per turn).
-fn write_mcp_config(workspace: &Path, wiring: &McpToolWiring, issue_id: &str) -> std::io::Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+/// requirement (not re-derived per turn). Written via the host filesystem either way --
+/// in Docker mode the file lands in the bind-mounted workspace directory, so it's
+/// visible inside the container at the corresponding mapped path without any extra
+/// step -- but its *contents* (the `command` to exec and the `--workflow-dir` value)
+/// must point at in-container paths, not host ones, since `claude` itself runs inside
+/// the container in that mode and would otherwise try to exec a Windows `.exe`.
+fn write_mcp_config(
+    workspace: &Path,
+    wiring: &McpToolWiring,
+    issue_id: &str,
+    container: Option<&ContainerHandle>,
+) -> std::io::Result<PathBuf> {
+    let (command, workflow_dir_arg) = match container {
+        Some(c) => (
+            container::CONTAINER_SYMPHONY_BIN.to_string(),
+            c.container_root.to_string_lossy().to_string(),
+        ),
+        None => (
+            std::env::current_exe()?.to_string_lossy().to_string(),
+            wiring.workflow_dir.to_string_lossy().to_string(),
+        ),
+    };
     let config = json!({
         "mcpServers": {
             "symphony": {
-                "command": exe.to_string_lossy(),
+                "command": command,
                 "args": [
                     "__mcp_tool_server",
                     "--tracker-kind", wiring.tracker_kind,
                     "--tracker-provider", wiring.tracker_provider_json,
-                    "--workflow-dir", wiring.workflow_dir.to_string_lossy(),
+                    "--workflow-dir", workflow_dir_arg,
                     "--issue-id", issue_id,
                 ]
             }
@@ -113,8 +142,46 @@ struct ClaudeSession {
     permission_mode: String,
     turn_timeout_ms: u64,
     workspace: PathBuf,
+    container: Option<ContainerHandle>,
+    container_workspace_path: Option<PathBuf>,
     mcp_config_path: Option<PathBuf>,
     session_id: Option<String>,
+}
+
+/// Cancellation-safe cleanup for a `docker exec`-launched turn: killing the host-side
+/// `docker exec` client (e.g. via `kill_on_drop` when the orchestrator aborts this
+/// task) only terminates that client, not the process it was attached to *inside* the
+/// container -- so without this, an aborted turn's `claude` process keeps running
+/// orphaned. Armed for the lifetime of a container-mode turn; `disarm()` on the normal
+/// completion path so a turn that already exited on its own doesn't also fire a
+/// needless (harmless, but pointless) `pkill` against a process that's already gone.
+struct ContainerKillGuard {
+    container_name: Option<String>,
+    process_name: String,
+}
+
+impl ContainerKillGuard {
+    fn armed(container_name: String, process_name: String) -> Self {
+        Self {
+            container_name: Some(container_name),
+            process_name,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.container_name = None;
+    }
+}
+
+impl Drop for ContainerKillGuard {
+    fn drop(&mut self) {
+        if let Some(name) = self.container_name.take() {
+            let process_name = self.process_name.clone();
+            tokio::spawn(async move {
+                container::kill_process_by_name(&name, &process_name).await;
+            });
+        }
+    }
 }
 
 #[async_trait]
@@ -128,41 +195,69 @@ impl AgentSession for ClaudeSession {
         prompt: &str,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AgentError> {
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&self.extra_args)
-            .arg("-p")
-            .arg(prompt)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose")
-            .arg("--permission-mode")
-            .arg(&self.permission_mode);
+        let mut claude_args: Vec<String> = self.extra_args.clone();
+        claude_args.extend([
+            "-p".to_string(),
+            prompt.to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--permission-mode".to_string(),
+            self.permission_mode.clone(),
+        ]);
         if let Some(model) = &self.model {
-            cmd.arg("--model").arg(model);
+            claude_args.push("--model".to_string());
+            claude_args.push(model.clone());
         }
         if let Some(sid) = &self.session_id {
-            cmd.arg("--resume").arg(sid);
+            claude_args.push("--resume".to_string());
+            claude_args.push(sid.clone());
         }
         if let Some(mcp_config_path) = &self.mcp_config_path {
-            // `claude`'s cwd is already `self.workspace` (set below), and it appears to
-            // mis-resolve an absolute --mcp-config path against that cwd (doubling it)
-            // rather than using it as-is. Passing just the filename sidesteps that.
-            let file_name = mcp_config_path.file_name().unwrap_or(mcp_config_path.as_os_str());
-            cmd.arg("--mcp-config")
-                .arg(file_name)
-                .arg("--strict-mcp-config")
-                .arg("--allowedTools")
-                .arg("mcp__symphony__*");
+            // `claude`'s cwd is already the workspace (host or in-container, set
+            // below), and it appears to mis-resolve an absolute --mcp-config path
+            // against that cwd (doubling it) rather than using it as-is. Passing just
+            // the filename sidesteps that.
+            let file_name = mcp_config_path
+                .file_name()
+                .unwrap_or(mcp_config_path.as_os_str());
+            claude_args.push("--mcp-config".to_string());
+            claude_args.push(file_name.to_string_lossy().to_string());
+            claude_args.push("--strict-mcp-config".to_string());
+            claude_args.push("--allowedTools".to_string());
+            claude_args.push("mcp__symphony__*".to_string());
         }
-        cmd.current_dir(&self.workspace)
-            .stdin(Stdio::null())
+
+        let mut kill_guard: Option<ContainerKillGuard> = None;
+        let mut cmd = match (&self.container, &self.container_workspace_path) {
+            (Some(container), Some(container_workspace)) => {
+                let mut c = Command::new("docker");
+                c.arg("exec")
+                    .arg("-w")
+                    .arg(container_workspace.to_string_lossy().to_string())
+                    .arg(&container.name)
+                    .arg(&self.command)
+                    .args(&claude_args);
+                kill_guard = Some(ContainerKillGuard::armed(
+                    container.name.clone(),
+                    self.command.clone(),
+                ));
+                c
+            }
+            _ => {
+                let mut c = Command::new(&self.command);
+                c.args(&claude_args).current_dir(&self.workspace);
+                c
+            }
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AgentError::NotFound(format!("failed to launch '{}': {e}", self.command)))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            AgentError::NotFound(format!("failed to launch '{}': {e}", self.command))
+        })?;
 
         let stdout = child.stdout.take().expect("piped stdout");
         let mut lines = BufReader::new(stdout).lines();
@@ -210,9 +305,7 @@ impl AgentSession for ClaudeSession {
                     }
                 }
                 Err(_) => {
-                    let _ = events.send(
-                        AgentEvent::new("malformed").with_message(truncate(&line)),
-                    );
+                    let _ = events.send(AgentEvent::new("malformed").with_message(truncate(&line)));
                 }
             }
         }
@@ -221,6 +314,14 @@ impl AgentSession for ClaudeSession {
             .wait()
             .await
             .map_err(|e| AgentError::ProcessExit(e.to_string()))?;
+
+        // The subprocess (host `claude`, or the `docker exec` client) exited on its
+        // own by this point -- whatever it was attached to inside a container is
+        // already gone too, so the guard's cleanup-on-drop would be a no-op anyway.
+        // Disarming just skips the pointless `pkill` call.
+        if let Some(guard) = &mut kill_guard {
+            guard.disarm();
+        }
 
         match outcome {
             Some(o) => Ok(o),
@@ -274,7 +375,8 @@ impl ClaudeSession {
                         .and_then(|r| r.as_str())
                         .unwrap_or("claude reported is_error=true")
                         .to_string();
-                    let _ = events.send(AgentEvent::new("turn_failed").with_message(reason.clone()));
+                    let _ =
+                        events.send(AgentEvent::new("turn_failed").with_message(reason.clone()));
                     Some(TurnOutcome::Failed { reason })
                 } else {
                     let _ = events.send({
@@ -292,7 +394,8 @@ impl ClaudeSession {
                 None
             }
             other => {
-                let _ = events.send(AgentEvent::new("other_message").with_message(other.to_string()));
+                let _ =
+                    events.send(AgentEvent::new("other_message").with_message(other.to_string()));
                 None
             }
         }
@@ -317,7 +420,11 @@ fn extract_text(v: &Value) -> Option<String> {
 /// event vocabulary doesn't name tool calls explicitly; we surface them as our own
 /// `tool_call` event for usage metrics).
 fn extract_tool_uses(v: &Value) -> Vec<String> {
-    let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+    let Some(content) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
         return Vec::new();
     };
     content
@@ -392,7 +499,10 @@ mod tests {
         assert_eq!(extract_text(&v).as_deref(), Some("doing two things"));
         assert_eq!(
             extract_tool_uses(&v),
-            vec!["Read".to_string(), "mcp__symphony__update_issue_state".to_string()]
+            vec![
+                "Read".to_string(),
+                "mcp__symphony__update_issue_state".to_string()
+            ]
         );
     }
 

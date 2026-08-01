@@ -8,6 +8,7 @@
 pub mod claude;
 pub mod codex;
 
+use crate::container::ContainerHandle;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::path::Path;
@@ -57,8 +58,12 @@ pub enum TurnOutcome {
     /// `usage` is informational; the orchestrator's authoritative token accounting comes
     /// from `AgentEvent::usage` on the `turn_completed` event.
     #[allow(dead_code)]
-    Completed { usage: Option<TokenUsage> },
-    Failed { reason: String },
+    Completed {
+        usage: Option<TokenUsage>,
+    },
+    Failed {
+        reason: String,
+    },
 }
 
 /// RECOMMENDED normalized error categories (Section 10.6).
@@ -98,11 +103,13 @@ pub trait AgentBackend: Send + Sync {
     /// Start (or prepare to start) a session rooted at `workspace`. `issue_id` is the
     /// opaque dispatch id (used to bind any provider-native tool wiring to this issue);
     /// `title` is used for turn/session titling where the backend supports it (Section
-    /// 10.2).
+    /// 10.2). `container` is `Some` in Docker mode (see README.md) -- backends that
+    /// don't support it (currently: Codex) may ignore it.
     async fn start_session(
         &self,
         workspace: &Path,
         issue_id: &str,
         title: &str,
+        container: Option<&ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError>;
 }

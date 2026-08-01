@@ -43,11 +43,17 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { success: true, content: content.into() }
+        Self {
+            success: true,
+            content: content.into(),
+        }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { success: false, content: content.into() }
+        Self {
+            success: false,
+            content: content.into(),
+        }
     }
 }
 
@@ -70,7 +76,12 @@ pub trait TrackerAdapter: Send + Sync {
 
     /// Execute a provider-native tool call host-side, with the adapter's configured
     /// credential, for the given opaque dispatch `issue_id`. Default: unsupported.
-    async fn execute_agent_tool(&self, name: &str, _arguments: serde_json::Value, _issue_id: &str) -> ToolResult {
+    async fn execute_agent_tool(
+        &self,
+        name: &str,
+        _arguments: serde_json::Value,
+        _issue_id: &str,
+    ) -> ToolResult {
         ToolResult::error(format!("unsupported tool '{name}'"))
     }
 }
@@ -83,7 +94,10 @@ pub fn build(
     workflow_dir: &std::path::Path,
 ) -> Result<Box<dyn TrackerAdapter>, TrackerError> {
     match kind {
-        "local" => Ok(Box::new(local::LocalTrackerAdapter::new(provider, workflow_dir)?)),
+        "local" => Ok(Box::new(local::LocalTrackerAdapter::new(
+            provider,
+            workflow_dir,
+        )?)),
         other => Err(TrackerError::UnsupportedTrackerKind(other.to_string())),
     }
 }

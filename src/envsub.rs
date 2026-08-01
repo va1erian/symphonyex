@@ -39,11 +39,7 @@ pub fn resolve_path(value: &str, base_dir: &Path) -> PathBuf {
     let resolved = resolve_var(value).unwrap_or_default();
     let expanded = expand_home(&resolved);
     let p = PathBuf::from(expanded);
-    let joined = if p.is_absolute() {
-        p
-    } else {
-        base_dir.join(p)
-    };
+    let joined = if p.is_absolute() { p } else { base_dir.join(p) };
     normalize(&joined)
 }
 

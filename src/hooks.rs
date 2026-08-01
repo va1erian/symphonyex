@@ -39,7 +39,12 @@ pub enum HookError {
 /// Run `script` as `bash -l -s` (script piped over stdin) in `cwd`, enforcing
 /// `timeout_ms`. stdout/stderr are captured and truncated before logging (Section
 /// 15.4).
-pub async fn run_hook(name: &str, script: &str, cwd: &Path, timeout_ms: u64) -> Result<(), HookError> {
+pub async fn run_hook(
+    name: &str,
+    script: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<(), HookError> {
     tracing::debug!(hook = name, %timeout_ms, "starting workspace hook");
 
     let mut cmd = Command::new("bash");
@@ -86,6 +91,34 @@ pub async fn run_hook(name: &str, script: &str, cwd: &Path, timeout_ms: u64) -> 
         Err(_) => {
             tracing::warn!(hook = name, %timeout_ms, "hook timed out");
             Err(HookError::Timeout(timeout_ms))
+        }
+    }
+}
+
+/// Run a hook either on the host (`container` is `None`, today's behavior, unchanged)
+/// or inside a Docker container (Docker mode, see README.md and `crate::container`).
+/// `host_cwd` is still required in the container case: it's used to map to the
+/// container-side working directory via `ContainerHandle::to_container_path`, keeping
+/// every call site working in host `PathBuf`s as it does today and converting only
+/// here, at the exec boundary.
+pub async fn run_hook_maybe_containerized(
+    name: &str,
+    script: &str,
+    host_root: &std::path::Path,
+    host_cwd: &Path,
+    timeout_ms: u64,
+    container: Option<&crate::container::ContainerHandle>,
+) -> Result<(), HookError> {
+    match container {
+        None => run_hook(name, script, host_cwd, timeout_ms).await,
+        Some(c) => {
+            let container_cwd = c.to_container_path(host_root, host_cwd);
+            crate::container::exec_script(c, &container_cwd, script, timeout_ms)
+                .await
+                .map_err(|e| HookError::NonZeroExit {
+                    status: "docker exec".to_string(),
+                    output: e.to_string(),
+                })
         }
     }
 }
@@ -141,6 +174,9 @@ esac
         let res = run_hook("test", script, dir.path(), 5000).await;
         assert!(res.is_ok(), "{res:?}");
         let contents = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
-        assert!(contents.starts_with("matched:"), "unexpected contents: {contents:?}");
+        assert!(
+            contents.starts_with("matched:"),
+            "unexpected contents: {contents:?}"
+        );
     }
 }

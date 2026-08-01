@@ -18,6 +18,10 @@ pub enum ConfigError {
     InvalidHookTimeout,
     #[error("invalid_config: {backend}.command must be present and non-empty")]
     MissingAgentCommand { backend: String },
+    #[error(
+        "invalid_config: workspace.docker.image is required when workspace.docker.enabled is true"
+    )]
+    MissingDockerImage,
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -61,6 +65,20 @@ pub struct ClaudeConfig {
     pub stall_timeout_ms: i64,
 }
 
+/// Extension: run workspace hooks and the coding agent inside a per-ticket Docker
+/// container (bind-mounted to `workflow_dir`) instead of directly on the host. See
+/// README.md "Docker mode" -- this exists specifically to eliminate the class of bug
+/// where the hook's shell (WSL) and the agent's own shell (Git Bash/MSYS) disagree
+/// about how to spell a Windows path for the same directory.
+#[derive(Debug, Clone)]
+pub struct DockerConfig {
+    pub enabled: bool,
+    pub image: Option<String>,
+    pub network: String,
+    pub mem_limit: Option<String>,
+    pub cpus: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker_kind: String,
@@ -76,6 +94,7 @@ pub struct EffectiveConfig {
     pub poll_interval_ms: u64,
 
     pub workspace_root: PathBuf,
+    pub docker: DockerConfig,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -146,7 +165,9 @@ fn get_vec_str(v: &Value, key: &str) -> Vec<String> {
 }
 
 fn get_map(v: &Value, key: &str) -> Value {
-    get(v, key).cloned().unwrap_or(Value::Mapping(Default::default()))
+    get(v, key)
+        .cloned()
+        .unwrap_or(Value::Mapping(Default::default()))
 }
 
 /// Resolve typed effective config from raw front matter (Section 6.1-6.4).
@@ -165,9 +186,19 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
 
     let tracker_kind = get_str(tracker, "kind").ok_or(ConfigError::MissingTrackerKind)?;
 
-    let workspace_root_raw = get_str(workspace, "root")
-        .unwrap_or_else(default_workspace_root);
+    let workspace_root_raw = get_str(workspace, "root").unwrap_or_else(default_workspace_root);
     let workspace_root = envsub::resolve_path(&workspace_root_raw, workflow_dir);
+
+    let docker = get(workspace, "docker").unwrap_or(&empty);
+    let docker_cfg = DockerConfig {
+        enabled: get(docker, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        image: get_str(docker, "image"),
+        network: get_str(docker, "network").unwrap_or_else(|| "bridge".to_string()),
+        mem_limit: get_str(docker, "mem_limit"),
+        cpus: get_str(docker, "cpus"),
+    };
 
     let hook_timeout_ms = get_u64(hooks, "timeout_ms", 60_000);
     if hook_timeout_ms == 0 {
@@ -186,7 +217,11 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 .filter_map(|(k, v)| {
                     let key = k.as_str()?.trim().to_lowercase();
                     let val = v.as_i64()?;
-                    if val > 0 { Some((key, val as u32)) } else { None }
+                    if val > 0 {
+                        Some((key, val as u32))
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         })
@@ -228,6 +263,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         poll_interval_ms: get_u64(polling, "interval_ms", 30_000),
 
         workspace_root,
+        docker: docker_cfg,
 
         hook_after_create: get_str(hooks, "after_create"),
         hook_before_run: get_str(hooks, "before_run"),
@@ -261,7 +297,9 @@ pub fn validate_for_dispatch(
     supported_tracker_kinds: &[&str],
 ) -> Result<(), ConfigError> {
     if !supported_tracker_kinds.contains(&cfg.tracker_kind.as_str()) {
-        return Err(ConfigError::UnsupportedTrackerKind(cfg.tracker_kind.clone()));
+        return Err(ConfigError::UnsupportedTrackerKind(
+            cfg.tracker_kind.clone(),
+        ));
     }
     let command = cfg.effective_command();
     if command.trim().is_empty() {
@@ -272,6 +310,9 @@ pub fn validate_for_dispatch(
         return Err(ConfigError::MissingAgentCommand {
             backend: backend.to_string(),
         });
+    }
+    if cfg.docker.enabled && cfg.docker.image.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(ConfigError::MissingDockerImage);
     }
     Ok(())
 }
@@ -312,8 +353,46 @@ mod tests {
         );
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert_eq!(cfg.concurrency_limit_for_state("in progress"), 3);
-        assert_eq!(cfg.concurrency_limit_for_state("bad"), cfg.max_concurrent_agents);
-        assert_eq!(cfg.concurrency_limit_for_state("also_bad"), cfg.max_concurrent_agents);
+        assert_eq!(
+            cfg.concurrency_limit_for_state("bad"),
+            cfg.max_concurrent_agents
+        );
+        assert_eq!(
+            cfg.concurrency_limit_for_state("also_bad"),
+            cfg.max_concurrent_agents
+        );
+    }
+
+    #[test]
+    fn docker_disabled_by_default() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.docker.enabled);
+        assert_eq!(cfg.docker.network, "bridge");
+    }
+
+    #[test]
+    fn docker_block_parses() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nworkspace:\n  docker:\n    enabled: true\n    image: my-agent:latest\n    network: none\n    mem_limit: 4g\n    cpus: \"2\"\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.docker.enabled);
+        assert_eq!(cfg.docker.image.as_deref(), Some("my-agent:latest"));
+        assert_eq!(cfg.docker.network, "none");
+        assert_eq!(cfg.docker.mem_limit.as_deref(), Some("4g"));
+        assert_eq!(cfg.docker.cpus.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn validate_rejects_docker_enabled_without_image() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nworkspace:\n  docker:\n    enabled: true\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(matches!(
+            validate_for_dispatch(&cfg, &["local"]),
+            Err(ConfigError::MissingDockerImage)
+        ));
     }
 
     #[test]

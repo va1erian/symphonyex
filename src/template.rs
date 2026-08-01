@@ -76,7 +76,11 @@ fn tokenize(template: &str) -> Result<Vec<Token>, TemplateError> {
             tokens.push(Token::Text(rest[..idx].to_string()));
         }
         let is_output = rest[idx..].starts_with("{{");
-        let (open, close) = if is_output { ("{{", "}}") } else { ("{%", "%}") };
+        let (open, close) = if is_output {
+            ("{{", "}}")
+        } else {
+            ("{%", "%}")
+        };
         let after_open = &rest[idx + open.len()..];
         let Some(end) = after_open.find(close) else {
             return Err(TemplateError::Parse(format!("unterminated '{open}'")));
@@ -189,7 +193,9 @@ fn parse_for_expr(inner: &str) -> Result<(String, Vec<String>), TemplateError> {
         .ok_or_else(|| TemplateError::Parse(format!("malformed for tag: '{inner}'")))?;
     let var = var.trim().to_string();
     if var.is_empty() {
-        return Err(TemplateError::Parse("for loop missing variable name".to_string()));
+        return Err(TemplateError::Parse(
+            "for loop missing variable name".to_string(),
+        ));
     }
     Ok((var, parse_path(path_part.trim())?))
 }
@@ -207,8 +213,8 @@ fn apply_filter(value: Value, filter: &Filter) -> Result<Value, TemplateError> {
         "upcase" => Ok(Value::String(display(&value).to_uppercase())),
         "downcase" => Ok(Value::String(display(&value).to_lowercase())),
         "default" => {
-            let is_empty = matches!(&value, Value::Null)
-                || matches!(&value, Value::String(s) if s.is_empty());
+            let is_empty =
+                matches!(&value, Value::Null) || matches!(&value, Value::String(s) if s.is_empty());
             if is_empty {
                 Ok(Value::String(filter.arg.clone().unwrap_or_default()))
             } else {
@@ -233,7 +239,11 @@ fn display(value: &Value) -> String {
 /// Every path segment MUST exist as a key; a missing key is an unknown-variable error
 /// even if an earlier segment resolved to `null`... except the final segment, whose
 /// value MAY legitimately be `null`.
-fn resolve(path: &[String], scopes: &[(String, Value)], root: &Value) -> Result<Value, TemplateError> {
+fn resolve(
+    path: &[String],
+    scopes: &[(String, Value)],
+    root: &Value,
+) -> Result<Value, TemplateError> {
     let (head, tail) = path.split_first().expect("path is never empty");
 
     let mut current = if let Some((_, v)) = scopes.iter().rev().find(|(name, _)| name == head) {

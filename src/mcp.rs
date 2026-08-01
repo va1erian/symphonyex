@@ -18,7 +18,10 @@ use crate::tracker::TrackerAdapter;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-pub async fn run_stdio_server(adapter: Box<dyn TrackerAdapter>, issue_id: &str) -> anyhow::Result<()> {
+pub async fn run_stdio_server(
+    adapter: Box<dyn TrackerAdapter>,
+    issue_id: &str,
+) -> anyhow::Result<()> {
     let specs = adapter.agent_tool_specs();
 
     let stdin = tokio::io::stdin();
@@ -63,8 +66,14 @@ pub async fn run_stdio_server(adapter: Box<dyn TrackerAdapter>, issue_id: &str) 
                 write_result(&mut stdout, id, json!({"tools": tools})).await?;
             }
             "tools/call" => {
-                let name = msg.pointer("/params/name").and_then(|v| v.as_str()).unwrap_or_default();
-                let arguments = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+                let name = msg
+                    .pointer("/params/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let arguments = msg
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or(json!({}));
                 let result = adapter.execute_agent_tool(name, arguments, issue_id).await;
                 write_result(
                     &mut stdout,
@@ -78,7 +87,13 @@ pub async fn run_stdio_server(adapter: Box<dyn TrackerAdapter>, issue_id: &str) 
             }
             other => {
                 if id.is_some() {
-                    write_error(&mut stdout, id, -32601, &format!("method not found: {other}")).await?;
+                    write_error(
+                        &mut stdout,
+                        id,
+                        -32601,
+                        &format!("method not found: {other}"),
+                    )
+                    .await?;
                 }
             }
         }
@@ -86,12 +101,29 @@ pub async fn run_stdio_server(adapter: Box<dyn TrackerAdapter>, issue_id: &str) 
     Ok(())
 }
 
-async fn write_result(stdout: &mut tokio::io::Stdout, id: Option<Value>, result: Value) -> anyhow::Result<()> {
-    write_line(stdout, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await
+async fn write_result(
+    stdout: &mut tokio::io::Stdout,
+    id: Option<Value>,
+    result: Value,
+) -> anyhow::Result<()> {
+    write_line(
+        stdout,
+        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    )
+    .await
 }
 
-async fn write_error(stdout: &mut tokio::io::Stdout, id: Option<Value>, code: i64, message: &str) -> anyhow::Result<()> {
-    write_line(stdout, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).await
+async fn write_error(
+    stdout: &mut tokio::io::Stdout,
+    id: Option<Value>,
+    code: i64,
+    message: &str,
+) -> anyhow::Result<()> {
+    write_line(
+        stdout,
+        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+    )
+    .await
 }
 
 async fn write_line(stdout: &mut tokio::io::Stdout, value: &Value) -> anyhow::Result<()> {

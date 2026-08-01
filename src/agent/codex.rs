@@ -40,9 +40,12 @@ impl AgentBackend for CodexBackend {
         workspace: &Path,
         _issue_id: &str,
         title: &str,
+        _container: Option<&crate::container::ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         if !workspace.is_dir() {
-            return Err(AgentError::InvalidCwd(format!("{workspace:?} is not a directory")));
+            return Err(AgentError::InvalidCwd(format!(
+                "{workspace:?} is not a directory"
+            )));
         }
 
         // Unlike hooks (see src/hooks.rs's module doc for the argv-corruption pitfalls
@@ -60,7 +63,9 @@ impl AgentBackend for CodexBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| AgentError::NotFound(format!("failed to launch '{}': {e}", self.command)))?;
+            .map_err(|e| {
+                AgentError::NotFound(format!("failed to launch '{}': {e}", self.command))
+            })?;
 
         // Diagnostic stderr is drained separately from the protocol stream (Section 10.3).
         if let Some(stderr) = child.stderr.take() {
@@ -131,7 +136,8 @@ struct CodexSession {
 
 impl CodexSession {
     async fn send(&mut self, payload: &Value) -> Result<(), AgentError> {
-        let mut line = serde_json::to_string(payload).map_err(|e| AgentError::ResponseError(e.to_string()))?;
+        let mut line =
+            serde_json::to_string(payload).map_err(|e| AgentError::ResponseError(e.to_string()))?;
         line.push('\n');
         self.stdin
             .write_all(line.as_bytes())
@@ -152,7 +158,9 @@ impl CodexSession {
                 .await
                 .map_err(|_| AgentError::ResponseTimeout(format!("no response to '{method}'")))?
                 .map_err(|e| AgentError::ProcessExit(e.to_string()))?
-                .ok_or_else(|| AgentError::ProcessExit("codex app-server closed stdout".to_string()))?;
+                .ok_or_else(|| {
+                    AgentError::ProcessExit("codex app-server closed stdout".to_string())
+                })?;
 
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -254,7 +262,9 @@ impl AgentSession for CodexSession {
     }
 
     async fn stop(mut self: Box<Self>) {
-        let _ = self.send(&json!({"jsonrpc": "2.0", "method": "shutdown", "params": {}})).await;
+        let _ = self
+            .send(&json!({"jsonrpc": "2.0", "method": "shutdown", "params": {}}))
+            .await;
         let _ = self.child.start_kill();
     }
 }
@@ -265,9 +275,10 @@ fn extract_usage_leniently(msg: &Value) -> Option<TokenUsage> {
             Value::Object(map) => {
                 for (k, val) in map {
                     if k.to_lowercase().contains(needle)
-                        && let Some(n) = val.as_u64() {
-                            return Some(n);
-                        }
+                        && let Some(n) = val.as_u64()
+                    {
+                        return Some(n);
+                    }
                     if let Some(n) = find_u64(val, needle) {
                         return Some(n);
                     }

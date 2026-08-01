@@ -15,11 +15,17 @@ pub enum FrontMatterError {
 /// block, returns an empty map and the whole input (trimmed) as body.
 pub fn split(raw: &str) -> Result<(serde_yaml::Value, String), FrontMatterError> {
     let Some(after_first) = raw.strip_prefix("---") else {
-        return Ok((serde_yaml::Value::Mapping(Default::default()), raw.trim().to_string()));
+        return Ok((
+            serde_yaml::Value::Mapping(Default::default()),
+            raw.trim().to_string(),
+        ));
     };
     let after_first = after_first.strip_prefix('\n').unwrap_or(after_first);
     let Some(end) = find_end(after_first) else {
-        return Ok((serde_yaml::Value::Mapping(Default::default()), raw.trim().to_string()));
+        return Ok((
+            serde_yaml::Value::Mapping(Default::default()),
+            raw.trim().to_string(),
+        ));
     };
     let (front_matter, rest) = after_first.split_at(end);
     let rest = strip_closing_marker(rest);
@@ -53,5 +59,8 @@ fn find_end(after_first: &str) -> Option<usize> {
 
 fn strip_closing_marker(rest: &str) -> &str {
     let rest = rest.strip_prefix("---").unwrap_or(rest);
-    rest.strip_prefix('\r').unwrap_or(rest).strip_prefix('\n').unwrap_or(rest)
+    rest.strip_prefix('\r')
+        .unwrap_or(rest)
+        .strip_prefix('\n')
+        .unwrap_or(rest)
 }

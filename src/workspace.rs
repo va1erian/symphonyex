@@ -1,5 +1,7 @@
 //! Workspace management and safety invariants (Section 9).
 
+use crate::config::DockerConfig;
+use crate::container::{self, ContainerHandle};
 use crate::envsub;
 use crate::hooks;
 use sha2::{Digest, Sha256};
@@ -16,6 +18,16 @@ pub enum WorkspaceError {
     Create(PathBuf, String),
     #[error("after_create hook failed: {0}")]
     HookFailed(#[from] hooks::HookError),
+    #[error("failed to start container: {0}")]
+    ContainerFailed(#[from] container::ContainerError),
+}
+
+/// Docker mode context (see README.md): the project root to bind-mount plus the
+/// resolved `workspace.docker` config. Only present when `docker.enabled` is true.
+#[derive(Debug, Clone)]
+pub struct DockerContext {
+    pub workflow_dir: PathBuf,
+    pub config: DockerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +39,9 @@ pub struct Workspace {
     pub workspace_key: String,
     #[allow(dead_code)]
     pub created_now: bool,
+    /// `Some` when Docker mode is enabled: the container hooks and the coding agent
+    /// should run inside for this ticket (Section "Docker mode", README.md).
+    pub container: Option<ContainerHandle>,
 }
 
 /// Derive a sanitized, collision-resistant workspace directory name from an issue
@@ -79,11 +94,19 @@ fn validate_containment(root: &Path, path: &Path) -> Result<(), WorkspaceError> 
 
 pub struct WorkspaceManager {
     root: PathBuf,
+    docker: Option<DockerContext>,
 }
 
 impl WorkspaceManager {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, docker: None }
+    }
+
+    /// Enable Docker mode: hooks and the coding agent run inside a per-ticket
+    /// container bind-mounting `docker.workflow_dir` instead of directly on the host.
+    pub fn with_docker(mut self, docker: Option<DockerContext>) -> Self {
+        self.docker = docker;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -96,7 +119,9 @@ impl WorkspaceManager {
 
     /// Create or reuse the workspace for `identifier` (Section 9.2). Runs `after_create`
     /// only when the directory did not already exist; hook failure removes the
-    /// partially-prepared directory and fails workspace creation.
+    /// partially-prepared directory and fails workspace creation. In Docker mode, also
+    /// ensures the ticket's container is running (idempotent, safe to call on every
+    /// dispatch/retry, not just first creation) before `after_create` runs inside it.
     pub async fn create_for_issue(
         &self,
         identifier: &str,
@@ -116,24 +141,62 @@ impl WorkspaceManager {
             return Err(WorkspaceError::NotADirectory(path));
         }
 
-        if created_now
-            && let Some(script) = after_create_hook
-                && let Err(e) = hooks::run_hook("after_create", script, &path, hook_timeout_ms).await
-                {
-                    let _ = tokio::fs::remove_dir_all(&path).await;
-                    return Err(WorkspaceError::HookFailed(e));
+        let container = match &self.docker {
+            None => None,
+            Some(ctx) => {
+                let name = container::derive_container_name(&ctx.workflow_dir, identifier);
+                let container_root = Path::new(container::CONTAINER_PROJECT_ROOT);
+                let handle = container::ensure_running(
+                    ctx.config.image.as_deref().unwrap_or_default(),
+                    &name,
+                    &ctx.workflow_dir,
+                    container_root,
+                    &ctx.config.network,
+                    ctx.config.mem_limit.as_deref(),
+                    ctx.config.cpus.as_deref(),
+                )
+                .await?;
+                Some(handle)
+            }
+        };
+
+        if created_now && let Some(script) = after_create_hook {
+            let result = match &container {
+                None => hooks::run_hook("after_create", script, &path, hook_timeout_ms).await,
+                Some(c) => {
+                    let docker_ctx = self
+                        .docker
+                        .as_ref()
+                        .expect("container implies docker context");
+                    hooks::run_hook_maybe_containerized(
+                        "after_create",
+                        script,
+                        &docker_ctx.workflow_dir,
+                        &path,
+                        hook_timeout_ms,
+                        Some(c),
+                    )
+                    .await
                 }
+            };
+            if let Err(e) = result {
+                let _ = tokio::fs::remove_dir_all(&path).await;
+                return Err(WorkspaceError::HookFailed(e));
+            }
+        }
 
         Ok(Workspace {
             path,
             workspace_key,
             created_now,
+            container,
         })
     }
 
     /// Remove the workspace for a now-terminal issue (Section 9.4 `before_remove`,
     /// Section 8.6 startup cleanup, Section 8.5 reconciliation cleanup). Best-effort:
-    /// hook and removal failures are logged, never propagated.
+    /// hook and removal failures are logged, never propagated. In Docker mode, the
+    /// container is stopped and removed before the host directory is deleted.
     pub async fn remove_for_issue(
         &self,
         identifier: &str,
@@ -148,11 +211,44 @@ impl WorkspaceManager {
             tracing::error!(?path, "refusing to remove workspace outside root");
             return;
         }
-        if let Some(script) = before_remove_hook
-            && let Err(e) = hooks::run_hook("before_remove", script, &path, hook_timeout_ms).await
-        {
-            tracing::warn!(?path, error = %e, "before_remove hook failed (ignored)");
+
+        let container_name = self
+            .docker
+            .as_ref()
+            .map(|ctx| container::derive_container_name(&ctx.workflow_dir, identifier));
+
+        if let Some(script) = before_remove_hook {
+            let result = match (&container_name, &self.docker) {
+                (Some(name), Some(ctx)) => {
+                    let handle = ContainerHandle {
+                        name: name.clone(),
+                        container_root: Path::new(container::CONTAINER_PROJECT_ROOT).to_path_buf(),
+                    };
+                    // `path` (the real host workspace dir) mapped relative to
+                    // `workflow_dir` -- not reconstructed from `identifier` alone --
+                    // so this stays correct regardless of where `workspace.root` is
+                    // configured relative to the project root (e.g. `.workspaces/`).
+                    hooks::run_hook_maybe_containerized(
+                        "before_remove",
+                        script,
+                        &ctx.workflow_dir,
+                        &path,
+                        hook_timeout_ms,
+                        Some(&handle),
+                    )
+                    .await
+                }
+                _ => hooks::run_hook("before_remove", script, &path, hook_timeout_ms).await,
+            };
+            if let Err(e) = result {
+                tracing::warn!(?path, error = %e, "before_remove hook failed (ignored)");
+            }
         }
+
+        if let Some(name) = &container_name {
+            container::remove(name).await;
+        }
+
         if let Err(e) = tokio::fs::remove_dir_all(&path).await {
             tracing::warn!(?path, error = %e, "failed to remove workspace (ignored)");
         }
@@ -208,6 +304,53 @@ mod tests {
         let ws2 = mgr.create_for_issue("ABC-1", None, 5000).await.unwrap();
         assert!(!ws2.created_now);
         assert_eq!(ws1.path, ws2.path);
+    }
+
+    /// End-to-end Docker-mode check against a real daemon: `after_create` must run
+    /// *inside* the container (proven by writing a marker only reachable via the
+    /// container's own filesystem view, which shows up on the host through the bind
+    /// mount), and `remove_for_issue` must tear the container down.
+    #[tokio::test]
+    #[ignore]
+    async fn docker_mode_runs_after_create_in_container_and_tears_down_on_remove() {
+        assert!(
+            container::docker_available().await,
+            "docker must be available for this test"
+        );
+        let workflow_dir = tempdir().unwrap();
+        let root = workflow_dir.path().join(".workspaces");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mgr = WorkspaceManager::new(root).with_docker(Some(DockerContext {
+            workflow_dir: workflow_dir.path().to_path_buf(),
+            config: crate::config::DockerConfig {
+                enabled: true,
+                image: Some("debian:bookworm-slim".to_string()),
+                network: "bridge".to_string(),
+                mem_limit: None,
+                cpus: None,
+            },
+        }));
+
+        let identifier = "AR-DOCKER-TEST";
+        let ws = mgr
+            .create_for_issue(identifier, Some("echo from-container > marker.txt"), 30_000)
+            .await
+            .unwrap();
+        assert!(ws.container.is_some());
+
+        let marker = ws.path.join("marker.txt");
+        assert!(
+            marker.exists(),
+            "after_create should have run inside the container"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "from-container"
+        );
+
+        mgr.remove_for_issue(identifier, None, 30_000).await;
+        assert!(!ws.path.exists(), "workspace directory should be removed");
     }
 
     #[tokio::test]

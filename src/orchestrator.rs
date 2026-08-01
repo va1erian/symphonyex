@@ -2,8 +2,11 @@
 //! (Section 7, 8, 16). One task owns all mutable scheduling state directly; worker
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
-use crate::agent::{AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex};
+use crate::agent::{
+    AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex,
+};
 use crate::config::{self, AgentBackendKind, EffectiveConfig};
+use crate::container::{self, ContainerHandle};
 use crate::domain::Issue;
 use crate::envsub;
 use crate::hooks;
@@ -12,7 +15,7 @@ use crate::status;
 use crate::template;
 use crate::tracker::{self, TrackerAdapter};
 use crate::workflow;
-use crate::workspace::WorkspaceManager;
+use crate::workspace::{DockerContext, WorkspaceManager};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -97,7 +100,10 @@ struct OrchestratorState {
 
 impl OrchestratorState {
     fn next_generation(&mut self, issue_id: &str) -> u64 {
-        let g = self.retry_generation.entry(issue_id.to_string()).or_insert(0);
+        let g = self
+            .retry_generation
+            .entry(issue_id.to_string())
+            .or_insert(0);
         *g += 1;
         *g
     }
@@ -109,11 +115,25 @@ enum ExitReason {
 }
 
 enum OrchMsg {
-    SessionStarted { issue_id: String, session_id: String },
-    TurnStarted { issue_id: String },
-    AgentEvent { issue_id: String, event: AgentEvent },
-    WorkerExit { issue_id: String, reason: ExitReason },
-    RetryFired { issue_id: String, generation: u64 },
+    SessionStarted {
+        issue_id: String,
+        session_id: String,
+    },
+    TurnStarted {
+        issue_id: String,
+    },
+    AgentEvent {
+        issue_id: String,
+        event: AgentEvent,
+    },
+    WorkerExit {
+        issue_id: String,
+        reason: ExitReason,
+    },
+    RetryFired {
+        issue_id: String,
+        generation: u64,
+    },
 }
 
 /// Load workflow + resolve config + build adapters for the current file contents.
@@ -150,6 +170,7 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             permission_mode: cfg.claude.permission_mode.clone(),
             turn_timeout_ms: cfg.claude.turn_timeout_ms,
             mcp_wiring,
+            workflow_dir: cfg.workflow_dir.clone(),
         }),
         AgentBackendKind::Codex => Arc::new(codex::CodexBackend {
             command: cfg.codex.command.clone(),
@@ -167,7 +188,15 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
         wf.prompt_template
     };
 
-    let workspace_mgr = WorkspaceManager::new(cfg.workspace_root.clone());
+    let docker_ctx = if cfg.docker.enabled {
+        Some(DockerContext {
+            workflow_dir: cfg.workflow_dir.clone(),
+            config: cfg.docker.clone(),
+        })
+    } else {
+        None
+    };
+    let workspace_mgr = WorkspaceManager::new(cfg.workspace_root.clone()).with_docker(docker_ctx);
     std::fs::create_dir_all(workspace_mgr.root())?;
 
     Ok(Shared {
@@ -181,7 +210,11 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
 
 /// Section 8.6: remove workspaces for issues already in a terminal state at startup.
 async fn startup_terminal_cleanup(shared: &Shared) {
-    match shared.tracker.fetch_issues_by_states(&shared.config.terminal_states).await {
+    match shared
+        .tracker
+        .fetch_issues_by_states(&shared.config.terminal_states)
+        .await
+    {
         Ok(issues) => {
             for issue in issues {
                 shared
@@ -213,13 +246,22 @@ pub async fn run(
         "symphony starting"
     );
 
+    if shared.config.docker.enabled && !container::docker_available().await {
+        anyhow::bail!(
+            "workspace.docker.enabled is true but `docker` isn't reachable -- \
+             is Docker Desktop running? (see README.md \"Docker mode\")"
+        );
+    }
+
     let report_path = report_path_override
         .unwrap_or_else(|| shared.config.workflow_dir.join("symphony-report.html"));
     tracing::info!(path = %report_path.display(), "usage report will be written here");
 
     startup_terminal_cleanup(&shared).await;
 
-    let mut last_attempted_mtime = std::fs::metadata(&workflow_path).ok().and_then(|m| m.modified().ok());
+    let mut last_attempted_mtime = std::fs::metadata(&workflow_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
 
     let (tx, mut rx) = mpsc::unbounded_channel::<OrchMsg>();
     let mut state = OrchestratorState::default();
@@ -300,7 +342,9 @@ fn maybe_reload(
     last_attempted_mtime: &mut Option<std::time::SystemTime>,
     interval: &mut tokio::time::Interval,
 ) {
-    let current_mtime = std::fs::metadata(workflow_path).ok().and_then(|m| m.modified().ok());
+    let current_mtime = std::fs::metadata(workflow_path)
+        .ok()
+        .and_then(|m| m.modified().ok());
     if current_mtime == *last_attempted_mtime {
         return;
     }
@@ -308,11 +352,13 @@ fn maybe_reload(
 
     match build_shared(workflow_path) {
         Ok(new_shared) => {
-            let interval_changed = new_shared.config.poll_interval_ms != shared.config.poll_interval_ms;
+            let interval_changed =
+                new_shared.config.poll_interval_ms != shared.config.poll_interval_ms;
             tracing::info!("workflow reloaded");
             *shared = new_shared;
             if interval_changed {
-                *interval = tokio::time::interval(Duration::from_millis(shared.config.poll_interval_ms));
+                *interval =
+                    tokio::time::interval(Duration::from_millis(shared.config.poll_interval_ms));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             }
         }
@@ -322,15 +368,24 @@ fn maybe_reload(
     }
 }
 
-async fn on_tick(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
+async fn on_tick(
+    shared: &Shared,
+    state: &mut OrchestratorState,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) {
     reconcile(shared, state, tx).await;
 
-    if let Err(e) = config::validate_for_dispatch(&shared.config, tracker::SUPPORTED_TRACKER_KINDS) {
+    if let Err(e) = config::validate_for_dispatch(&shared.config, tracker::SUPPORTED_TRACKER_KINDS)
+    {
         tracing::error!(error = %e, "dispatch preflight validation failed; skipping dispatch this tick");
         return;
     }
 
-    let issues = match shared.tracker.fetch_issues_by_states(&shared.config.active_states).await {
+    let issues = match shared
+        .tracker
+        .fetch_issues_by_states(&shared.config.active_states)
+        .await
+    {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(error = %e, "candidate fetch failed; skipping dispatch this tick");
@@ -362,14 +417,26 @@ async fn on_tick(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::Unbo
 }
 
 fn eligible_for_dispatch(issue: &Issue, cfg: &EffectiveConfig, state: &OrchestratorState) -> bool {
-    if issue.id.is_empty() || issue.identifier.is_empty() || issue.title.is_empty() || issue.state.is_empty() {
+    if issue.id.is_empty()
+        || issue.identifier.is_empty()
+        || issue.title.is_empty()
+        || issue.state.is_empty()
+    {
         return false;
     }
     let normalized = issue.normalized_state();
-    if !cfg.active_states.iter().any(|s| s.trim().to_lowercase() == normalized) {
+    if !cfg
+        .active_states
+        .iter()
+        .any(|s| s.trim().to_lowercase() == normalized)
+    {
         return false;
     }
-    if cfg.terminal_states.iter().any(|s| s.trim().to_lowercase() == normalized) {
+    if cfg
+        .terminal_states
+        .iter()
+        .any(|s| s.trim().to_lowercase() == normalized)
+    {
         return false;
     }
     if !issue.is_routable(&cfg.required_labels) {
@@ -407,10 +474,16 @@ fn priority_value(i: &Issue) -> i64 {
 }
 
 fn created_at_key(i: &Issue) -> i64 {
-    i.created_at.map(|t| t.timestamp_millis()).unwrap_or(i64::MAX)
+    i.created_at
+        .map(|t| t.timestamp_millis())
+        .unwrap_or(i64::MAX)
 }
 
-fn has_available_slot(cfg: &EffectiveConfig, state: &OrchestratorState, normalized_state: &str) -> bool {
+fn has_available_slot(
+    cfg: &EffectiveConfig,
+    state: &OrchestratorState,
+    normalized_state: &str,
+) -> bool {
     if state.running.len() as u32 >= cfg.max_concurrent_agents {
         return false;
     }
@@ -438,7 +511,14 @@ async fn dispatch_issue(
     let issue_id_for_worker = issue_id.clone();
 
     let handle = tokio::spawn(async move {
-        run_agent_attempt(issue_id_for_worker, issue_for_worker, attempt, snapshot, tx2).await;
+        run_agent_attempt(
+            issue_id_for_worker,
+            issue_for_worker,
+            attempt,
+            snapshot,
+            tx2,
+        )
+        .await;
     });
 
     state.running.insert(
@@ -461,7 +541,10 @@ async fn dispatch_issue(
     state.retry_attempts.remove(&issue_id);
 
     state.metrics.agents_spawned += 1;
-    state.metrics.issue_entry(&identifier, &title).dispatch_count += 1;
+    state
+        .metrics
+        .issue_entry(&identifier, &title)
+        .dispatch_count += 1;
 
     tracing::info!(issue_id = %issue_id, identifier = %identifier, attempt = ?attempt, "dispatched");
 }
@@ -537,7 +620,11 @@ async fn terminate_running(
 /// exit, and it can't safely run (or workspace cleanup safely proceed) while the
 /// aborted task's `Drop` (which `kill_on_drop`s the agent subprocess) might still be
 /// in flight.
-async fn abort_and_run_after_run(shared: &Shared, handle: tokio::task::JoinHandle<()>, identifier: &str) {
+async fn abort_and_run_after_run(
+    shared: &Shared,
+    handle: tokio::task::JoinHandle<()>,
+    identifier: &str,
+) {
     handle.abort();
     let _ = handle.await; // resolves once the task has truly finished, Err(Cancelled) is expected
 
@@ -548,9 +635,36 @@ async fn abort_and_run_after_run(shared: &Shared, handle: tokio::task::JoinHandl
     if !path.is_dir() {
         return;
     }
-    if let Err(e) = hooks::run_hook("after_run", script, &path, shared.config.hook_timeout_ms).await {
+    // No live `Workspace` handle here (only `identifier`), so the container -- if
+    // Docker mode is enabled -- is re-derived by name rather than looked up; this is
+    // safe because the name is deterministic (`container::derive_container_name`) and
+    // the container's lifecycle is still owned by `WorkspaceManager`, which hasn't
+    // torn it down yet at this point in `terminate_running`/`reconcile_stalled`.
+    let container = docker_container_for(shared, identifier);
+    if let Err(e) = hooks::run_hook_maybe_containerized(
+        "after_run",
+        script,
+        &shared.config.workflow_dir,
+        &path,
+        shared.config.hook_timeout_ms,
+        container.as_ref(),
+    )
+    .await
+    {
         tracing::warn!(%identifier, error = %e, "after_run hook failed (ignored) [reconciliation-triggered termination]");
     }
+}
+
+/// Deterministically re-derive the Docker-mode container handle for `identifier`
+/// without needing a live `Workspace` (see `abort_and_run_after_run`'s doc comment).
+fn docker_container_for(shared: &Shared, identifier: &str) -> Option<ContainerHandle> {
+    if !shared.config.docker.enabled {
+        return None;
+    }
+    Some(ContainerHandle {
+        name: container::derive_container_name(&shared.config.workflow_dir, identifier),
+        container_root: Path::new(container::CONTAINER_PROJECT_ROOT).to_path_buf(),
+    })
 }
 
 /// Turns/tool-calls/tokens are already folded into `state.metrics` live as they
@@ -559,13 +673,19 @@ async fn abort_and_run_after_run(shared: &Shared, handle: tokio::task::JoinHandl
 fn finalize_issue_runtime(state: &mut OrchestratorState, entry: &RunningEntry, outcome: &str) {
     let seconds = entry.started_at.elapsed().as_secs_f64();
     state.metrics.seconds_running += seconds;
-    let issue_metrics = state.metrics.issue_entry(&entry.issue.identifier, &entry.issue.title);
+    let issue_metrics = state
+        .metrics
+        .issue_entry(&entry.issue.identifier, &entry.issue.title);
     issue_metrics.seconds_running += seconds;
     issue_metrics.last_outcome = Some(outcome.to_string());
 }
 
 /// Section 8.5: stall detection (Part A) + tracker state refresh (Part B).
-async fn reconcile(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
+async fn reconcile(
+    shared: &Shared,
+    state: &mut OrchestratorState,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) {
     reconcile_stalled(shared, state, tx).await;
 
     let running_ids: Vec<String> = state.running.keys().cloned().collect();
@@ -579,22 +699,45 @@ async fn reconcile(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::Un
             for issue in refreshed {
                 seen.insert(issue.id.clone());
                 let normalized = issue.normalized_state();
-                let terminal = shared.config.terminal_states.iter().any(|s| s.trim().to_lowercase() == normalized);
-                let active = shared.config.active_states.iter().any(|s| s.trim().to_lowercase() == normalized);
+                let terminal = shared
+                    .config
+                    .terminal_states
+                    .iter()
+                    .any(|s| s.trim().to_lowercase() == normalized);
+                let active = shared
+                    .config
+                    .active_states
+                    .iter()
+                    .any(|s| s.trim().to_lowercase() == normalized);
                 let routable = issue.is_routable(&shared.config.required_labels);
 
                 if terminal {
-                    terminate_running(state, shared, &issue.id, true, "reached terminal tracker state").await;
+                    terminate_running(
+                        state,
+                        shared,
+                        &issue.id,
+                        true,
+                        "reached terminal tracker state",
+                    )
+                    .await;
                 } else if active && routable {
                     if let Some(entry) = state.running.get_mut(&issue.id) {
                         entry.issue = issue;
                     }
                 } else {
-                    terminate_running(state, shared, &issue.id, false, "no longer active/routable").await;
+                    terminate_running(state, shared, &issue.id, false, "no longer active/routable")
+                        .await;
                 }
             }
             for missing_id in running_ids.iter().filter(|id| !seen.contains(*id)) {
-                terminate_running(state, shared, missing_id, false, "no longer visible in tracker").await;
+                terminate_running(
+                    state,
+                    shared,
+                    missing_id,
+                    false,
+                    "no longer visible in tracker",
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -603,7 +746,11 @@ async fn reconcile(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::Un
     }
 }
 
-async fn reconcile_stalled(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
+async fn reconcile_stalled(
+    shared: &Shared,
+    state: &mut OrchestratorState,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) {
     let stall_ms = shared.config.effective_stall_timeout_ms();
     if stall_ms <= 0 {
         return;
@@ -635,11 +782,25 @@ async fn reconcile_stalled(shared: &Shared, state: &mut OrchestratorState, tx: &
             abort_and_run_after_run(shared, entry.handle, &identifier).await;
         }
         let delay = backoff_delay_ms(attempt, shared.config.max_retry_backoff_ms);
-        schedule_retry(state, tx, &issue_id, &identifier, attempt, delay, Some("stalled: no activity".to_string()));
+        schedule_retry(
+            state,
+            tx,
+            &issue_id,
+            &identifier,
+            attempt,
+            delay,
+            Some("stalled: no activity".to_string()),
+        );
     }
 }
 
-async fn handle_retry_fired(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>, issue_id: String, generation: u64) {
+async fn handle_retry_fired(
+    shared: &Shared,
+    state: &mut OrchestratorState,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+    issue_id: String,
+    generation: u64,
+) {
     let Some(entry) = state.retry_attempts.get(&issue_id) else {
         return;
     };
@@ -648,12 +809,24 @@ async fn handle_retry_fired(shared: &Shared, state: &mut OrchestratorState, tx: 
     }
     let entry = state.retry_attempts.remove(&issue_id).unwrap();
 
-    let refreshed = match shared.tracker.fetch_issues_by_ids(std::slice::from_ref(&issue_id)).await {
+    let refreshed = match shared
+        .tracker
+        .fetch_issues_by_ids(std::slice::from_ref(&issue_id))
+        .await
+    {
         Ok(r) => r,
         Err(_) => {
             let next_attempt = entry.attempt + 1;
             let delay = backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms);
-            schedule_retry(state, tx, &issue_id, &entry.identifier, next_attempt, delay, Some("retry refresh failed".to_string()));
+            schedule_retry(
+                state,
+                tx,
+                &issue_id,
+                &entry.identifier,
+                next_attempt,
+                delay,
+                Some("retry refresh failed".to_string()),
+            );
             return;
         }
     };
@@ -664,7 +837,11 @@ async fn handle_retry_fired(shared: &Shared, state: &mut OrchestratorState, tx: 
     };
 
     let normalized = issue.normalized_state();
-    let active = shared.config.active_states.iter().any(|s| s.trim().to_lowercase() == normalized);
+    let active = shared
+        .config
+        .active_states
+        .iter()
+        .any(|s| s.trim().to_lowercase() == normalized);
     let routable = issue.is_routable(&shared.config.required_labels);
 
     if !active || !routable {
@@ -677,13 +854,29 @@ async fn handle_retry_fired(shared: &Shared, state: &mut OrchestratorState, tx: 
     } else {
         let next_attempt = entry.attempt + 1;
         let delay = backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms);
-        schedule_retry(state, tx, &issue_id, &entry.identifier, next_attempt, delay, Some("no available orchestrator slots".to_string()));
+        schedule_retry(
+            state,
+            tx,
+            &issue_id,
+            &entry.identifier,
+            next_attempt,
+            delay,
+            Some("no available orchestrator slots".to_string()),
+        );
     }
 }
 
-async fn handle_msg(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>, msg: OrchMsg) {
+async fn handle_msg(
+    shared: &Shared,
+    state: &mut OrchestratorState,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+    msg: OrchMsg,
+) {
     match msg {
-        OrchMsg::SessionStarted { issue_id, session_id } => {
+        OrchMsg::SessionStarted {
+            issue_id,
+            session_id,
+        } => {
             if let Some(e) = state.running.get_mut(&issue_id) {
                 e.session_id = session_id;
             }
@@ -697,7 +890,11 @@ async fn handle_msg(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::U
             }
         }
         OrchMsg::AgentEvent { issue_id, event } => {
-            let session_id = state.running.get(&issue_id).map(|e| e.session_id.clone()).unwrap_or_default();
+            let session_id = state
+                .running
+                .get(&issue_id)
+                .map(|e| e.session_id.clone())
+                .unwrap_or_default();
             tracing::info!(issue_id = %issue_id, session_id = %session_id, event = %event.event, at = %event.timestamp, message = ?event.message, "agent event");
 
             let is_tool_call = event.event == "tool_call";
@@ -741,18 +938,37 @@ async fn handle_msg(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::U
                     finalize_issue_runtime(state, &entry, "worker exited normally");
                     state.completed.insert(issue_id.clone());
                     tracing::info!(issue_id = %issue_id, identifier = %entry.issue.identifier, "worker exited normally; scheduling continuation check");
-                    schedule_retry(state, tx, &issue_id, &entry.issue.identifier, 1, 1_000, None);
+                    schedule_retry(
+                        state,
+                        tx,
+                        &issue_id,
+                        &entry.issue.identifier,
+                        1,
+                        1_000,
+                        None,
+                    );
                 }
                 ExitReason::Error(err) => {
                     finalize_issue_runtime(state, &entry, &format!("error: {err}"));
                     let next_attempt = entry.retry_attempt.unwrap_or(0) + 1;
                     let delay = backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms);
                     tracing::warn!(issue_id = %issue_id, identifier = %entry.issue.identifier, error = %err, next_attempt, delay_ms = delay, "worker exited abnormally; scheduling retry");
-                    schedule_retry(state, tx, &issue_id, &entry.issue.identifier, next_attempt, delay, Some(err));
+                    schedule_retry(
+                        state,
+                        tx,
+                        &issue_id,
+                        &entry.issue.identifier,
+                        next_attempt,
+                        delay,
+                        Some(err),
+                    );
                 }
             }
         }
-        OrchMsg::RetryFired { issue_id, generation } => {
+        OrchMsg::RetryFired {
+            issue_id,
+            generation,
+        } => {
             handle_retry_fired(shared, state, tx, issue_id, generation).await;
         }
     }
@@ -775,7 +991,11 @@ async fn run_agent_attempt(
 
     let workspace = match snapshot
         .workspace_mgr
-        .create_for_issue(&issue.identifier, cfg.hook_after_create.as_deref(), cfg.hook_timeout_ms)
+        .create_for_issue(
+            &issue.identifier,
+            cfg.hook_after_create.as_deref(),
+            cfg.hook_timeout_ms,
+        )
         .await
     {
         Ok(ws) => ws,
@@ -788,10 +1008,27 @@ async fn run_agent_attempt(
         }
     };
 
-    let reason = run_attempt_body(&issue_id, issue, attempt, &workspace.path, &snapshot, &tx).await;
+    let reason = run_attempt_body(
+        &issue_id,
+        issue,
+        attempt,
+        &workspace.path,
+        workspace.container.as_ref(),
+        &snapshot,
+        &tx,
+    )
+    .await;
 
     if let Some(script) = &cfg.hook_after_run
-        && let Err(e) = hooks::run_hook("after_run", script, &workspace.path, cfg.hook_timeout_ms).await
+        && let Err(e) = hooks::run_hook_maybe_containerized(
+            "after_run",
+            script,
+            &cfg.workflow_dir,
+            &workspace.path,
+            cfg.hook_timeout_ms,
+            workspace.container.as_ref(),
+        )
+        .await
     {
         tracing::warn!(issue_id = %issue_id, error = %e, "after_run hook failed (ignored)");
     }
@@ -804,13 +1041,22 @@ async fn run_attempt_body(
     mut issue: Issue,
     attempt: Option<u32>,
     workspace_path: &Path,
+    container: Option<&ContainerHandle>,
     snapshot: &DispatchSnapshot,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
 
     if let Some(script) = &cfg.hook_before_run
-        && let Err(e) = hooks::run_hook("before_run", script, workspace_path, cfg.hook_timeout_ms).await
+        && let Err(e) = hooks::run_hook_maybe_containerized(
+            "before_run",
+            script,
+            &cfg.workflow_dir,
+            workspace_path,
+            cfg.hook_timeout_ms,
+            container,
+        )
+        .await
     {
         return ExitReason::Error(format!("before_run hook error: {e}"));
     }
@@ -820,7 +1066,11 @@ async fn run_attempt_body(
     }
 
     let title = format!("{}: {}", issue.identifier, issue.title);
-    let mut session = match snapshot.agent_backend.start_session(workspace_path, &issue.id, &title).await {
+    let mut session = match snapshot
+        .agent_backend
+        .start_session(workspace_path, &issue.id, &title, container)
+        .await
+    {
         Ok(s) => s,
         Err(e) => return ExitReason::Error(format!("agent session startup error: {e}")),
     };
@@ -835,7 +1085,13 @@ async fn run_attempt_body(
     let exit: ExitReason;
 
     loop {
-        let prompt = match render_turn_prompt(&snapshot.prompt_template, &issue, attempt, turn_number, max_turns) {
+        let prompt = match render_turn_prompt(
+            &snapshot.prompt_template,
+            &issue,
+            attempt,
+            turn_number,
+            max_turns,
+        ) {
             Ok(p) => p,
             Err(e) => {
                 exit = ExitReason::Error(format!("prompt error: {e}"));
@@ -843,7 +1099,9 @@ async fn run_attempt_body(
             }
         };
 
-        let _ = tx.send(OrchMsg::TurnStarted { issue_id: issue_id.to_string() });
+        let _ = tx.send(OrchMsg::TurnStarted {
+            issue_id: issue_id.to_string(),
+        });
 
         let turn_result = run_one_turn(session.as_mut(), &prompt, issue_id, tx).await;
 
@@ -859,7 +1117,11 @@ async fn run_attempt_body(
             }
         }
 
-        let refreshed = match snapshot.tracker.fetch_issues_by_ids(&[issue.id.clone()]).await {
+        let refreshed = match snapshot
+            .tracker
+            .fetch_issues_by_ids(&[issue.id.clone()])
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 exit = ExitReason::Error(format!("issue state refresh error: {e}"));
@@ -873,7 +1135,10 @@ async fn run_attempt_body(
         issue = next_issue;
 
         let normalized = issue.normalized_state();
-        let active = cfg.active_states.iter().any(|s| s.trim().to_lowercase() == normalized);
+        let active = cfg
+            .active_states
+            .iter()
+            .any(|s| s.trim().to_lowercase() == normalized);
         if !active || !issue.is_routable(&cfg.required_labels) {
             exit = ExitReason::Normal;
             break;
@@ -939,8 +1204,13 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn test_shared(hook_after_run: &str, workspace_root: PathBuf, tracker_dir: &std::path::Path) -> Shared {
-        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
+    fn test_shared(
+        hook_after_run: &str,
+        workspace_root: PathBuf,
+        tracker_dir: &std::path::Path,
+    ) -> Shared {
+        let cfg_yaml: serde_yaml::Value =
+            serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
         let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
         cfg.hook_after_run = Some(hook_after_run.to_string());
         cfg.workspace_root = workspace_root.clone();
@@ -960,6 +1230,7 @@ mod tests {
                 permission_mode: "bypassPermissions".to_string(),
                 turn_timeout_ms: 1000,
                 mcp_wiring: None,
+                workflow_dir: Path::new(".").to_path_buf(),
             }),
             workspace_mgr: Arc::new(WorkspaceManager::new(workspace_root)),
         }
@@ -1022,4 +1293,3 @@ mod tests {
         assert!(!workspace.join("marker.txt").exists());
     }
 }
-

@@ -19,7 +19,11 @@ run it immediately without any external credentials: edit the `state:` field in
 get created.
 
 Requires `bash` on `PATH` (Git for Windows, WSL, or any POSIX host) — hooks and the
-Codex backend both launch via `bash -lc`.
+Codex backend both launch via `bash -lc`. On Windows specifically, having *both*
+Git-for-Windows and WSL installed means whichever one `PATH` happens to resolve first
+is what hooks actually run under, which can disagree with what the coding agent's own
+Bash tool resolves to — see **Docker mode** below for the fix if you hit path-spelling
+errors like `ssh: Could not resolve hostname c`.
 
 ## Live status dashboard
 
@@ -91,6 +95,79 @@ Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`
 Per-backend settings live under the `claude:` and `codex:` front-matter keys (mirroring
 each other where it makes sense); `claude.*` is a spec extension, not part of the
 normative schema.
+
+## Docker mode
+
+Off by default; opt in per-project with `workspace.docker` in `WORKFLOW.md`:
+
+```yaml
+workspace:
+  root: ./.workspaces
+  docker:
+    enabled: true
+    image: my-project-agent:latest   # FROM this repo's own Dockerfile, see below
+    network: bridge                    # default; "none" if a project needs no egress
+    mem_limit: 4g                       # optional
+    cpus: "2"                            # optional
+```
+
+**Why this exists.** Workspace hooks (`hooks.rs`) run their scripts via WSL's `bash`,
+while the coding agent's own `Bash` tool — invoked by `claude` running natively on the
+host — resolves paths via Git Bash/MSYS. These disagree about how to spell a Windows
+path for the same directory (`/mnt/c/...` vs `/c/...`), and there is no single spelling
+that satisfies both; hit this twice in production (once via a hardcoded `git clone`
+URL, once via an agent "fixing" a remote URL to match its own environment and breaking
+the hooks'). Docker mode runs **both** the hooks and the `claude` process inside the
+same Linux container, bind-mounted once to the whole project directory (`workflow_dir`
+— covers the workspace, the tracker's `issues/`, and a mainline repo like
+bsky-archiver's `app/` in one mount) at a fixed path (`/project`,
+`container::CONTAINER_PROJECT_ROOT`). Inside the container there is exactly one
+filesystem and one path convention, so this class of bug becomes structurally
+impossible rather than just less likely.
+
+As a side effect this also isolates concurrent agents from each other and the host:
+each ticket gets its own persistent container (created alongside its workspace, torn
+down alongside it), so a runaway agent is capped by `mem_limit`/`cpus` and can't touch
+anything outside the bind mount.
+
+**Building an image.** This repo's own `Dockerfile` is the base every project image
+extends: `debian:bookworm-slim` + `bash`/`git`/the `claude` CLI + a Linux build of
+`symphony` itself (for the MCP tool-server subcommand, `container::CONTAINER_SYMPHONY_BIN`
+at `/usr/local/bin/symphony`) — built inside a multi-stage Docker build, so no
+cross-compilation toolchain is needed on the host, just `docker build` itself:
+
+```bash
+docker build -t symphony-base:latest .
+```
+
+A project adds whatever toolchain its tickets need on top:
+
+```dockerfile
+FROM symphony-base:latest
+RUN apt-get update && apt-get install -y --no-install-recommends <your toolchain> \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+**Currently Claude-backend only** (`agent.backend: claude`) — Codex's `start_session`
+accepts and ignores the container parameter for now.
+
+**Prerequisite**: Docker Desktop (or an equivalent daemon) running, `docker` on `PATH`.
+Symphony checks this at startup when `docker.enabled: true` and fails fast with a clear
+message rather than surfacing "docker: command not found" buried in a hook failure.
+
+**Security posture — what this does and does not fix.** Real improvement: the agent's
+`bypassPermissions`-mode shell can now only reach what's bind-mounted, not the whole
+host filesystem, plus resource limits and process isolation that don't exist at all
+today. What stays exactly as risky: `bypassPermissions` itself is unchanged (the agent
+still has an unrestricted shell, just a smaller reachable filesystem); the bind mount
+is full read-write across the *whole* project, so a bad agent on one ticket can still
+corrupt another ticket's workspace or the mainline repo; `WORKFLOW.md` hooks remain a
+trusted-script trust boundary, and running Docker at all typically requires
+host-privileged access anyway; there's no image signing/scanning, and this is stock
+`docker run` (namespaces + cgroups), not a hardened runtime (gVisor/Firecracker). This
+is a real hardening step for a single trusted operator running their own
+`WORKFLOW.md` locally — **not** sufficient for multi-tenant or untrusted-input
+production use.
 
 ## Provider-native tracker tool (Section 10.5)
 
@@ -171,8 +248,10 @@ pass-through and default to whatever your installed Codex build defaults to). Th
 no operator-approval channel — a run that would require interactive approval or
 user-input fails the run rather than stalling. If you need stricter sandboxing, tighten
 `claude.permission_mode` / `codex.approval_policy` and `codex.turn_sandbox_policy`, or
-add OS/container isolation around the whole process (Section 15.5); this codebase does
-not add any of its own.
+enable **Docker mode** (see above) for filesystem/resource isolation per ticket
+(Section 15.5) — Claude backend only today, and not sufficient on its own for
+untrusted-input use; see that section's security posture notes for exactly what it
+does and does not cover.
 
 Filesystem safety invariants from Section 9.5 are enforced unconditionally (not
 configurable): the agent's `cwd` is always validated to be a sanitized, root-contained

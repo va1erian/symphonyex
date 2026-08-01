@@ -201,7 +201,12 @@ impl TrackerAdapter for LocalTrackerAdapter {
         }]
     }
 
-    async fn execute_agent_tool(&self, name: &str, arguments: serde_json::Value, issue_id: &str) -> ToolResult {
+    async fn execute_agent_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        issue_id: &str,
+    ) -> ToolResult {
         if name != "update_issue_state" {
             return ToolResult::error(format!("unsupported tool '{name}'"));
         }
@@ -248,7 +253,10 @@ fn parse_issue_file(path: &Path) -> Result<RawIssue, String> {
         return Err("id, identifier, title, and state MUST be non-empty".to_string());
     }
 
-    let dispatchable = fm.get("dispatchable").and_then(|v| v.as_bool()).unwrap_or(true);
+    let dispatchable = fm
+        .get("dispatchable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let priority = fm.get("priority").and_then(|v| v.as_i64());
 
@@ -311,9 +319,15 @@ fn parse_issue_file(path: &Path) -> Result<RawIssue, String> {
             description,
             priority,
             state,
-            branch_name: fm.get("branch_name").and_then(|v| v.as_str()).map(String::from),
+            branch_name: fm
+                .get("branch_name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             url: fm.get("url").and_then(|v| v.as_str()).map(String::from),
-            assignee_id: fm.get("assignee_id").and_then(|v| v.as_str()).map(String::from),
+            assignee_id: fm
+                .get("assignee_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             labels,
             blocked_by: Vec::new(),
             dispatchable,
@@ -407,7 +421,11 @@ mod tests {
     #[tokio::test]
     async fn fetch_by_ids_fails_on_malformed_requested_record() {
         let dir = tempdir().unwrap();
-        write_issue(dir.path(), "bad.md", "---\ntitle: No identifier or state\n---\n");
+        write_issue(
+            dir.path(),
+            "bad.md",
+            "---\ntitle: No identifier or state\n---\n",
+        );
         let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
         let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
         let err = adapter
@@ -437,7 +455,10 @@ mod tests {
             .await;
         assert!(result.success, "{}", result.content);
 
-        let issues = adapter.fetch_issues_by_states(&["done".to_string()]).await.unwrap();
+        let issues = adapter
+            .fetch_issues_by_states(&["done".to_string()])
+            .await
+            .unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].identifier, "C-1");
         assert_eq!(issues[0].labels, vec!["x".to_string()]);
@@ -449,7 +470,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
         let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
-        let result = adapter.execute_agent_tool("delete_everything", json!({}), "c").await;
+        let result = adapter
+            .execute_agent_tool("delete_everything", json!({}), "c")
+            .await;
         assert!(!result.success);
     }
 
@@ -469,7 +492,10 @@ mod tests {
         let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
         let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
 
-        let issues = adapter.fetch_issues_by_states(&["todo".to_string()]).await.unwrap();
+        let issues = adapter
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
         let downstream = issues.iter().find(|i| i.identifier == "DOWN-1").unwrap();
         assert!(!downstream.dispatchable);
         assert_eq!(downstream.blocked_by.len(), 1);
@@ -480,7 +506,10 @@ mod tests {
         adapter
             .execute_agent_tool("update_issue_state", json!({"state": "done"}), "upstream")
             .await;
-        let issues = adapter.fetch_issues_by_states(&["todo".to_string()]).await.unwrap();
+        let issues = adapter
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
         let downstream = issues.iter().find(|i| i.identifier == "DOWN-1").unwrap();
         assert!(downstream.dispatchable);
         assert!(downstream.blocked_by.is_empty());
@@ -497,7 +526,10 @@ mod tests {
         let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
         let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
 
-        let issues = adapter.fetch_issues_by_states(&["todo".to_string()]).await.unwrap();
+        let issues = adapter
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
         let downstream = &issues[0];
         assert!(!downstream.dispatchable);
         assert_eq!(downstream.blocked_by[0].state, None);
@@ -519,8 +551,14 @@ mod tests {
         let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
         let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
 
-        let issues = adapter.fetch_issues_by_states(&["todo".to_string()]).await.unwrap();
+        let issues = adapter
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
         let downstream = issues.iter().find(|i| i.identifier == "DOWN-1").unwrap();
-        assert!(!downstream.dispatchable, "a cancelled dependency must not satisfy depends_on");
+        assert!(
+            !downstream.dispatchable,
+            "a cancelled dependency must not satisfy depends_on"
+        );
     }
 }

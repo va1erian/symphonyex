@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod container;
 mod domain;
 mod envsub;
 mod frontmatter;
@@ -79,7 +80,8 @@ async fn main() -> std::process::ExitCode {
         issue_id,
     }) = cli.command
     {
-        return run_mcp_tool_server(&tracker_kind, &tracker_provider, &workflow_dir, &issue_id).await;
+        return run_mcp_tool_server(&tracker_kind, &tracker_provider, &workflow_dir, &issue_id)
+            .await;
     }
 
     let path = workflow::resolve_workflow_path(cli.workflow_path.as_deref());
