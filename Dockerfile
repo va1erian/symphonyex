@@ -55,6 +55,19 @@ COPY --from=builder /build/target/release/symphony /usr/local/bin/symphony
 RUN groupadd -g 1000 agent && useradd -u 1000 -g 1000 -m -s /bin/bash agent
 ENV HOME=/home/agent
 
+# Git's "dubious ownership" protection refuses to operate on a mounted repo it
+# doesn't own unless `safe.directory` allow-lists it. The synthesized `repo:` hooks
+# (config.rs) also set this via `git config --global`, but that lands in
+# /home/agent/.gitconfig -- part of the *container's* own filesystem layer, not the
+# persistent project volume/mount. A container that gets recreated (image rebuild,
+# `docker rm`, a host reboot) loses that global config, yet the workspace's own
+# `.symphony-initialized` marker (on the persistent volume/mount) then skips
+# `after_create` forever, so it never gets re-applied -- a real recurring failure
+# mode, not a hypothetical one. A system-level, wildcarded allow-list baked into the
+# image itself isn't subject to either problem: every container from this image is
+# already single-project/single-tenant, so trusting any mounted repo is safe here.
+RUN git config --system --add safe.directory '*'
+
 # Placeholder for `workspace.docker.mount_claude_credentials` (see config.rs's doc
 # comment): pre-create this as an actual file, owned by the agent user, so a `docker
 # run -v <host-credentials-file>:/home/agent/.claude/.credentials.json:ro` bind-mounts

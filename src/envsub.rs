@@ -45,17 +45,20 @@ fn var_name(value: &str) -> Option<&str> {
 /// one exists -- used for `workspace.docker.mount_claude_credentials` (see
 /// `config::DockerConfig`'s doc comment) so a containerized `claude` CLI can reuse the
 /// host's existing session instead of needing a separate API key. Checks
-/// `SYMPHONY_HOST_CLAUDE_CREDENTIALS` first (set by `daemon::start` when daemonized,
-/// since a daemon container has no direct view of the real host filesystem to resolve
-/// this itself -- see that function's own doc comment), falling back to resolving
-/// directly from `USERPROFILE`/`HOME` (the non-daemonized case, where this process
-/// *is* already running on the real host).
+/// `SYMPHONY_HOST_CLAUDE_CREDENTIALS` first (set by `daemon::start` when daemonized),
+/// falling back to resolving directly from `USERPROFILE`/`HOME` (the non-daemonized
+/// case, where this process *is* already running on the real host).
+///
+/// The override is trusted without an `is_file()` check here, deliberately: when this
+/// runs *inside* the daemonized Symphony's own container (Docker-outside-of-Docker),
+/// the path refers to the real Windows host's filesystem, which this process can't see
+/// or stat at all -- only the sibling container Docker creates via the mounted socket
+/// can actually resolve it. `daemon::start` already validated the file exists on the
+/// real host before forwarding this env var, so re-checking it here from the wrong
+/// filesystem would only ever wrongly discard a valid path.
 pub fn resolve_claude_credentials_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SYMPHONY_HOST_CLAUDE_CREDENTIALS") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
+        return Some(PathBuf::from(p));
     }
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     let path = PathBuf::from(home)
@@ -197,19 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_claude_credentials_path_ignores_override_pointing_at_missing_file() {
+    fn resolve_claude_credentials_path_trusts_override_even_when_unresolvable_here() {
+        // Deliberately not `is_file()`-checked (see the function's own doc comment):
+        // from inside a daemonized Symphony's own container, a path forwarded via
+        // this env var refers to the real host's filesystem, which this process
+        // can't stat at all -- only the sibling container Docker creates through the
+        // mounted socket can. A path that doesn't resolve *here* must still be
+        // trusted and returned as-is.
         unsafe {
             std::env::set_var(
                 "SYMPHONY_HOST_CLAUDE_CREDENTIALS",
-                "/definitely/does/not/exist.json",
+                "/definitely/does/not/exist/from/here.json",
             );
         }
-        // Falls through to the real USERPROFILE/HOME lookup rather than returning the
-        // dangling override path -- assert only that it isn't the dangling path itself,
-        // since whether *this* machine happens to have real credentials is unknowable.
-        assert_ne!(
+        assert_eq!(
             resolve_claude_credentials_path(),
-            Some(PathBuf::from("/definitely/does/not/exist.json"))
+            Some(PathBuf::from("/definitely/does/not/exist/from/here.json"))
         );
         unsafe {
             std::env::remove_var("SYMPHONY_HOST_CLAUDE_CREDENTIALS");
