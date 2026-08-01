@@ -206,10 +206,28 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
         // necessary at all: Docker doesn't inherit the host environment into a
         // container the way a plain child process would.
         let env_passthrough = envsub::collect_var_refs(&wf.config);
+        // Only actually resolve the host's Claude Code login when the operator opted
+        // in via `workspace.docker.mount_claude_credentials` -- see that field's doc
+        // comment in config.rs. `resolve_claude_credentials_path` itself already
+        // handles the daemonized-vs-direct distinction (checks
+        // `SYMPHONY_HOST_CLAUDE_CREDENTIALS`, forwarded by `daemon::start`, before
+        // falling back to this process's own `USERPROFILE`/`HOME`).
+        let claude_credentials_path = cfg
+            .docker
+            .mount_claude_credentials
+            .then(envsub::resolve_claude_credentials_path)
+            .flatten();
+        if cfg.docker.mount_claude_credentials && claude_credentials_path.is_none() {
+            tracing::warn!(
+                "workspace.docker.mount_claude_credentials is enabled but no Claude Code \
+                 credentials file was found -- containers will run unauthenticated"
+            );
+        }
         Some(DockerContext {
             workflow_dir: cfg.workflow_dir.clone(),
             mount,
             env_passthrough,
+            claude_credentials_path,
             config: cfg.docker.clone(),
         })
     } else {

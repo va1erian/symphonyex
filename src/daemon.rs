@@ -199,6 +199,24 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
 
     let volume_mount = format!("{volume}:/project");
     let daemon_env = format!("SYMPHONY_DAEMON_VOLUME={volume}");
+    // The daemon container has no direct view of the real host filesystem, so it
+    // can't resolve `~/.claude/.credentials.json` itself the way a non-daemonized run
+    // would -- resolve it here, on the actual host, and forward the real path in.
+    // `orchestrator::build_shared` (running inside the daemon container) reads this
+    // back via `envsub::resolve_claude_credentials_path`. Only computed when the
+    // operator opted in, since it's a real trust concession (see
+    // `DockerConfig::mount_claude_credentials`'s doc comment).
+    let credentials_env = cfg.docker.mount_claude_credentials.then(|| {
+        crate::envsub::resolve_claude_credentials_path()
+            .map(|p| format!("SYMPHONY_HOST_CLAUDE_CREDENTIALS={}", p.display()))
+    });
+    if cfg.docker.mount_claude_credentials && credentials_env.as_ref().is_some_and(Option::is_none)
+    {
+        tracing::warn!(
+            "workspace.docker.mount_claude_credentials is enabled but no Claude Code \
+             credentials file was found on this host -- containers will run unauthenticated"
+        );
+    }
     let port_str = port.map(|p| p.to_string());
 
     let mut args: Vec<&str> = vec![
@@ -215,6 +233,10 @@ pub async fn start(workflow_path: &Path, port: Option<u16>) -> anyhow::Result<()
         "-e",
         &daemon_env,
     ];
+    if let Some(Some(env)) = &credentials_env {
+        args.push("-e");
+        args.push(env);
+    }
     // Same secrets a per-ticket container would need (see
     // orchestrator::build_shared's identical use of collect_var_refs) -- the
     // orchestrator running *inside* this daemon container needs them too, e.g. to

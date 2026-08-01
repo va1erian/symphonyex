@@ -229,6 +229,12 @@ pub struct RunOptions<'a> {
     /// `envsub::collect_var_refs`'s doc comment for why this list exists and how it's
     /// built -- the value is never passed here, only the name).
     pub env_passthrough: &'a [String],
+    /// Additional bind mounts beyond the main project-root mount (`host_path`,
+    /// `container_path`, `readonly`) -- e.g. the host's own Claude Code login (see
+    /// `workspace.docker.mount_claude_credentials`), mounted so the containerized
+    /// `claude` CLI reuses the host's existing session instead of needing its own
+    /// separate API key.
+    pub extra_mounts: &'a [(PathBuf, String, bool)],
 }
 
 /// Idempotently ensure a named container exists, is running, has `host_mount`
@@ -287,6 +293,16 @@ pub async fn ensure_running(
     if let Some(user) = options.user {
         args.push("--user".into());
         args.push(user.into());
+    }
+    for (host_path, container_path, readonly) in options.extra_mounts {
+        let suffix = if *readonly { ":ro" } else { "" };
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}{}",
+            to_container_path_str(host_path),
+            container_path,
+            suffix
+        ));
     }
     for var_name in options.env_passthrough {
         // `-e VAR_NAME` with no `=value`: Docker reads the value from *its own*
@@ -506,6 +522,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &["SYMPHONY_TEST_ENV_PASSTHROUGH".to_string()],
+                extra_mounts: &[],
             },
         )
         .await
@@ -551,6 +568,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &[],
+                extra_mounts: &[],
             },
         )
         .await
@@ -566,6 +584,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &[],
+                extra_mounts: &[],
             },
         )
         .await
@@ -605,6 +624,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &[],
+                extra_mounts: &[],
             },
         )
         .await
@@ -664,6 +684,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &[],
+                extra_mounts: &[],
             },
         )
         .await
@@ -711,6 +732,7 @@ mod tests {
                 cpus: None,
                 user: None,
                 env_passthrough: &[],
+                extra_mounts: &[],
             },
         )
         .await

@@ -55,6 +55,15 @@ COPY --from=builder /build/target/release/symphony /usr/local/bin/symphony
 RUN groupadd -g 1000 agent && useradd -u 1000 -g 1000 -m -s /bin/bash agent
 ENV HOME=/home/agent
 
+# Placeholder for `workspace.docker.mount_claude_credentials` (see config.rs's doc
+# comment): pre-create this as an actual file, owned by the agent user, so a `docker
+# run -v <host-credentials-file>:/home/agent/.claude/.credentials.json:ro` bind-mounts
+# a file onto a file. Docker infers the mount target's type from this path when it
+# doesn't already exist, which is unreliable across Docker versions -- pre-creating it
+# removes the ambiguity outright.
+RUN mkdir -p /home/agent/.claude && touch /home/agent/.claude/.credentials.json \
+    && chown -R 1000:1000 /home/agent/.claude
+
 # Every workspace hook and the coding agent itself run with a container bind-mount at
 # this path (`container::CONTAINER_PROJECT_ROOT`) -- create it so `docker run -v
 # <host>:/project -w /project` has somewhere to land even before the first mount.

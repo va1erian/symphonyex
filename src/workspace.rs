@@ -41,6 +41,14 @@ pub struct DockerContext {
     /// inside the container, since Docker doesn't inherit the host environment into a
     /// container automatically the way a plain child process would.
     pub env_passthrough: Vec<String>,
+    /// Host path to the host's own Claude Code login (`~/.claude/.credentials.json`),
+    /// resolved once at startup via `envsub::resolve_claude_credentials_path` --
+    /// `Some` only when `config.mount_claude_credentials` is true AND that file was
+    /// actually found. Bind-mounted read-only into each per-ticket container at
+    /// `/home/agent/.claude/.credentials.json` so the containerized `claude` CLI
+    /// reuses the host's existing session instead of needing its own separate
+    /// `ANTHROPIC_API_KEY`.
+    pub claude_credentials_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +93,21 @@ pub fn derive_workspace_key(identifier: &str) -> String {
 fn is_allowed(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
 }
+
+/// Best-effort permissive chmod (world rwx) for a freshly created workspace directory
+/// in Docker mode -- see the call site's doc comment. No-op on non-Unix targets:
+/// Windows has no POSIX mode bits, and host-mode Docker on Windows doesn't hit this
+/// class of ownership mismatch the way a real Linux volume in daemon mode does.
+#[cfg(unix)]
+async fn chmod_permissive(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).await {
+        tracing::warn!(?path, error = %e, "failed to chmod workspace directory (ignored)");
+    }
+}
+
+#[cfg(not(unix))]
+async fn chmod_permissive(_path: &Path) {}
 
 /// Invariant 2: the workspace path MUST stay inside the workspace root.
 fn validate_containment(root: &Path, path: &Path) -> Result<(), WorkspaceError> {
@@ -162,6 +185,18 @@ impl WorkspaceManager {
             tokio::fs::create_dir_all(&path)
                 .await
                 .map_err(|e| WorkspaceError::Create(path.clone(), e.to_string()))?;
+            if self.docker.is_some() {
+                // In Docker mode this directory is written to by two different
+                // processes with two different uids: the orchestrator itself (root,
+                // when daemonized -- see README.md "Daemonizing Symphony") creates
+                // it, but the per-ticket sibling container writes into it (git clone,
+                // etc.) as `workspace.docker.user`. Best-effort permissive chmod so
+                // that mismatch doesn't turn into a permission-denied clone failure --
+                // no-op on Windows (host-mode Docker's bind-mount translation doesn't
+                // hit this the same way; only seen in practice under daemon mode's
+                // real Linux volume).
+                chmod_permissive(&path).await;
+            }
         } else if !path.is_dir() {
             return Err(WorkspaceError::NotADirectory(path));
         }
@@ -174,12 +209,24 @@ impl WorkspaceManager {
             Some(ctx) => {
                 let name = container::derive_container_name(&ctx.workflow_dir, identifier);
                 let container_root = Path::new(container::CONTAINER_PROJECT_ROOT);
+                let extra_mounts: Vec<(PathBuf, String, bool)> = ctx
+                    .claude_credentials_path
+                    .as_ref()
+                    .map(|p| {
+                        vec![(
+                            p.clone(),
+                            "/home/agent/.claude/.credentials.json".to_string(),
+                            true,
+                        )]
+                    })
+                    .unwrap_or_default();
                 let options = container::RunOptions {
                     network: &ctx.config.network,
                     mem_limit: ctx.config.mem_limit.as_deref(),
                     cpus: ctx.config.cpus.as_deref(),
                     user: ctx.config.user.as_deref(),
                     env_passthrough: &ctx.env_passthrough,
+                    extra_mounts: &extra_mounts,
                 };
                 let handle = container::ensure_running(
                     ctx.config.image.as_deref().unwrap_or_default(),
@@ -402,6 +449,7 @@ mod tests {
             workflow_dir: workflow_dir.path().to_path_buf(),
             mount: MountSource::HostPath(workflow_dir.path().to_path_buf()),
             env_passthrough: Vec::new(),
+            claude_credentials_path: None,
             config: crate::config::DockerConfig {
                 enabled: true,
                 image: Some("debian:bookworm-slim".to_string()),
@@ -409,6 +457,7 @@ mod tests {
                 mem_limit: None,
                 cpus: None,
                 user: None,
+                mount_claude_credentials: false,
             },
         }));
 

@@ -94,6 +94,13 @@ pub struct DockerConfig {
     /// backend specifically: `claude` refuses `bypassPermissions` when running as
     /// root -- see the Symphony base `Dockerfile`'s own doc comment on this.
     pub user: Option<String>,
+    /// Bind-mount the host's own Claude Code login (`~/.claude/.credentials.json`)
+    /// read-only into each per-ticket container, so the containerized `claude` CLI
+    /// reuses the host's existing session instead of needing its own separate API
+    /// key. Off by default: every container that runs gets read access to this file
+    /// while it's enabled, which is a real trust concession worth opting into
+    /// deliberately, not defaulting on.
+    pub mount_claude_credentials: bool,
 }
 
 /// Extension: git-repo-as-first-class-input (see README.md "Git repo as first-class
@@ -241,6 +248,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         mem_limit: get_str(docker, "mem_limit"),
         cpus: get_str(docker, "cpus"),
         user: get_str(docker, "user"),
+        mount_claude_credentials: get(docker, "mount_claude_credentials")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     };
 
     let hook_timeout_ms = get_u64(hooks, "timeout_ms", 60_000);
@@ -394,9 +404,20 @@ fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
     let identity = "git config user.email \"symphony@local\"\n\
         git config user.name \"Symphony Agent\"\n";
 
+    // In Docker mode this directory can end up owned by a different uid than the one
+    // that clones into it (the daemon's own orchestrator process, root when
+    // daemonized, creates it; a per-ticket container running as `workspace.docker.user`
+    // does the actual clone -- see workspace.rs's `chmod_permissive`). Even once
+    // permission bits allow the write, git's own "dubious ownership" protection
+    // (2.35.2+) still refuses to operate on a directory it doesn't own unless told
+    // it's trusted. This has to run *before* `git clone`, not after: clone itself
+    // starts using the freshly-initialized `.git` the moment it creates it.
+    let trust_dir = "git config --global --add safe.directory \"$PWD\"\n";
+
     let after_create = match &repo.token_env {
         Some(var) => format!(
             "name=\"$(basename \"$PWD\")\"\n\
+             {trust_dir}\
              cred_helper='!f() {{ echo username=x-access-token; echo \"password=${var}\"; }}; f'\n\
              git -c credential.helper=\"$cred_helper\" clone \"{url}\" .\n\
              git config credential.helper \"$cred_helper\"\n\
@@ -405,6 +426,7 @@ fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
         ),
         None => format!(
             "name=\"$(basename \"$PWD\")\"\n\
+             {trust_dir}\
              git clone \"{url}\" .\n\
              {identity}\
              git checkout -b \"issue-$name\" \"origin/{branch}\"\n"
@@ -557,6 +579,8 @@ mod tests {
         assert!(create.contains("credential.helper"));
         assert!(create.contains("git config user.email"));
         assert!(create.contains("git config user.name"));
+        assert!(create.contains("safe.directory"));
+        assert!(create.find("safe.directory").unwrap() < create.find("clone").unwrap());
 
         let before = cfg.hook_before_run.unwrap();
         assert!(before.contains("is-inside-work-tree"));

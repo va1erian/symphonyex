@@ -41,6 +41,29 @@ fn var_name(value: &str) -> Option<&str> {
     }
 }
 
+/// Resolve the host's own Claude Code login file (`~/.claude/.credentials.json`), if
+/// one exists -- used for `workspace.docker.mount_claude_credentials` (see
+/// `config::DockerConfig`'s doc comment) so a containerized `claude` CLI can reuse the
+/// host's existing session instead of needing a separate API key. Checks
+/// `SYMPHONY_HOST_CLAUDE_CREDENTIALS` first (set by `daemon::start` when daemonized,
+/// since a daemon container has no direct view of the real host filesystem to resolve
+/// this itself -- see that function's own doc comment), falling back to resolving
+/// directly from `USERPROFILE`/`HOME` (the non-daemonized case, where this process
+/// *is* already running on the real host).
+pub fn resolve_claude_credentials_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SYMPHONY_HOST_CLAUDE_CREDENTIALS") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let path = PathBuf::from(home)
+        .join(".claude")
+        .join(".credentials.json");
+    path.is_file().then_some(path)
+}
+
 /// Recursively walk a parsed WORKFLOW.md config tree and collect every distinct
 /// `$VAR_NAME`-shaped string value found anywhere in it (bare names, no `$`, sorted
 /// and deduplicated). Used to forward exactly the secrets a config actually
@@ -157,6 +180,40 @@ mod tests {
             collect_var_refs(&yaml),
             vec!["ANOTHER_VAR".to_string(), "GITHUB_TOKEN".to_string()]
         );
+    }
+
+    #[test]
+    fn resolve_claude_credentials_path_prefers_the_daemon_forwarded_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds = dir.path().join("creds.json");
+        std::fs::write(&creds, "{}").unwrap();
+        unsafe {
+            std::env::set_var("SYMPHONY_HOST_CLAUDE_CREDENTIALS", &creds);
+        }
+        assert_eq!(resolve_claude_credentials_path(), Some(creds));
+        unsafe {
+            std::env::remove_var("SYMPHONY_HOST_CLAUDE_CREDENTIALS");
+        }
+    }
+
+    #[test]
+    fn resolve_claude_credentials_path_ignores_override_pointing_at_missing_file() {
+        unsafe {
+            std::env::set_var(
+                "SYMPHONY_HOST_CLAUDE_CREDENTIALS",
+                "/definitely/does/not/exist.json",
+            );
+        }
+        // Falls through to the real USERPROFILE/HOME lookup rather than returning the
+        // dangling override path -- assert only that it isn't the dangling path itself,
+        // since whether *this* machine happens to have real credentials is unknowable.
+        assert_ne!(
+            resolve_claude_credentials_path(),
+            Some(PathBuf::from("/definitely/does/not/exist.json"))
+        );
+        unsafe {
+            std::env::remove_var("SYMPHONY_HOST_CLAUDE_CREDENTIALS");
+        }
     }
 
     #[test]
