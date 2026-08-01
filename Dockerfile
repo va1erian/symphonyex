@@ -18,8 +18,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
-# --- Runtime: what every per-ticket container actually runs.
+# --- Runtime: what every per-ticket container actually runs, and (for images used
+# with `symphony daemon start`, see README.md "Daemonizing Symphony") what the daemon
+# container itself runs too.
 FROM debian:bookworm-slim
+ARG DOCKER_CLI_VERSION=27.3.1
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash git ca-certificates curl gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -27,6 +30,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # The Claude Code CLI's published package name/install method; verify against
     # https://docs.claude.com/en/docs/claude-code if this has since changed.
     && npm install -g @anthropic-ai/claude-code \
+    # docker CLI (client only, no engine/daemon) -- lets a daemonized Symphony spawn
+    # per-ticket sibling containers through a mounted host Docker socket
+    # (Docker-outside-of-Docker). Static official binary, not an apt package: avoids
+    # adding Docker's own apt repo/GPG key just for the client. Harmless to include in
+    # every image even when not used for `symphony daemon start`.
+    && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
     && apt-get purge -y curl gnupg && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 

@@ -53,6 +53,16 @@ pub async fn kill_process_by_name(container: &str, process_name: &str) {
 /// per project (so two different projects' containers never collide even if they
 /// happen to use the same ticket identifiers).
 pub fn derive_container_name(workflow_dir: &Path, identifier: &str) -> String {
+    let hex = hash_workflow_dir(workflow_dir);
+    let key = crate::workspace::derive_workspace_key(identifier);
+    format!("symphony-{hex}-{key}")
+}
+
+/// Short, stable, per-project hash of `workflow_dir` -- shared by per-ticket container
+/// naming above and by `crate::daemon`'s daemon-container/volume naming, so both stay
+/// consistent (and never collide across two different projects) without duplicating
+/// the hashing logic.
+pub fn hash_workflow_dir(workflow_dir: &Path) -> String {
     let workflow_dir_n = crate::envsub::normalize(workflow_dir);
     let dir_str = if cfg!(windows) {
         workflow_dir_n.to_string_lossy().to_lowercase()
@@ -60,9 +70,7 @@ pub fn derive_container_name(workflow_dir: &Path, identifier: &str) -> String {
         workflow_dir_n.to_string_lossy().to_string()
     };
     let hash = Sha256::digest(dir_str.as_bytes());
-    let hex: String = hash.iter().take(4).map(|b| format!("{b:02x}")).collect(); // 32 bits
-    let key = crate::workspace::derive_workspace_key(identifier);
-    format!("symphony-{hex}-{key}")
+    hash.iter().take(4).map(|b| format!("{b:02x}")).collect() // 32 bits
 }
 
 #[derive(Debug, Error)]
@@ -73,6 +81,37 @@ pub enum ContainerError {
     CommandFailed { op: String, output: String },
     #[error("docker exec timed out after {0}ms")]
     Timeout(u64),
+}
+
+/// Where a container's project-root mount actually comes from.
+#[derive(Debug, Clone)]
+pub enum MountSource {
+    /// Bind-mount a host directory. The default: used whenever Symphony itself runs
+    /// directly on the host (not daemonized) -- today's only supported mode.
+    HostPath(PathBuf),
+    /// Mount a named Docker volume. Used when Symphony itself is daemonized (running
+    /// inside its own container, `symphony daemon start`, see README.md): per-ticket
+    /// sibling containers are created by the *host's* Docker daemon through a mounted
+    /// socket (Docker-outside-of-Docker), not nested inside the daemon's own
+    /// container, so a bind-mount naming the daemon's own in-container path (e.g.
+    /// `/project`) would resolve to nothing meaningful on the host side. A named
+    /// volume is referenced by name and resolves correctly for sibling containers
+    /// regardless of which container asked for it. No other code needs to change for
+    /// this to work correctly: a daemonized Symphony's own `workflow_dir` (where it
+    /// finds `WORKFLOW.md`) is already its in-container path once it's running inside
+    /// its own container with the volume mounted at the same point sibling containers
+    /// use -- exactly what `ContainerHandle::to_container_path` and
+    /// `derive_container_name` already expect, unchanged.
+    NamedVolume(String),
+}
+
+impl MountSource {
+    fn as_docker_run_source(&self) -> String {
+        match self {
+            MountSource::HostPath(p) => to_container_path_str(p),
+            MountSource::NamedVolume(name) => name.clone(),
+        }
+    }
 }
 
 /// A running (or startable) named container bind-mounted to a project directory.
@@ -182,7 +221,7 @@ pub async fn docker_available() -> bool {
 pub async fn ensure_running(
     image: &str,
     name: &str,
-    host_mount: &Path,
+    mount: &MountSource,
     container_root: &Path,
     network: &str,
     mem_limit: Option<&str>,
@@ -207,7 +246,7 @@ pub async fn ensure_running(
 
     let mount_arg = format!(
         "{}:{}",
-        to_container_path_str(host_mount),
+        mount.as_docker_run_source(),
         to_container_path_str(container_root)
     );
     let mut args: Vec<String> = vec![
@@ -423,7 +462,7 @@ mod tests {
         let h1 = ensure_running(
             "debian:bookworm-slim",
             name,
-            dir.path(),
+            &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
             "bridge",
             None,
@@ -434,7 +473,7 @@ mod tests {
         let h2 = ensure_running(
             "debian:bookworm-slim",
             name,
-            dir.path(),
+            &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
             "bridge",
             None,
@@ -445,6 +484,69 @@ mod tests {
         assert_eq!(h1.name, h2.name);
 
         remove(name).await;
+    }
+
+    /// `MountSource::NamedVolume` is the Docker-outside-of-Docker case (a daemonized
+    /// Symphony spawning per-ticket sibling containers via a mounted host socket, see
+    /// README.md "Daemonizing Symphony") -- prove it actually results in a working
+    /// mount, not just that the string gets built without erroring.
+    #[tokio::test]
+    #[ignore]
+    async fn ensure_running_with_named_volume_mounts_correctly() {
+        assert!(
+            docker_available().await,
+            "docker must be available for this test"
+        );
+        let volume = "symphony-test-named-volume";
+        let name = "symphony-test-ensure-running-volume";
+        remove(name).await;
+        let _ = run_docker(&["volume", "rm", "-f", volume], "volume rm").await;
+        run_docker(&["volume", "create", volume], "volume create")
+            .await
+            .unwrap();
+
+        let handle = ensure_running(
+            "debian:bookworm-slim",
+            name,
+            &MountSource::NamedVolume(volume.to_string()),
+            Path::new("/project"),
+            "bridge",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        exec_script(
+            &handle,
+            Path::new("/project"),
+            "echo from-volume > marker.txt",
+            10_000,
+        )
+        .await
+        .unwrap();
+
+        // Independently confirm the write actually landed in the named volume (not
+        // just somewhere inside the container's own writable layer): a second,
+        // unrelated container mounting the same volume should see it too.
+        run_docker(
+            &[
+                "run",
+                "--rm",
+                "-v",
+                &format!("{volume}:/check"),
+                "debian:bookworm-slim",
+                "test",
+                "-f",
+                "/check/marker.txt",
+            ],
+            "run check",
+        )
+        .await
+        .unwrap();
+
+        remove(name).await;
+        let _ = run_docker(&["volume", "rm", "-f", volume], "volume rm").await;
     }
 
     #[tokio::test]
@@ -461,7 +563,7 @@ mod tests {
         let handle = ensure_running(
             "debian:bookworm-slim",
             name,
-            dir.path(),
+            &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
             "bridge",
             None,
@@ -504,7 +606,7 @@ mod tests {
         let handle = ensure_running(
             "debian:bookworm-slim",
             name,
-            dir.path(),
+            &MountSource::HostPath(dir.path().to_path_buf()),
             Path::new("/project"),
             "bridge",
             None,

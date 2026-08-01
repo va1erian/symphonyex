@@ -169,6 +169,74 @@ is a real hardening step for a single trusted operator running their own
 `WORKFLOW.md` locally — **not** sufficient for multi-tenant or untrusted-input
 production use.
 
+## Daemonizing Symphony
+
+Everything above assumes a human launches `symphony` and watches it. `symphony
+daemon` runs Symphony itself as a long-lived, auto-restarting, single-instance Docker
+container instead -- point it at a git repo, a GitHub issues board (or the local
+tracker), and a `WORKFLOW.md`, and it keeps working unattended, surviving crashes and
+reboots without a terminal session to babysit it.
+
+```bash
+symphony daemon start ./WORKFLOW.md --port 7777
+symphony daemon status ./WORKFLOW.md
+symphony daemon logs ./WORKFLOW.md --follow
+symphony daemon stop ./WORKFLOW.md
+```
+
+**Requires `workspace.docker.enabled: true`** (see "Docker mode" above) -- the daemon
+container spawns per-ticket sibling containers by reaching the *host's* Docker daemon
+through a mounted socket (Docker-outside-of-Docker), so per-ticket Docker mode has to
+already be configured; `daemon start` refuses to run otherwise.
+
+**Under the hood**: `daemon start` runs the same base image `docker build -t
+symphony-base .` produces, as `docker run -d --name symphony-daemon-<hash> --restart
+unless-stopped -v <named-volume>:/project -v /var/run/docker.sock:/var/run/docker.sock
+-e SYMPHONY_DAEMON_VOLUME=<named-volume> ... symphony <workflow-path> --port <port>`.
+Three things worth knowing:
+
+- **The project lives in a named Docker volume, not a host bind-mount.** Per-ticket
+  sibling containers are created by the *host's* Docker daemon, not nested inside the
+  daemon's own container -- a bind-mount naming the daemon's own in-container path
+  (e.g. `/project`) would resolve to nothing on the host, where those sibling
+  containers actually run. A named volume is referenced by name and resolves
+  correctly regardless of which container asked for it. The first `daemon start` for
+  a project seeds a fresh volume by copying whatever's currently on the host at
+  `workflow_dir`; later starts reuse the same volume as-is (so the daemon's own
+  commits/pushes since then aren't overwritten by a stale host copy).
+- **`docker run --name` is the single-instance guard.** A second `daemon start` for
+  the same project fails immediately with a clear error instead of silently racing --
+  directly closing the failure mode from an incident that motivated daemonizing this
+  in the first place: a manually-relaunched orchestrator accidentally left two
+  instances dispatching the same ticket concurrently.
+- **The status dashboard binds `0.0.0.0` instead of `127.0.0.1` in daemon mode**
+  (detected via the `SYMPHONY_DAEMON_VOLUME` env var `daemon start` sets) -- loopback
+  in a container's own network namespace isn't reachable through `docker run -p` at
+  all, so the usual host-mode "loopback only" default would make `--port` silently
+  useless. The container boundary is the isolation mechanism here instead;
+  reachability is already gated by whether `-p`/`--port` was passed.
+
+**Crash-restart** is Docker's own `--restart unless-stopped` policy: it restarts on an
+internal crash or a Docker daemon restart, but deliberately *not* after an explicit
+`docker stop`/`kill` (`symphony daemon stop` included) -- that's Docker's standard
+"stopped on purpose, stay stopped" semantics, not a Symphony behavior. **Reboot
+survival** additionally depends on Docker Desktop itself starting on login --
+something to configure in Docker Desktop's own settings, not in Symphony.
+`daemon start` against a project whose daemon was `stop`ped (container still exists,
+just not running) resumes that same container rather than erroring on a name
+conflict; it comes back with whatever port/settings it was originally started with,
+not new flags passed to the later `start` call -- `docker rm` the old container first
+to pick up a changed image or port.
+
+**Security note**: mounting the host's Docker socket into the daemon container is
+**effectively root-equivalent host access** -- anything that can reach the socket can
+launch a container with an arbitrary bind-mount of the entire host filesystem. This is
+a materially bigger trust concession than per-ticket Docker mode alone (which only
+ever bind-mounts one project directory into an otherwise-isolated container), and
+applies on top of that section's own caveats, not instead of them. Same bottom line,
+stated more strongly here: reasonable for a single trusted operator running their own
+project unattended on their own machine, not a step toward multi-tenant safety.
+
 ## Provider-native tracker tool (Section 10.5)
 
 The coding agent only ever runs inside the per-issue workspace — it has no visibility

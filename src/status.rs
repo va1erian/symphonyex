@@ -39,11 +39,33 @@ pub struct RetryRow {
     pub error: Option<String>,
 }
 
-/// Bind loopback-only on `port` and serve the dashboard until the process exits.
-pub async fn serve(port: u16, rx: watch::Receiver<StatusSnapshot>) -> anyhow::Result<()> {
+/// Bind and serve the dashboard until the process exits. Loopback-only
+/// (`127.0.0.1`) unless `bind_all_interfaces` is set, in which case it binds
+/// `0.0.0.0` instead.
+///
+/// The loopback-only default is a deliberate security choice on a bare host (Section
+/// 13.7: "no JS, no JSON API" -- not hardened for exposure beyond the local machine).
+/// That reasoning flips inside a container, though: a daemonized Symphony (see
+/// `crate::daemon`, README.md "Daemonizing Symphony") runs the dashboard inside its
+/// *own* container's network namespace, where `127.0.0.1` refers to the container's
+/// own loopback interface -- unreachable from the host even with the port published
+/// via `docker run -p`, since port publishing forwards to a container's external
+/// interface, not its loopback. There's no "other users on the same host" to guard
+/// against inside that namespace; the container boundary itself is the isolation
+/// mechanism, and reachability is already gated by whether `-p` was passed at all.
+pub async fn serve(
+    port: u16,
+    bind_all_interfaces: bool,
+    rx: watch::Receiver<StatusSnapshot>,
+) -> anyhow::Result<()> {
     let app = Router::new().route("/", get(dashboard)).with_state(rx);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    tracing::info!("status dashboard listening on http://127.0.0.1:{port}");
+    let bind_addr = if bind_all_interfaces {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    let listener = tokio::net::TcpListener::bind((bind_addr, port)).await?;
+    tracing::info!("status dashboard listening on http://{bind_addr}:{port}");
     axum::serve(listener, app).await?;
     Ok(())
 }

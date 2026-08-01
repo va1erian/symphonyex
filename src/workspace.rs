@@ -1,7 +1,7 @@
 //! Workspace management and safety invariants (Section 9).
 
 use crate::config::DockerConfig;
-use crate::container::{self, ContainerHandle};
+use crate::container::{self, ContainerHandle, MountSource};
 use crate::envsub;
 use crate::hooks;
 use sha2::{Digest, Sha256};
@@ -28,6 +28,12 @@ pub enum WorkspaceError {
 pub struct DockerContext {
     pub workflow_dir: PathBuf,
     pub config: DockerConfig,
+    /// Where each ticket container's project-root mount actually comes from.
+    /// `MountSource::HostPath(workflow_dir)` in the common case (Symphony running
+    /// directly on the host); `MountSource::NamedVolume(_)` when Symphony itself is
+    /// daemonized (see README.md "Daemonizing Symphony" and `container::MountSource`'s
+    /// own doc comment for why a bind-mount can't be used in that case).
+    pub mount: MountSource,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +170,7 @@ impl WorkspaceManager {
                 let handle = container::ensure_running(
                     ctx.config.image.as_deref().unwrap_or_default(),
                     &name,
-                    &ctx.workflow_dir,
+                    &ctx.mount,
                     container_root,
                     &ctx.config.network,
                     ctx.config.mem_limit.as_deref(),
@@ -382,6 +388,7 @@ mod tests {
 
         let mgr = WorkspaceManager::new(root).with_docker(Some(DockerContext {
             workflow_dir: workflow_dir.path().to_path_buf(),
+            mount: MountSource::HostPath(workflow_dir.path().to_path_buf()),
             config: crate::config::DockerConfig {
                 enabled: true,
                 image: Some("debian:bookworm-slim".to_string()),

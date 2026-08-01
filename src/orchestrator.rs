@@ -189,8 +189,20 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
     };
 
     let docker_ctx = if cfg.docker.enabled {
+        // `SYMPHONY_DAEMON_VOLUME`: set by `symphony daemon start` when Symphony
+        // itself is running inside its own container (Docker-outside-of-Docker) --
+        // per-ticket sibling containers must then mount this named volume rather than
+        // bind-mount a host path, since a path meaningful only inside *this*
+        // container's own mount namespace (e.g. `/project`) wouldn't resolve to
+        // anything on the host, where sibling containers are actually created. See
+        // `container::MountSource`'s doc comment for the full explanation.
+        let mount = match std::env::var("SYMPHONY_DAEMON_VOLUME") {
+            Ok(volume) if !volume.trim().is_empty() => container::MountSource::NamedVolume(volume),
+            _ => container::MountSource::HostPath(cfg.workflow_dir.clone()),
+        };
         Some(DockerContext {
             workflow_dir: cfg.workflow_dir.clone(),
+            mount,
             config: cfg.docker.clone(),
         })
     } else {
@@ -268,8 +280,13 @@ pub async fn run(
 
     let (status_tx, status_rx) = tokio::sync::watch::channel(status::StatusSnapshot::default());
     if let Some(port) = status_port {
+        // Same daemonized-Symphony signal used for MountSource above: inside its own
+        // container, loopback-only binding would make the dashboard unreachable even
+        // with the port published (see status::serve's doc comment for why).
+        let bind_all_interfaces =
+            std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         tokio::spawn(async move {
-            if let Err(e) = status::serve(port, status_rx).await {
+            if let Err(e) = status::serve(port, bind_all_interfaces, status_rx).await {
                 tracing::error!(error = %e, "status server exited");
             }
         });

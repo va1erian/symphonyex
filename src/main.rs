@@ -1,6 +1,7 @@
 mod agent;
 mod config;
 mod container;
+mod daemon;
 mod domain;
 mod envsub;
 mod frontmatter;
@@ -58,6 +59,39 @@ enum Command {
         #[arg(long)]
         issue_id: String,
     },
+
+    /// Run Symphony itself as a long-lived, auto-restarting, single-instance Docker
+    /// container (see README.md "Daemonizing Symphony"). Requires
+    /// `workspace.docker.enabled: true` in WORKFLOW.md.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon (idempotent-ish: refuses to start a second one for the same
+    /// project; a pre-existing named volume from an earlier start is reused as-is).
+    Start {
+        /// Path to WORKFLOW.md. Defaults to ./WORKFLOW.md.
+        workflow_path: Option<PathBuf>,
+        /// Serve the live status dashboard on this loopback port inside the daemon
+        /// container, published to the same port on the host.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Stop the daemon (the named volume and its data are left alone).
+    Stop { workflow_path: Option<PathBuf> },
+    /// Show whether the daemon is running.
+    Status { workflow_path: Option<PathBuf> },
+    /// Show the daemon's logs.
+    Logs {
+        workflow_path: Option<PathBuf>,
+        /// Stream new log lines as they happen instead of just the recent tail.
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 #[tokio::main]
@@ -73,15 +107,18 @@ async fn main() -> std::process::ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    if let Some(Command::McpToolServer {
-        tracker_kind,
-        tracker_provider,
-        workflow_dir,
-        issue_id,
-    }) = cli.command
-    {
-        return run_mcp_tool_server(&tracker_kind, &tracker_provider, &workflow_dir, &issue_id)
-            .await;
+    match cli.command {
+        Some(Command::McpToolServer {
+            tracker_kind,
+            tracker_provider,
+            workflow_dir,
+            issue_id,
+        }) => {
+            return run_mcp_tool_server(&tracker_kind, &tracker_provider, &workflow_dir, &issue_id)
+                .await;
+        }
+        Some(Command::Daemon { action }) => return run_daemon_command(action).await,
+        None => {}
     }
 
     let path = workflow::resolve_workflow_path(cli.workflow_path.as_deref());
@@ -103,6 +140,40 @@ async fn main() -> std::process::ExitCode {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received shutdown signal");
             std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+async fn run_daemon_command(action: DaemonAction) -> std::process::ExitCode {
+    let result = match action {
+        DaemonAction::Start {
+            workflow_path,
+            port,
+        } => {
+            let path = workflow::resolve_workflow_path(workflow_path.as_deref());
+            daemon::start(&path, port).await
+        }
+        DaemonAction::Stop { workflow_path } => {
+            let path = workflow::resolve_workflow_path(workflow_path.as_deref());
+            daemon::stop(&path).await
+        }
+        DaemonAction::Status { workflow_path } => {
+            let path = workflow::resolve_workflow_path(workflow_path.as_deref());
+            daemon::status(&path).await
+        }
+        DaemonAction::Logs {
+            workflow_path,
+            follow,
+        } => {
+            let path = workflow::resolve_workflow_path(workflow_path.as_deref());
+            daemon::logs(&path, follow).await
+        }
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!(error = %e, "symphony daemon command failed");
+            std::process::ExitCode::FAILURE
         }
     }
 }
