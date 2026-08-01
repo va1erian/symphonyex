@@ -4,6 +4,7 @@ mod container;
 mod daemon;
 mod domain;
 mod envsub;
+mod eventlog;
 mod frontmatter;
 mod hooks;
 mod mcp;

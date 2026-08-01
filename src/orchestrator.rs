@@ -34,6 +34,12 @@ struct Shared {
     tracker: Arc<dyn TrackerAdapter>,
     agent_backend: Arc<dyn AgentBackend>,
     workspace_mgr: Arc<WorkspaceManager>,
+    /// Feeds the SQLite event log's dedicated writer task (`eventlog::spawn_writer`) --
+    /// see that module's doc comment for why this is a channel rather than a shared
+    /// connection. Not part of `DispatchSnapshot`: only `handle_msg`/`dispatch_issue`
+    /// (which already own `shared`) ever record events, not the per-issue worker task
+    /// itself.
+    event_tx: mpsc::UnboundedSender<crate::eventlog::NewEvent>,
 }
 
 impl Shared {
@@ -46,6 +52,12 @@ impl Shared {
             workspace_mgr: self.workspace_mgr.clone(),
         }
     }
+}
+
+/// Best-effort: a full channel or a writer task that's already exited just means one
+/// history row is lost, never something worth propagating into the dispatch path.
+fn record_event(shared: &Shared, ev: crate::eventlog::NewEvent) {
+    let _ = shared.event_tx.send(ev);
 }
 
 #[derive(Clone)]
@@ -246,12 +258,19 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
     let workspace_mgr = WorkspaceManager::new(cfg.workspace_root.clone()).with_docker(docker_ctx);
     std::fs::create_dir_all(workspace_mgr.root())?;
 
+    // Same directory convention `symphony-report.html` already defaults to, so the
+    // event log lands in the same place (including inside a daemonized Symphony's own
+    // persistent volume) with no new config needed.
+    let event_tx =
+        crate::eventlog::spawn_writer(cfg.workflow_dir.join(crate::eventlog::DB_FILENAME));
+
     Ok(Shared {
         config: cfg,
         prompt_template,
         tracker: Arc::from(tracker_adapter),
         agent_backend,
         workspace_mgr: Arc::new(workspace_mgr),
+        event_tx,
     })
 }
 
@@ -320,8 +339,12 @@ pub async fn run(
         // with the port published (see status::serve's doc comment for why).
         let bind_all_interfaces =
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
+        let db_path = shared
+            .config
+            .workflow_dir
+            .join(crate::eventlog::DB_FILENAME);
         tokio::spawn(async move {
-            if let Err(e) = status::serve(port, bind_all_interfaces, status_rx).await {
+            if let Err(e) = status::serve(port, bind_all_interfaces, status_rx, db_path).await {
                 tracing::error!(error = %e, "status server exited");
             }
         });
@@ -610,6 +633,20 @@ async fn dispatch_issue(
         .dispatch_count += 1;
 
     tracing::info!(issue_id = %issue_id, identifier = %identifier, attempt = ?attempt, "dispatched");
+    record_event(
+        shared,
+        crate::eventlog::NewEvent {
+            issue_id,
+            identifier,
+            title,
+            session_id: None,
+            event_type: "dispatched".to_string(),
+            message: attempt.map(|a| format!("attempt {a}")),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        },
+    );
 }
 
 fn backoff_delay_ms(attempt: u32, max_backoff_ms: u64) -> u64 {
@@ -887,6 +924,24 @@ async fn handle_retry_fired(
         return; // superseded by a newer retry schedule
     }
     let entry = state.retry_attempts.remove(&issue_id).unwrap();
+    // RetryEntry has no title field (it's a pure scheduling record) -- identifier
+    // stands in for title here rather than an extra tracker fetch just for a log row;
+    // the eventual dispatch (if one happens) logs the real title via its own
+    // "dispatched" event.
+    record_event(
+        shared,
+        crate::eventlog::NewEvent {
+            issue_id: issue_id.clone(),
+            identifier: entry.identifier.clone(),
+            title: entry.identifier.clone(),
+            session_id: None,
+            event_type: "retry_fired".to_string(),
+            message: Some(format!("attempt {}", entry.attempt)),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        },
+    );
 
     let refreshed = match shared
         .tracker
@@ -957,15 +1012,45 @@ async fn handle_msg(
             session_id,
         } => {
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.session_id = session_id;
+                e.session_id = session_id.clone();
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "session_started".to_string(),
+                        message: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
             }
         }
         OrchMsg::TurnStarted { issue_id } => {
             if let Some(e) = state.running.get_mut(&issue_id) {
                 e.turn_count += 1;
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
                 state.metrics.turns_started += 1;
                 state.metrics.issue_entry(&identifier, &title).turns += 1;
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "turn_started".to_string(),
+                        message: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
             }
         }
         OrchMsg::AgentEvent { issue_id, event } => {
@@ -1006,6 +1091,21 @@ async fn handle_msg(
                     *state.metrics.tool_call_counts.entry(tool_name).or_insert(0) += 1;
                     state.metrics.issue_entry(&identifier, &title).tool_calls += 1;
                 }
+
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: event.event,
+                        message: event.message,
+                        input_tokens: event.usage.as_ref().map(|u| u.input_tokens),
+                        output_tokens: event.usage.as_ref().map(|u| u.output_tokens),
+                        total_tokens: event.usage.as_ref().map(|u| u.total_tokens),
+                    },
+                );
             }
         }
         OrchMsg::WorkerExit { issue_id, reason } => {
@@ -1017,6 +1117,20 @@ async fn handle_msg(
                     finalize_issue_runtime(state, &entry, "worker exited normally");
                     state.completed.insert(issue_id.clone());
                     tracing::info!(issue_id = %issue_id, identifier = %entry.issue.identifier, "worker exited normally; scheduling continuation check");
+                    record_event(
+                        shared,
+                        crate::eventlog::NewEvent {
+                            issue_id: issue_id.clone(),
+                            identifier: entry.issue.identifier.clone(),
+                            title: entry.issue.title.clone(),
+                            session_id: Some(entry.session_id.clone()),
+                            event_type: "worker_exit".to_string(),
+                            message: Some("worker exited normally".to_string()),
+                            input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                        },
+                    );
                     schedule_retry(
                         state,
                         tx,
@@ -1032,6 +1146,20 @@ async fn handle_msg(
                     let next_attempt = entry.retry_attempt.unwrap_or(0) + 1;
                     let delay = backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms);
                     tracing::warn!(issue_id = %issue_id, identifier = %entry.issue.identifier, error = %err, next_attempt, delay_ms = delay, "worker exited abnormally; scheduling retry");
+                    record_event(
+                        shared,
+                        crate::eventlog::NewEvent {
+                            issue_id: issue_id.clone(),
+                            identifier: entry.issue.identifier.clone(),
+                            title: entry.issue.title.clone(),
+                            session_id: Some(entry.session_id.clone()),
+                            event_type: "worker_exit".to_string(),
+                            message: Some(format!("error: {err}")),
+                            input_tokens: None,
+                            output_tokens: None,
+                            total_tokens: None,
+                        },
+                    );
                     schedule_retry(
                         state,
                         tx,
@@ -1297,6 +1425,7 @@ mod tests {
         let provider: serde_yaml::Value =
             serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
         let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
         Shared {
             config: cfg,
@@ -1312,6 +1441,7 @@ mod tests {
                 workflow_dir: Path::new(".").to_path_buf(),
             }),
             workspace_mgr: Arc::new(WorkspaceManager::new(workspace_root)),
+            event_tx,
         }
     }
 

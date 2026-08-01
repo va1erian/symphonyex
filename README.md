@@ -27,13 +27,31 @@ errors like `ssh: Could not resolve hostname c`.
 
 ## Live status dashboard
 
-`symphony ./WORKFLOW.md --port 7777` additionally serves a minimal live dashboard at
-`http://127.0.0.1:7777` (loopback only) — one plain server-rendered HTML page,
-`<meta>`-refreshed every second, no JS, no JSON API (see `src/status.rs`). It shows
-currently-running agents as cards (identifier, session id, elapsed time, turn count,
-last event) and the retry queue. Useful for watching dispatch/concurrency behavior —
-e.g. bump `agent.max_concurrent_agents` and you'll see multiple cards running at once.
-Off by default; only starts when `--port` is passed.
+`symphony ./WORKFLOW.md --port 7777` additionally serves a small dashboard at
+`http://127.0.0.1:7777` (loopback only; see `src/status.rs`), off by default and only
+starting when `--port` is passed:
+
+- **`/`** — currently-running agents as cards (identifier, session id, elapsed time,
+  turn count, last event) and the retry queue. Live-updates every 2s via a small
+  inline `fetch()` + `innerHTML` swap against `/fragment` — not a `<meta>` full-page
+  refresh (the original mechanism, and genuinely janky: every tick was a real browser
+  navigation, resetting scroll position and any open selection). The new mechanism has
+  none of that; nothing outside the two data containers ever reloads.
+- **`/events`** — filterable, paginated browse of every dispatch/turn/tool-call/exit
+  event ever recorded, backed by a persistent SQLite log (`<workflow_dir>/symphony.db`,
+  `src/eventlog.rs`) that survives a restart — unlike `/`, which is live state and
+  correctly shows nothing running right after a restart. High-frequency
+  low-information events (`other_message`, Claude's own intermediate streaming
+  chunks) are hidden by default; a "Show all" link brings them back.
+- **`/usage`** — token/turn/tool-call consumption, globally and per-issue, queried
+  live from the same SQLite log. Independent of, and does not replace, the
+  always-on `--report` HTML file below (both exist; this one is browsable/filterable
+  and survives restarts by design, the other is a single continuously-rewritten
+  snapshot file).
+
+Useful for watching dispatch/concurrency behavior — e.g. bump
+`agent.max_concurrent_agents` and you'll see multiple cards running at once on `/`, or
+look back at exactly what happened on `/events` afterward.
 
 ## Usage report
 
