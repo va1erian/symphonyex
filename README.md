@@ -51,6 +51,19 @@ its tokens show as 0. Narrow race, mostly visible on short poll intervals agains
 trivial/fast tasks; not expected to matter much at realistic poll intervals against
 real work.
 
+That same reconciliation-preempts-mid-turn race used to be worse than a metrics gap:
+`after_run` (and therefore an agent's `git commit`/`push`, if that's what the hook
+does) never ran at all when a worker was aborted by reconciliation rather than exiting
+on its own — a fully-verified, ticket-complete attempt could get its workspace deleted
+before its work was ever persisted anywhere. Fixed: reconciliation now `.abort()`s
+*and awaits* the worker's `JoinHandle` (not just an `AbortHandle`, which only requests
+cancellation) before running `after_run` or touching the workspace, so the aborted
+task's `Drop` — which `kill_on_drop`s the agent subprocess — has actually finished
+first, and `after_run` runs every time a running attempt ends, matching Section 9.4
+("success, failure, timeout, or cancellation"). Found by running the real
+bsky-archiver pipeline: a ticket showed `done` with fully verified work, but its
+branch never appeared upstream.
+
 ## Coding-agent backends
 
 Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`.

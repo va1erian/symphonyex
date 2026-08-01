@@ -64,7 +64,15 @@ struct RunningEntry {
     tokens: TokenUsage,
     turn_count: u32,
     tool_call_count: u32,
-    abort: tokio::task::AbortHandle,
+    /// The worker task's own `JoinHandle`, not just an `AbortHandle`: reconciliation
+    /// needs to `.abort()` *and then await* it before touching the workspace itself
+    /// (running `after_run`, deleting the directory), so the aborted task's `Drop`
+    /// (which `kill_on_drop`s the agent subprocess) has actually finished first —
+    /// otherwise a hook/cleanup racing a not-yet-dead subprocess can silently lose
+    /// work (see the `AR-8` incident this fixed: `after_run` never ran on
+    /// reconciliation-triggered termination, so a fully-verified attempt's git commit
+    /// never happened before its workspace got deleted).
+    handle: tokio::task::JoinHandle<()>,
     retry_attempt: Option<u32>,
 }
 
@@ -445,7 +453,7 @@ async fn dispatch_issue(
             tokens: TokenUsage::default(),
             turn_count: 0,
             tool_call_count: 0,
-            abort: handle.abort_handle(),
+            handle,
             retry_attempt: attempt,
         },
     );
@@ -505,13 +513,14 @@ async fn terminate_running(
     outcome: &str,
 ) {
     if let Some(entry) = state.running.remove(issue_id) {
-        entry.abort.abort();
         finalize_issue_runtime(state, &entry, outcome);
+        let identifier = entry.issue.identifier.clone();
+        abort_and_run_after_run(shared, entry.handle, &identifier).await;
         if cleanup_workspace {
             shared
                 .workspace_mgr
                 .remove_for_issue(
-                    &entry.issue.identifier,
+                    &identifier,
                     shared.config.hook_before_remove.as_deref(),
                     shared.config.hook_timeout_ms,
                 )
@@ -520,6 +529,28 @@ async fn terminate_running(
     }
     state.claimed.remove(issue_id);
     state.retry_attempts.remove(issue_id);
+}
+
+/// Abort a running worker and *wait for it to actually stop* (not just request
+/// cancellation) before touching its workspace, then run `after_run` if configured —
+/// Section 9.4 requires `after_run` to fire on cancellation, not just normal/error
+/// exit, and it can't safely run (or workspace cleanup safely proceed) while the
+/// aborted task's `Drop` (which `kill_on_drop`s the agent subprocess) might still be
+/// in flight.
+async fn abort_and_run_after_run(shared: &Shared, handle: tokio::task::JoinHandle<()>, identifier: &str) {
+    handle.abort();
+    let _ = handle.await; // resolves once the task has truly finished, Err(Cancelled) is expected
+
+    let Some(script) = &shared.config.hook_after_run else {
+        return;
+    };
+    let path = shared.workspace_mgr.path_for(identifier);
+    if !path.is_dir() {
+        return;
+    }
+    if let Err(e) = hooks::run_hook("after_run", script, &path, shared.config.hook_timeout_ms).await {
+        tracing::warn!(%identifier, error = %e, "after_run hook failed (ignored) [reconciliation-triggered termination]");
+    }
 }
 
 /// Turns/tool-calls/tokens are already folded into `state.metrics` live as they
@@ -535,7 +566,7 @@ fn finalize_issue_runtime(state: &mut OrchestratorState, entry: &RunningEntry, o
 
 /// Section 8.5: stall detection (Part A) + tracker state refresh (Part B).
 async fn reconcile(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
-    reconcile_stalled(shared, state, tx);
+    reconcile_stalled(shared, state, tx).await;
 
     let running_ids: Vec<String> = state.running.keys().cloned().collect();
     if running_ids.is_empty() {
@@ -572,7 +603,7 @@ async fn reconcile(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::Un
     }
 }
 
-fn reconcile_stalled(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
+async fn reconcile_stalled(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::UnboundedSender<OrchMsg>) {
     let stall_ms = shared.config.effective_stall_timeout_ms();
     if stall_ms <= 0 {
         return;
@@ -600,8 +631,8 @@ fn reconcile_stalled(shared: &Shared, state: &mut OrchestratorState, tx: &mpsc::
             .unwrap_or(0)
             + 1;
         if let Some(entry) = state.running.remove(&issue_id) {
-            entry.abort.abort();
             finalize_issue_runtime(state, &entry, "stalled: no activity");
+            abort_and_run_after_run(shared, entry.handle, &identifier).await;
         }
         let delay = backoff_delay_ms(attempt, shared.config.max_retry_backoff_ms);
         schedule_retry(state, tx, &issue_id, &identifier, attempt, delay, Some("stalled: no activity".to_string()));
@@ -900,6 +931,95 @@ fn render_turn_prompt(
              report completion.",
             issue.identifier, issue.title
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_shared(hook_after_run: &str, workspace_root: PathBuf, tracker_dir: &std::path::Path) -> Shared {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
+        let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        cfg.hook_after_run = Some(hook_after_run.to_string());
+        cfg.workspace_root = workspace_root.clone();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        Shared {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(claude::ClaudeBackend {
+                command: "claude".to_string(),
+                extra_args: Vec::new(),
+                model: None,
+                permission_mode: "bypassPermissions".to_string(),
+                turn_timeout_ms: 1000,
+                mcp_wiring: None,
+            }),
+            workspace_mgr: Arc::new(WorkspaceManager::new(workspace_root)),
+        }
+    }
+
+    /// Regression test for the AR-8 incident: a running worker that gets aborted by
+    /// reconciliation (terminal state, non-active state, or a stall timeout) must
+    /// still get its `after_run` hook run before its workspace is touched — not just
+    /// a worker that exits on its own via the normal WorkerExit message path.
+    #[tokio::test]
+    async fn abort_and_run_after_run_runs_the_hook_against_a_real_workspace() {
+        let root = tempdir().unwrap();
+        let tracker_dir = tempdir().unwrap();
+        let identifier = "AR-TEST";
+        let shared = test_shared(
+            "echo ran > after_run_marker.txt",
+            root.path().to_path_buf(),
+            tracker_dir.path(),
+        );
+        let workspace = shared.workspace_mgr.path_for(identifier);
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // A task that would run forever if not aborted -- stands in for a worker
+        // that's mid-turn (e.g. waiting on a `claude` subprocess) when reconciliation
+        // decides to terminate it.
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+
+        abort_and_run_after_run(&shared, handle, identifier).await;
+
+        assert!(
+            workspace.join("after_run_marker.txt").exists(),
+            "after_run hook should have run against the workspace after the abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_and_run_after_run_is_a_noop_without_a_configured_hook() {
+        let root = tempdir().unwrap();
+        let tracker_dir = tempdir().unwrap();
+        let identifier = "AR-TEST-2";
+        let mut shared = test_shared(
+            "echo should-not-run > marker.txt",
+            root.path().to_path_buf(),
+            tracker_dir.path(),
+        );
+        shared.config.hook_after_run = None;
+        let workspace = shared.workspace_mgr.path_for(identifier);
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+
+        abort_and_run_after_run(&shared, handle, identifier).await;
+
+        assert!(!workspace.join("marker.txt").exists());
     }
 }
 
