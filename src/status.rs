@@ -54,6 +54,14 @@ pub struct RetryRow {
 struct AppState {
     status_rx: watch::Receiver<StatusSnapshot>,
     db_path: PathBuf,
+    /// URL path this router is mounted under -- `""` when served at the root (the
+    /// single-project CLI path, `serve` below), or `/projects/<id>` when nested into
+    /// the multi-project service's own router (`src/service.rs`'s `project_proxy`).
+    /// Every absolute link/asset URL this module renders (`nav`, `/fragment`'s
+    /// `fetch()`, the `/events` links) is prefixed with this so in-page navigation
+    /// still lands within the same mount point -- without it, a nested dashboard's
+    /// own links would silently escape to the service's top-level routes instead.
+    base_path: String,
 }
 
 /// Bind and serve the dashboard until the process exits. Loopback-only
@@ -70,19 +78,35 @@ struct AppState {
 /// There's no "other users on the same host" to guard against inside that namespace;
 /// the container boundary itself is the isolation mechanism, and reachability is
 /// already gated by whether `-p` was passed at all.
+/// The dashboard/fragment/events/usage routes on their own, with no bind/serve
+/// attached -- lets a caller that already owns an axum server (`src/service.rs`'s
+/// multi-project web UI) `.nest()` one of these per registered project instead of
+/// duplicating any of this module's HTML/handler code.
+pub fn router(
+    status_rx: watch::Receiver<StatusSnapshot>,
+    db_path: PathBuf,
+    base_path: &str,
+) -> Router {
+    let state = AppState {
+        status_rx,
+        db_path,
+        base_path: base_path.to_string(),
+    };
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/fragment", get(fragment))
+        .route("/events", get(events_page))
+        .route("/usage", get(usage_page))
+        .with_state(state)
+}
+
 pub async fn serve(
     port: u16,
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
-    let state = AppState { status_rx, db_path };
-    let app = Router::new()
-        .route("/", get(dashboard))
-        .route("/fragment", get(fragment))
-        .route("/events", get(events_page))
-        .route("/usage", get(usage_page))
-        .with_state(state);
+    let app = router(status_rx, db_path, "");
     let bind_addr = if bind_all_interfaces {
         "0.0.0.0"
     } else {
@@ -124,12 +148,16 @@ const STYLE: &str = r#"
   .totals .stat .l { font-size: 0.72rem; color: #888; text-transform: uppercase; letter-spacing: 0.04em; }
 "#;
 
-fn nav(active: &str) -> String {
+/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`);
+/// `base` (`AppState::base_path`) is prepended only to the emitted `href`, so callers
+/// keep comparing/passing the same unprefixed identifiers regardless of where this
+/// router ends up mounted.
+fn nav(active: &str, base: &str) -> String {
     let link = |href: &str, label: &str| {
         if href == active {
-            format!(r#"<a href="{href}" style="color:#fff;font-weight:600">{label}</a>"#)
+            format!(r#"<a href="{base}{href}" style="color:#fff;font-weight:600">{label}</a>"#)
         } else {
-            format!(r#"<a href="{href}">{label}</a>"#)
+            format!(r#"<a href="{base}{href}">{label}</a>"#)
         }
     };
     format!(
@@ -140,7 +168,7 @@ fn nav(active: &str) -> String {
     )
 }
 
-fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str) -> String {
+fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base: &str) -> String {
     format!(
         r#"<!doctype html>
 <html>
@@ -157,27 +185,36 @@ fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str) -> St
 </body>
 </html>
 "#,
-        nav = nav(active_nav),
+        nav = nav(active_nav, base),
     )
 }
 
 async fn dashboard(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
-    let script = r#"<script>
-function refreshFragment() {
-  fetch('/fragment').then(r => r.text()).then(html => {
+    let script = format!(
+        r#"<script>
+function refreshFragment() {{
+  fetch('{base}/fragment').then(r => r.text()).then(html => {{
     document.getElementById('symphony-fragment').innerHTML = html;
-  }).catch(() => {});
-}
+  }}).catch(() => {{}});
+}}
 setInterval(refreshFragment, 2000);
-</script>"#;
+</script>"#,
+        base = state.base_path,
+    );
     let body = format!(
         r#"<div class="meta">generated {generated} &middot; live-updates every 2s, in place (no page reload)</div>
 <div id="symphony-fragment">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
         fragment = render_fragment(&snapshot),
     );
-    Html(page_shell("live status", "/", &body, script))
+    Html(page_shell(
+        "live status",
+        "/",
+        &body,
+        &script,
+        &state.base_path,
+    ))
 }
 
 async fn fragment(State(state): State<AppState>) -> Html<String> {
@@ -278,29 +315,30 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     };
 
     let rows = eventlog::recent_events(&state.db_path, &filter, limit, offset).unwrap_or_default();
+    let base = state.base_path.as_str();
 
     let table_rows: String = if rows.is_empty() {
         "<tr><td colspan=\"6\" class=\"empty\">No events recorded yet.</td></tr>".to_string()
     } else {
-        rows.iter().map(event_row).collect()
+        rows.iter().map(|r| event_row(r, base)).collect()
     };
 
     let importance_toggle = if include_low_importance {
         format!(
             r#"<a href="{}">Hide low-importance (e.g. streaming heartbeats)</a>"#,
-            events_link(&q, offset, Some("normal"))
+            events_link(&q, offset, Some("normal"), base)
         )
     } else {
         format!(
             r#"<a href="{}">Show all (incl. low-importance)</a>"#,
-            events_link(&q, offset, Some("all"))
+            events_link(&q, offset, Some("all"), base)
         )
     };
 
     let prev = if offset > 0 {
         format!(
             r#"<a href="{}">&larr; Newer</a>"#,
-            events_link(&q, (offset - limit).max(0), None)
+            events_link(&q, (offset - limit).max(0), None, base)
         )
     } else {
         String::new()
@@ -308,7 +346,7 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let next = if rows.len() as i64 == limit {
         format!(
             r#"<a href="{}">Older &rarr;</a>"#,
-            events_link(&q, offset + limit, None)
+            events_link(&q, offset + limit, None, base)
         )
     } else {
         String::new()
@@ -335,10 +373,15 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
         prev = prev,
         next = next,
     );
-    Html(page_shell("events", "/events", &body, ""))
+    Html(page_shell("events", "/events", &body, "", base))
 }
 
-fn events_link(q: &EventsQuery, offset: i64, importance_override: Option<&str>) -> String {
+fn events_link(
+    q: &EventsQuery,
+    offset: i64,
+    importance_override: Option<&str>,
+    base: &str,
+) -> String {
     let mut parts = Vec::new();
     if let Some(issue) = &q.issue
         && !issue.is_empty()
@@ -355,10 +398,10 @@ fn events_link(q: &EventsQuery, offset: i64, importance_override: Option<&str>) 
         parts.push(format!("importance={}", urlencode(importance)));
     }
     parts.push(format!("offset={offset}"));
-    format!("/events?{}", parts.join("&"))
+    format!("{base}/events?{}", parts.join("&"))
 }
 
-fn event_row(r: &eventlog::EventRow) -> String {
+fn event_row(r: &eventlog::EventRow, base: &str) -> String {
     let tokens = if r.total_tokens.is_some() {
         format!(
             "{}/{}",
@@ -380,7 +423,7 @@ fn event_row(r: &eventlog::EventRow) -> String {
         escape(&r.event_type)
     };
     format!(
-        "<tr><td>{id}</td><td>{time}</td><td><a href=\"/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td>{message}</td><td>{tokens}</td></tr>",
+        "<tr><td>{id}</td><td>{time}</td><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td>{message}</td><td>{tokens}</td></tr>",
         id = r.id,
         time = escape(&r.created_at),
         issue_link = urlencode(&r.issue_id),
@@ -401,10 +444,11 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     let summary = eventlog::usage_summary(&state.db_path).unwrap_or_default();
     let by_issue = eventlog::usage_by_issue(&state.db_path).unwrap_or_default();
 
+    let base = state.base_path.as_str();
     let issue_rows: String = if by_issue.is_empty() {
         "<tr><td colspan=\"8\" class=\"empty\">No usage recorded yet.</td></tr>".to_string()
     } else {
-        by_issue.iter().map(issue_usage_row).collect()
+        by_issue.iter().map(|r| issue_usage_row(r, base)).collect()
     };
 
     let body = format!(
@@ -433,12 +477,12 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
         total_tokens = summary.total_tokens,
         issue_rows = issue_rows,
     );
-    Html(page_shell("usage", "/usage", &body, ""))
+    Html(page_shell("usage", "/usage", &body, "", base))
 }
 
-fn issue_usage_row(r: &eventlog::IssueUsageRow) -> String {
+fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     format!(
-        "<tr><td><a href=\"/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td></tr>",
+        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td></tr>",
         issue_link = urlencode(&r.issue_id),
         identifier = escape(&r.identifier),
         title = escape(&r.title),
@@ -524,7 +568,7 @@ mod tests {
             total_tokens: Some(150),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let html = event_row(&row);
+        let html = event_row(&row, "");
         assert!(html.contains("100/50"));
     }
 
@@ -544,7 +588,7 @@ mod tests {
             total_tokens: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let html = event_row(&row);
+        let html = event_row(&row, "");
         assert!(html.contains(">-<"));
     }
 

@@ -60,6 +60,44 @@ pub fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
     Some((owner.to_string(), name.to_string()))
 }
 
+/// Fetch a file's raw contents from a GitHub repo at a given ref -- used by the
+/// multi-project service (`src/service.rs`) to pull a newly-registered (or
+/// periodically refreshed) repo's own `WORKFLOW.md` directly from GitHub, without
+/// requiring a local clone. Doesn't need a full `GithubRepoHost` (which mandates a
+/// token): public repos need none, so `token_env` is optional here, resolved to its
+/// value only at the point of this call and never stored -- same convention as
+/// `RepoConfig::token_env` everywhere else in this codebase.
+pub async fn fetch_file(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    path: &str,
+    token_env: Option<&str>,
+) -> anyhow::Result<String> {
+    let token = token_env
+        .map(|var| {
+            std::env::var(var)
+                .map_err(|_| anyhow::anyhow!("env var '{var}' (referenced by token_env) is unset"))
+        })
+        .transpose()?;
+    let client = reqwest::Client::builder().user_agent("symphony").build()?;
+    let url = format!("{DEFAULT_BASE_URL}/repos/{owner}/{repo}/contents/{path}?ref={branch}");
+    let mut req = client
+        .get(&url)
+        .header("Accept", "application/vnd.github.raw")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = &token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("failed to fetch '{path}' from {owner}/{repo}@{branch}: {status} {body}");
+    }
+    Ok(resp.text().await?)
+}
+
 impl GithubRepoHost {
     pub fn new(repo: &RepoConfig) -> Result<Self, String> {
         let (owner, name) = parse_github_owner_repo(&repo.url)

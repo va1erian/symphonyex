@@ -307,10 +307,65 @@ async fn startup_terminal_cleanup(shared: &Shared) {
     }
 }
 
+/// Handed back to a caller that spawned `run_managed` (the multi-project service
+/// manager, `src/service.rs`) so it can nest this project's own status/events/usage
+/// pages into its own aggregate web UI, the same data `run`'s own `status_port`
+/// branch below feeds directly into `status::serve`.
+pub struct ProjectHandles {
+    pub status_rx: tokio::sync::watch::Receiver<status::StatusSnapshot>,
+    pub db_path: PathBuf,
+}
+
+/// Single-project entry point (Section 5): runs until the process is killed or the
+/// workflow can't be loaded. Used directly by the CLI (`main.rs`) -- never
+/// externally cancellable, matching today's "ctrl_c kills the whole process" model.
 pub async fn run(
     workflow_path: PathBuf,
     status_port: Option<u16>,
     report_path_override: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // Never fired: `run`'s caller has no shutdown concept of its own, so this receiver
+    // simply stays pending for the process lifetime, same as before this arm existed.
+    let (_never_fired, shutdown) = tokio::sync::oneshot::channel();
+    run_inner(
+        workflow_path,
+        status_port,
+        report_path_override,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// Multi-project entry point (`src/service.rs`): like `run`, but never opens its own
+/// status port (the service aggregates status itself) and can be stopped from the
+/// outside via `shutdown` when a project is deregistered, without killing the whole
+/// service process. `handles_tx` delivers this project's `ProjectHandles` back to the
+/// caller once they're available (right after startup), so the caller can nest this
+/// project's dashboard into its own router before this function's polling loop --
+/// which runs for as long as the project stays registered -- returns.
+pub async fn run_managed(
+    workflow_path: PathBuf,
+    report_path_override: Option<PathBuf>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    handles_tx: tokio::sync::oneshot::Sender<ProjectHandles>,
+) -> anyhow::Result<()> {
+    run_inner(
+        workflow_path,
+        None,
+        report_path_override,
+        shutdown,
+        Some(handles_tx),
+    )
+    .await
+}
+
+async fn run_inner(
+    workflow_path: PathBuf,
+    status_port: Option<u16>,
+    report_path_override: Option<PathBuf>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    handles_tx: Option<tokio::sync::oneshot::Sender<ProjectHandles>>,
 ) -> anyhow::Result<()> {
     let mut shared = build_shared(&workflow_path)?;
     tracing::info!(
@@ -341,20 +396,35 @@ pub async fn run(
     let mut state = OrchestratorState::default();
 
     let (status_tx, status_rx) = tokio::sync::watch::channel(status::StatusSnapshot::default());
+    let db_path = shared
+        .config
+        .workflow_dir
+        .join(crate::eventlog::DB_FILENAME);
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
         // with the port published (see status::serve's doc comment for why).
         let bind_all_interfaces =
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
-        let db_path = shared
-            .config
-            .workflow_dir
-            .join(crate::eventlog::DB_FILENAME);
+        let status_rx_for_serve = status_rx.clone();
+        let db_path_for_serve = db_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = status::serve(port, bind_all_interfaces, status_rx, db_path).await {
+            if let Err(e) = status::serve(
+                port,
+                bind_all_interfaces,
+                status_rx_for_serve,
+                db_path_for_serve,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "status server exited");
             }
+        });
+    }
+    if let Some(handles_tx) = handles_tx {
+        let _ = handles_tx.send(ProjectHandles {
+            status_rx: status_rx.clone(),
+            db_path: db_path.clone(),
         });
     }
 
@@ -384,6 +454,10 @@ pub async fn run(
                 handle_msg(&shared, &mut state, &tx, msg).await;
                 status_tx.send_replace(build_status_snapshot(&state));
                 write_report(&report_path, &workflow_path, &state);
+            }
+            _ = &mut shutdown => {
+                tracing::info!(path = %workflow_path.display(), "project stopped (removed from service)");
+                return Ok(());
             }
         }
     }
