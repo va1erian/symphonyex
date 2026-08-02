@@ -21,16 +21,26 @@
 //! id, turn completion/failure, and token usage, using the same lenient
 //! substring-matching approach `codex.rs` uses for its own uncertain schema.
 //!
-//! Partially confirmed by a real Docker-mode smoke test (see
-//! `real_captured_auth_failure_payload_parses_correctly` below): a failing turn really
-//! does look like `{"type":"error","sessionID":"ses_...","error":{"data":{"message":
-//! "..."}}}}`, i.e. `sessionID` (camelCase, not `session_id`) is the real top-level
-//! field, and an error's message lives under `error.data.message`, not `error.message`.
-//! The *completion* path (`turn_completed`'s "finish"/"complete"/"done" type-name
-//! guess, token usage field names, tool-call field names) is still unverified -- that
-//! smoke test only exercised the failure path (an invalid API key). Treat those parts
-//! as a starting point to verify against a real successful run, not a confirmed
-//! contract.
+//! Confirmed against two real Docker-mode runs (see
+//! `real_captured_auth_failure_payload_parses_correctly` and
+//! `real_step_finish_payload_extracts_token_usage` below) -- `sessionID` (camelCase,
+//! not `session_id`) is the real top-level field name; a failing turn looks like
+//! `{"type":"error","error":{"data":{"message":"..."}}}}` (the message lives under
+//! `error.data.message`, not `error.message`); and a successful step's completion
+//! event is `{"type":"step_finish","part":{"tokens":{"input":N,"output":N,...}}}` --
+//! matched by the `contains("finish")` check by coincidence (the real type name is
+//! `step_finish`, not `finish`/`complete`/`done` as originally guessed), with usage at
+//! `part.tokens.{input,output}`, not the `input_tokens`/`output_tokens` flat naming
+//! originally guessed (every real turn recorded zero tokens until this was fixed).
+//! One structural note from that same real run: `opencode` emits a `step_finish` per
+//! *internal* agentic-loop step, not once per `opencode run` invocation -- so a single
+//! Symphony turn can emit several `turn_completed` `AgentEvent`s before the subprocess
+//! actually exits. This is fine as designed: `TurnOutcome::Completed.usage` is
+//! documented as informational only (see `AgentEvent`'s own doc in `mod.rs`); the
+//! orchestrator's authoritative token accounting sums every `AgentEvent::usage` as it
+//! streams through, not just the last one. Tool-call detection is also confirmed
+//! working from that same real run's event log: real `tool_call` events correctly
+//! carried the actual tool names used (`read`, `bash`, `glob`, `grep`).
 //!
 //! **High-trust default posture** (mirrors the Claude backend, Section 10.5 example):
 //! passes `--auto` by default, auto-approving every tool call (file edit, bash) the
@@ -392,12 +402,45 @@ fn shallow_find_str(v: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-/// Extract token usage leniently from common field names, searching arbitrarily deep
-/// (unlike `shallow_find_str`) since usage blocks are commonly nested a variable number
-/// of levels deep in practice -- same approach and same reasoning as
+/// Extract token usage leniently, searching arbitrarily deep (unlike
+/// `shallow_find_str`) since usage blocks are commonly nested a variable number of
+/// levels deep in practice -- same approach and same reasoning as
 /// `codex.rs::extract_usage_leniently`, duplicated rather than shared because the two
 /// backends' schemas are independent guesses that may not stay aligned.
+///
+/// Real shape confirmed via a live Docker-mode capture (Fireworks/Kimi K2.7 Code, a
+/// genuine successful turn -- see `real_step_finish_payload_extracts_token_usage`
+/// below): a `step_finish` event's `part.tokens` object has plain `input`/`output`
+/// keys (no `_token`/`_tokens` suffix at all -- the "token-ness" is carried by the
+/// parent key `tokens`, not each child), plus `reasoning` and `cache.{read,write}`.
+/// `total_tokens` here is deliberately `input + output` (matching every other
+/// backend's definition of the field), NOT the payload's own `tokens.total`, which
+/// bundles in reasoning/cache tokens too and would be inconsistent with how Claude's
+/// and Codex's `TokenUsage.total_tokens` are computed.
 fn extract_usage_leniently(v: &Value) -> Option<TokenUsage> {
+    fn find_tokens_object(v: &Value) -> Option<TokenUsage> {
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::Object(tokens)) = map.get("tokens") {
+                    let input = tokens.get("input").and_then(|n| n.as_u64());
+                    let output = tokens.get("output").and_then(|n| n.as_u64());
+                    if input.is_some() || output.is_some() {
+                        let i = input.unwrap_or(0);
+                        let o = output.unwrap_or(0);
+                        return Some(TokenUsage {
+                            input_tokens: i,
+                            output_tokens: o,
+                            total_tokens: i + o,
+                        });
+                    }
+                }
+                map.values().find_map(find_tokens_object)
+            }
+            Value::Array(items) => items.iter().find_map(find_tokens_object),
+            _ => None,
+        }
+    }
+
     fn find_u64(v: &Value, needles: &[&str]) -> Option<u64> {
         match v {
             Value::Object(map) => {
@@ -418,9 +461,15 @@ fn extract_usage_leniently(v: &Value) -> Option<TokenUsage> {
             _ => None,
         }
     }
-    // Covers both Anthropic-style (input_tokens/output_tokens) and OpenAI-style
-    // (prompt_tokens/completion_tokens) naming, since OpenCode aggregates across
-    // providers and may normalize to either.
+
+    if let Some(usage) = find_tokens_object(v) {
+        return Some(usage);
+    }
+
+    // Fallback for schema variants without a `tokens: {input, output}` object --
+    // covers both Anthropic-style (input_tokens/output_tokens) and OpenAI-style
+    // (prompt_tokens/completion_tokens) flat naming, unverified against a real
+    // payload but kept in case a different opencode version/provider uses it.
     let input = find_u64(
         v,
         &["input_token", "inputtoken", "prompt_token", "prompttoken"],
@@ -511,6 +560,50 @@ mod tests {
                 assert_eq!(u.input_tokens, 10);
                 assert_eq!(u.output_tokens, 5);
                 assert_eq!(u.total_tokens, 15);
+            }
+            other => panic!("expected Completed with usage, got {other:?}"),
+        }
+    }
+
+    /// Real payload captured from a genuinely successful `opencode run --format json`
+    /// turn (Fireworks/kimi-k2p7-code, Docker-mode smoke test) -- confirms the actual
+    /// completion event is `type: "step_finish"` (matched by the existing
+    /// `contains("finish")` check) and that usage lives at `part.tokens.{input,output}`,
+    /// not the `input_tokens`/`output_tokens` flat naming this parser originally
+    /// guessed at (which is why every real turn recorded zero tokens before this fix).
+    /// `tokens.total` (6330 in the real payload) deliberately isn't used for
+    /// `total_tokens` -- it bundles in reasoning/cache tokens, whereas `total_tokens`
+    /// here means `input + output`, matching every other backend.
+    #[test]
+    fn real_step_finish_payload_extracts_token_usage() {
+        let mut session = new_session();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let v = json!({
+            "type": "step_finish",
+            "timestamp": 1785665654337_u64,
+            "sessionID": "ses_03e0878cbffeXblntUlDTnmxOO",
+            "part": {
+                "id": "prt_fc1f78e370017hF7fLtd9NvRuy",
+                "reason": "stop",
+                "messageID": "msg_fc1f788650017TGY2e9lQNrkew",
+                "sessionID": "ses_03e0878cbffeXblntUlDTnmxOO",
+                "type": "step-finish",
+                "tokens": {
+                    "total": 6330,
+                    "input": 212,
+                    "output": 22,
+                    "reasoning": 0,
+                    "cache": {"write": 0, "read": 6096}
+                },
+                "cost": 0
+            }
+        });
+        let outcome = session.handle_message(&v, &tx);
+        match outcome {
+            Some(TurnOutcome::Completed { usage: Some(u) }) => {
+                assert_eq!(u.input_tokens, 212);
+                assert_eq!(u.output_tokens, 22);
+                assert_eq!(u.total_tokens, 234); // input + output, not the payload's tokens.total
             }
             other => panic!("expected Completed with usage, got {other:?}"),
         }
