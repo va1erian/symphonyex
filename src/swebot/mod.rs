@@ -202,14 +202,20 @@ fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
 /// capability's own poll failure is logged and doesn't stop the other two or the
 /// next cycle.
 pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
-    let Some(repo) = cfg.repo.clone() else {
+    // SweBot posts (Q&A, drafting, review) authenticate as `swebot.token` when set --
+    // a separate GitHub identity from `repo.token` (the coding agent's own, used for
+    // branch pushes and `open_pull_request`). Falls back to `repo.token` when
+    // `swebot.token` isn't configured, matching the old single-identity behavior. See
+    // `config::EffectiveConfig::swebot_repo_config`'s doc comment for why this split
+    // exists: GitHub rejects a PR review from the same account that authored the PR.
+    let Some(swebot_repo) = cfg.swebot_repo_config() else {
         tracing::error!(
             "swebot.enabled but no repo: block resolved -- config::resolve should have \
              rejected this already"
         );
         return;
     };
-    let host = match GithubRepoHost::new(&repo) {
+    let host = match GithubRepoHost::new(&swebot_repo) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "swebot: failed to build GithubRepoHost, not starting");
@@ -222,7 +228,7 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
 
     tracing::info!("swebot starting");
     loop {
-        if let Err(e) = git::ensure_shared_clone(&repo, &shared_clone_dir).await {
+        if let Err(e) = git::ensure_shared_clone(&swebot_repo, &shared_clone_dir).await {
             tracing::warn!(error = %e, "swebot: failed to refresh shared clone; Q&A/drafting will retry next cycle");
         } else {
             if let Err(e) = qa::poll_once(&cfg, &host, &backend, &shared_clone_dir).await {

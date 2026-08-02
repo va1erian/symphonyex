@@ -345,6 +345,7 @@ chat UI, no webhook receiver — just another poll loop, like everything else he
 ```yaml
 swebot:
   enabled: true
+  token: $SWEBOT_GITHUB_TOKEN         # optional; see "Two identities" below
   qa:
     discussion_category: "Q&A"        # default
   drafting:
@@ -355,9 +356,24 @@ swebot:
 
 Off by default, same posture as `repo.pull_request`: this posts real comments and
 reviews on a real GitHub repo. Requires `repo.url` to be a `github.com` URL and
-`repo.token` to be set — SweBot keys off `repo:` (the same source of truth
-`repo.pull_request` uses) rather than `tracker.provider.repo`, so it works the same
-regardless of `tracker.kind`.
+either `repo.token` or `swebot.token` to be set — SweBot keys off `repo:` (the same
+source of truth `repo.pull_request` uses) rather than `tracker.provider.repo`, so it
+works the same regardless of `tracker.kind`.
+
+**Two identities — why `swebot.token` exists**: by default SweBot authenticates with
+the same `repo.token` the coding agent uses to push branches and open PRs. That's fine
+for Q&A and drafting, but it breaks PR review specifically: GitHub's API rejects an
+`APPROVE`/`REQUEST_CHANGES` review from the same account that authored the pull
+request (422 "Can not approve your own pull request"), and since Symphony's coding
+agent is always the PR's author, single-identity SweBot can *never* actually approve
+one — `swebot/review.rs` falls back to posting a plain comment instead so a poll cycle
+doesn't 422-loop forever, but a genuine approval never lands. Set `swebot.token` to a
+second GitHub credential (a separate bot account/App installation, e.g. "codebot" for
+the coding agent's own `repo.token` and "swebot" for this one) to give SweBot a
+distinct identity from the PR author, and approvals go through for real. `swebot.token`
+follows the same `$VAR_NAME`-env-var-reference convention as `repo.token` (see
+`config::RepoConfig::token_env`'s doc comment) — the value itself is never embedded in
+config, only the env var's name.
 
 **Persona and quality bar**: every SweBot prompt shares one tone/rubric prefix
 (`swebot::PERSONA`) — friendly and direct, but holding a genuinely high bar
