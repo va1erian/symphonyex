@@ -88,7 +88,8 @@ branch never appeared upstream.
 
 ## Coding-agent backends
 
-Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`.
+Set `agent.backend: claude` (default), `agent.backend: codex`, or `agent.backend:
+opencode` in `WORKFLOW.md`.
 
 - **`claude`** (default, the "make it Claude-compatible" path): launches the `claude`
   CLI in headless mode (`claude -p <prompt> --output-format stream-json --resume
@@ -109,10 +110,24 @@ Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`
   notification methods to detect turn completion. Treat it as a skeleton to adjust
   against your installed Codex version, not a verified client — see
   `src/agent/codex.rs` for the exact caveat.
+- **`opencode`** (the pluggable-model-provider path): launches the open-source,
+  provider-agnostic [`opencode`](https://opencode.ai) CLI in headless mode (`opencode
+  run --format json --model <provider/model> --auto --session <session_id> <prompt>`),
+  one subprocess per turn, same `--auto`-by-default high-trust posture as `claude`'s
+  `bypassPermissions` and the same reasoning (no human present to approve tool calls in
+  a headless run). This is how Fireworks AI (or any of `opencode`'s ~75 other
+  providers) plugs in: `opencode` itself owns the provider connection and
+  credentials — configure a provider once via `opencode`'s own `/connect` flow or a
+  static `opencode.json` provider block (e.g. pointing `FIREWORKS_API_KEY` at a
+  `fireworks` provider), then set `opencode.model: fireworks/<model-id>` here. Symphony
+  never sees or manages that credential. Like the Codex backend, `opencode run --format
+  json`'s exact per-event schema isn't fully documented publicly; this module
+  implements the subprocess/NDJSON transport solidly and guesses at event field names
+  leniently — see `src/agent/opencode.rs` for the exact caveat.
 
-Per-backend settings live under the `claude:` and `codex:` front-matter keys (mirroring
-each other where it makes sense); `claude.*` is a spec extension, not part of the
-normative schema.
+Per-backend settings live under the `claude:`, `codex:`, and `opencode:` front-matter
+keys (mirroring each other where it makes sense); none of these are part of the
+normative schema, they're all spec extensions.
 
 ## Docker mode
 
@@ -166,8 +181,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends <your toolchain
     && rm -rf /var/lib/apt/lists/*
 ```
 
-**Currently Claude-backend only** (`agent.backend: claude`) — Codex's `start_session`
-accepts and ignores the container parameter for now.
+**Currently Claude-backend only** (`agent.backend: claude`) — both Codex's and
+OpenCode's `start_session` accept and ignore the container parameter for now;
+`validate_for_dispatch` rejects `workspace.docker.enabled: true` with either backend
+rather than silently no-op'ing the isolation.
 
 **Prerequisite**: Docker Desktop (or an equivalent daemon) running, `docker` on `PATH`.
 Symphony checks this at startup when `docker.enabled: true` and fails fast with a clear
