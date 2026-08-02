@@ -19,9 +19,18 @@
 //! transport contract Symphony controls (subprocess launch, NDJSON framing, per-line
 //! timeout, stderr kept separate) and a best-effort guess at field names for session
 //! id, turn completion/failure, and token usage, using the same lenient
-//! substring-matching approach `codex.rs` uses for its own uncertain schema. Treat the
-//! guessed field names as a starting point to verify against a real installed
-//! `opencode` build, not as a confirmed contract.
+//! substring-matching approach `codex.rs` uses for its own uncertain schema.
+//!
+//! Partially confirmed by a real Docker-mode smoke test (see
+//! `real_captured_auth_failure_payload_parses_correctly` below): a failing turn really
+//! does look like `{"type":"error","sessionID":"ses_...","error":{"data":{"message":
+//! "..."}}}}`, i.e. `sessionID` (camelCase, not `session_id`) is the real top-level
+//! field, and an error's message lives under `error.data.message`, not `error.message`.
+//! The *completion* path (`turn_completed`'s "finish"/"complete"/"done" type-name
+//! guess, token usage field names, tool-call field names) is still unverified -- that
+//! smoke test only exercised the failure path (an invalid API key). Treat those parts
+//! as a starting point to verify against a real successful run, not a confirmed
+//! contract.
 //!
 //! **High-trust default posture** (mirrors the Claude backend, Section 10.5 example):
 //! passes `--auto` by default, auto-approving every tool call (file edit, bash) the
@@ -281,12 +290,24 @@ impl OpenCodeSession {
         let msg_type = raw_type.to_lowercase();
 
         if msg_type.contains("error") || v.get("error").is_some() {
+            // Confirmed against a real `opencode run --format json` failure (invalid
+            // provider credentials): `{"type":"error","error":{"name":"UnknownError",
+            // "data":{"message":"...","ref":"..."}}}` -- the message lives under
+            // `error.data.message`, not `error.message` directly. `error.message` and
+            // bare-string `error` are kept as fallbacks for whatever other error shapes
+            // exist (still unverified -- see the module doc's caveat).
             let reason = v
                 .get("error")
                 .and_then(|e| {
                     e.as_str()
                         .map(String::from)
                         .or_else(|| e.get("message").and_then(|m| m.as_str()).map(String::from))
+                        .or_else(|| {
+                            e.get("data")
+                                .and_then(|d| d.get("message"))
+                                .and_then(|m| m.as_str())
+                                .map(String::from)
+                        })
                 })
                 .unwrap_or_else(|| format!("opencode reported type='{msg_type}'"));
             let _ = events.send(AgentEvent::new("turn_failed").with_message(reason.clone()));
@@ -520,6 +541,43 @@ mod tests {
         let outcome = session.handle_message(&v, &tx);
         match outcome {
             Some(TurnOutcome::Failed { reason }) => assert_eq!(reason, "boom"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Real payload captured from `opencode run --format json` against Fireworks with
+    /// an invalid API key (Docker mode smoke test, symphony-base image) -- not a
+    /// synthetic guess like the other fixtures here. Confirms `error.data.message` is
+    /// the actual nesting (not `error.message`) and that `sessionID` (not
+    /// `session_id`) is the real top-level field name.
+    #[test]
+    fn real_captured_auth_failure_payload_parses_correctly() {
+        let mut session = new_session();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let v = json!({
+            "type": "error",
+            "timestamp": 1785663447156_u64,
+            "sessionID": "ses_03e2a20f7ffe24SP8z3Tdr3aav",
+            "error": {
+                "name": "UnknownError",
+                "data": {
+                    "message": "Unexpected server error. Check server logs for details.",
+                    "ref": "err_a3ebaa40"
+                }
+            }
+        });
+        let outcome = session.handle_message(&v, &tx);
+        assert_eq!(
+            session.session_id.as_deref(),
+            Some("ses_03e2a20f7ffe24SP8z3Tdr3aav")
+        );
+        match outcome {
+            Some(TurnOutcome::Failed { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Unexpected server error. Check server logs for details."
+                );
+            }
             other => panic!("expected Failed, got {other:?}"),
         }
     }
