@@ -20,9 +20,11 @@ pub async fn poll_once(
     backend: &dyn AgentBackend,
     tracker: &dyn TrackerAdapter,
 ) -> Result<(), String> {
+    // The clone-for-diffing side is read-only, but uses SweBot's own identity (rather
+    // than `cfg.repo` directly) so it authenticates fine even when only `swebot.token`
+    // is configured and `repo.token` isn't -- see `swebot_repo_config`'s doc comment.
     let repo = cfg
-        .repo
-        .as_ref()
+        .swebot_repo_config()
         .ok_or("swebot.review.enabled but no repo: block resolved")?;
     let prs = host.list_open_symphony_prs().await?;
 
@@ -32,7 +34,7 @@ pub async fn poll_once(
         }
 
         let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
-        git::clone_branch(repo, scratch.path(), &pr.head_ref).await?;
+        git::clone_branch(&repo, scratch.path(), &pr.head_ref).await?;
         let diff = git::diff_against(scratch.path(), &repo.default_branch).await?;
         // Written to a file and *referenced* in the prompt, not embedded in it: a
         // real PR's diff hit Windows' ~32K command-line length limit in practice
@@ -132,18 +134,21 @@ pub async fn poll_once(
             }
             // GitHub refuses to let an account approve its own pull request. When
             // the same token authenticates both the coding agent (PR author) and
-            // SweBot (reviewer) -- the common case for a single-operator setup --
-            // an "approve" verdict always hits this. Falling back to a plain
-            // comment with the same reasoning means the review still gets posted
-            // and recorded (has_reviewed_sha becomes true), rather than retrying
-            // and 422ing again on every single poll forever -- a real failure mode
-            // hit running this live: it silently burned a full review turn on
-            // every cycle with nothing ever actually landing.
+            // SweBot (reviewer) -- the default when `swebot.token` isn't set, see
+            // `config::EffectiveConfig::swebot_repo_config` -- an "approve" verdict
+            // always hits this. Falling back to a plain comment with the same
+            // reasoning means the review still gets posted and recorded
+            // (has_reviewed_sha becomes true), rather than retrying and 422ing again
+            // on every single poll forever -- a real failure mode hit running this
+            // live: it silently burned a full review turn on every cycle with
+            // nothing ever actually landing. Setting `swebot.token` to a second
+            // GitHub identity avoids hitting this fallback at all.
             Err(e) if event == "APPROVE" && e.contains("Can not approve your own pull request") => {
                 let note = format!(
                     "(SweBot would approve this, but GitHub doesn't allow approving your own \
                      pull request -- the coding agent and SweBot are using the same token \
-                     here. Posting as a comment instead.)\n\n{summary}"
+                     here. Posting as a comment instead. Set `swebot.token` to a separate \
+                     GitHub identity to avoid this.)\n\n{summary}"
                 );
                 host.post_pr_review(pr.number, &pr.head_sha, "COMMENT", &note)
                     .await?;

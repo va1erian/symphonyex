@@ -44,8 +44,12 @@ pub enum ConfigError {
         "invalid_config: swebot.enabled requires repo.url to be a github.com URL (owner/name) -- SweBot's Q&A/drafting/review capabilities are GitHub-specific"
     )]
     SwebotRequiresGithubRepo,
-    #[error("invalid_config: swebot.enabled requires repo.token to be set")]
+    #[error("invalid_config: swebot.enabled requires repo.token or swebot.token to be set")]
     SwebotRequiresRepoToken,
+    #[error(
+        "invalid_config: swebot.token must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidSwebotToken,
     #[error("invalid_config: repo.url is required when the repo block is present")]
     MissingRepoUrl,
     #[error(
@@ -221,6 +225,16 @@ pub struct SwebotConfig {
     /// so a project can run Q&A/drafting without also turning on review, or vice
     /// versa, without a second top-level flag.
     pub review_enabled: bool,
+    /// Name of an env var holding a *separate* GitHub credential for SweBot's own
+    /// posts (Q&A replies, drafted issues, PR reviews), distinct from `repo.token`
+    /// (the identity the coding agent pushes branches and opens PRs as -- "codebot"
+    /// in the two-identity setup this exists for). Falls back to `repo.token_env`
+    /// when unset, matching the old single-identity behavior. Giving SweBot its own
+    /// identity matters specifically for `review.enabled`: GitHub's API rejects an
+    /// `APPROVE`/`REQUEST_CHANGES` review from the same account that authored the
+    /// pull request (422 "Can not approve your own pull request"), so if both roles
+    /// share one token, SweBot silently can never approve the coding agent's own PRs.
+    pub token_env: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +302,23 @@ impl EffectiveConfig {
             .max_concurrent_agents_by_state
             .get(&key)
             .unwrap_or(&self.max_concurrent_agents)
+    }
+
+    /// `repo:` as SweBot itself should authenticate to GitHub with: `swebot.token` if
+    /// set (a separate identity from the coding agent's own `repo.token`, so SweBot's
+    /// PR reviews aren't posted by the same account that opened the PR -- see
+    /// `SwebotConfig::token_env`'s doc comment), else `repo.token` unchanged, matching
+    /// the old single-identity behavior. `None` iff `self.repo` itself is `None`.
+    pub fn swebot_repo_config(&self) -> Option<RepoConfig> {
+        let repo = self.repo.as_ref()?;
+        Some(RepoConfig {
+            token_env: self
+                .swebot
+                .token_env
+                .clone()
+                .or_else(|| repo.token_env.clone()),
+            ..repo.clone()
+        })
     }
 }
 
@@ -402,6 +433,13 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let swebot_qa = get(swebot_raw, "qa").unwrap_or(&empty);
     let swebot_drafting = get(swebot_raw, "drafting").unwrap_or(&empty);
     let swebot_review = get(swebot_raw, "review").unwrap_or(&empty);
+    let swebot_token_env = get_str(swebot_raw, "token")
+        .map(|t| {
+            envsub::var_name_of(&t)
+                .map(|s| s.to_string())
+                .ok_or(ConfigError::InvalidSwebotToken)
+        })
+        .transpose()?;
     let swebot_cfg = SwebotConfig {
         enabled: swebot_enabled,
         qa_discussion_category: get_str(swebot_qa, "discussion_category")
@@ -411,6 +449,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         review_enabled: get(swebot_review, "enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(swebot_enabled),
+        token_env: swebot_token_env,
     };
     if swebot_cfg.enabled {
         let repo = repo_cfg
@@ -419,7 +458,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         if crate::repo_host::parse_github_owner_repo(&repo.url).is_none() {
             return Err(ConfigError::SwebotRequiresGithubRepo);
         }
-        if repo.token_env.is_none() {
+        if repo.token_env.is_none() && swebot_cfg.token_env.is_none() {
             return Err(ConfigError::SwebotRequiresRepoToken);
         }
     }
@@ -907,6 +946,69 @@ mod tests {
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert_eq!(cfg.swebot.qa_discussion_category, "Q&A");
         assert_eq!(cfg.swebot.drafting_discussion_category, "Feature Requests");
+    }
+
+    #[test]
+    fn swebot_token_defaults_to_none_and_swebot_repo_config_falls_back_to_repo_token() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_4\nswebot:\n  enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.swebot.token_env.is_none());
+        assert_eq!(
+            cfg.swebot_repo_config().unwrap().token_env.as_deref(),
+            Some("SYMPHONY_TEST_SWEBOT_TOKEN_4")
+        );
+    }
+
+    #[test]
+    fn swebot_token_gives_swebot_its_own_identity_distinct_from_repo_token() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_CODEBOT_TOKEN\nswebot:\n  enabled: true\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_5\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.swebot.token_env.as_deref(),
+            Some("SYMPHONY_TEST_SWEBOT_TOKEN_5")
+        );
+        assert_eq!(
+            cfg.repo.as_ref().unwrap().token_env.as_deref(),
+            Some("SYMPHONY_TEST_CODEBOT_TOKEN")
+        );
+        assert_eq!(
+            cfg.swebot_repo_config().unwrap().token_env.as_deref(),
+            Some("SYMPHONY_TEST_SWEBOT_TOKEN_5")
+        );
+    }
+
+    #[test]
+    fn swebot_token_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_6\nswebot:\n  enabled: true\n  \
+             token: not-a-var\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidSwebotToken)
+        ));
+    }
+
+    #[test]
+    fn swebot_enabled_accepts_swebot_token_alone_with_no_repo_token() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n\
+             swebot:\n  enabled: true\n  token: $SYMPHONY_TEST_SWEBOT_TOKEN_7\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.repo.as_ref().unwrap().token_env.is_none());
+        assert_eq!(
+            cfg.swebot_repo_config().unwrap().token_env.as_deref(),
+            Some("SYMPHONY_TEST_SWEBOT_TOKEN_7")
+        );
     }
 
     #[test]
