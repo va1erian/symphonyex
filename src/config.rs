@@ -31,6 +31,10 @@ pub enum ConfigError {
     )]
     InvalidClaudeApiKey,
     #[error(
+        "invalid_config: opencode.api_key must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidOpenCodeApiKey,
+    #[error(
         "invalid_config: repo.pull_request requires repo.url to be a github.com URL (owner/name) -- open_pull_request only supports GitHub"
     )]
     PullRequestRequiresGithubRepo,
@@ -57,12 +61,14 @@ pub enum ConfigError {
 pub enum AgentBackendKind {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl AgentBackendKind {
     fn parse(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "codex" => AgentBackendKind::Codex,
+            "opencode" => AgentBackendKind::OpenCode,
             _ => AgentBackendKind::Claude,
         }
     }
@@ -103,6 +109,34 @@ pub struct ClaudeConfig {
     /// `resolve()`'s own validation (that it's a `$VAR_NAME` reference, not a literal)
     /// -- `collect_var_refs` walks the raw config tree directly, so this field's real
     /// job is documenting and validating the convention, not driving further logic.
+    #[allow(dead_code)]
+    pub api_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenCodeConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    /// `provider/model` string passed to `--model`, e.g.
+    /// `fireworks/accounts/fireworks/models/<model-id>`. `opencode` itself must already
+    /// have that provider configured (see README.md "Coding-agent backends") --
+    /// Symphony only names it, the same way `ClaudeConfig`/`CodexConfig` don't manage
+    /// their own CLI's login either.
+    pub model: Option<String>,
+    /// Passed as `--auto` when true. Same high-trust rationale as `ClaudeConfig`'s
+    /// `permission_mode: bypassPermissions`: a headless run has no human to approve
+    /// tool calls interactively.
+    pub auto_approve: bool,
+    pub turn_timeout_ms: u64,
+    pub stall_timeout_ms: i64,
+    /// Name of an env var holding the API key for whichever provider `model` names
+    /// (e.g. `FIREWORKS_API_KEY`). Mirrors `ClaudeConfig::api_key_env` exactly: named,
+    /// not resolved to a value here, purely so `envsub::collect_var_refs` (which walks
+    /// the raw config tree directly, not this typed struct) picks it up and forwards
+    /// it into Docker-mode containers via `docker run -e`. `opencode` itself must
+    /// already have a provider configured whose `apiKey` references this same env var
+    /// name (see README.md "Coding-agent backends") -- this field's job is documenting
+    /// and validating that convention, not driving further logic.
     #[allow(dead_code)]
     pub api_key_env: Option<String>,
 }
@@ -227,6 +261,7 @@ pub struct EffectiveConfig {
 
     pub codex: CodexConfig,
     pub claude: ClaudeConfig,
+    pub opencode: OpenCodeConfig,
 }
 
 impl EffectiveConfig {
@@ -234,6 +269,7 @@ impl EffectiveConfig {
         match self.agent_backend {
             AgentBackendKind::Claude => &self.claude.command,
             AgentBackendKind::Codex => &self.codex.command,
+            AgentBackendKind::OpenCode => &self.opencode.command,
         }
     }
 
@@ -241,6 +277,7 @@ impl EffectiveConfig {
         match self.agent_backend {
             AgentBackendKind::Claude => self.claude.stall_timeout_ms,
             AgentBackendKind::Codex => self.codex.stall_timeout_ms,
+            AgentBackendKind::OpenCode => self.opencode.stall_timeout_ms,
         }
     }
 
@@ -300,6 +337,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let agent = get(config, "agent").unwrap_or(&empty);
     let codex = get(config, "codex").unwrap_or(&empty);
     let claude = get(config, "claude").unwrap_or(&empty);
+    let opencode = get(config, "opencode").unwrap_or(&empty);
 
     let tracker_kind = get_str(tracker, "kind").ok_or(ConfigError::MissingTrackerKind)?;
 
@@ -451,6 +489,24 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         stall_timeout_ms: get_i64(claude, "stall_timeout_ms", 300_000),
     };
 
+    let opencode_cfg = OpenCodeConfig {
+        command: get_str(opencode, "command").unwrap_or_else(|| "opencode".to_string()),
+        args: get_vec_str(opencode, "args"),
+        model: get_str(opencode, "model"),
+        auto_approve: get(opencode, "auto_approve")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        turn_timeout_ms: get_u64(opencode, "turn_timeout_ms", 3_600_000),
+        stall_timeout_ms: get_i64(opencode, "stall_timeout_ms", 300_000),
+        api_key_env: get_str(opencode, "api_key")
+            .map(|k| {
+                envsub::var_name_of(&k)
+                    .map(|s| s.to_string())
+                    .ok_or(ConfigError::InvalidOpenCodeApiKey)
+            })
+            .transpose()?,
+    };
+
     let cfg = EffectiveConfig {
         tracker_kind,
         tracker_provider: get_map(tracker, "provider"),
@@ -483,6 +539,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
 
         codex: codex_cfg,
         claude: claude_cfg,
+        opencode: opencode_cfg,
     };
 
     Ok(cfg)
@@ -596,6 +653,7 @@ pub fn validate_for_dispatch(
         let backend = match cfg.agent_backend {
             AgentBackendKind::Claude => "claude",
             AgentBackendKind::Codex => "codex",
+            AgentBackendKind::OpenCode => "opencode",
         };
         return Err(ConfigError::MissingAgentCommand {
             backend: backend.to_string(),
@@ -1052,12 +1110,91 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_docker_enabled_with_opencode_backend() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nworkspace:\n  docker:\n    \
+             enabled: true\n    image: some-image:latest\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(validate_for_dispatch(&cfg, &["local"]).is_ok());
+    }
+
+    #[test]
+    fn opencode_api_key_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  api_key: not-a-var\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidOpenCodeApiKey)
+        ));
+    }
+
+    #[test]
+    fn opencode_api_key_var_reference_resolves_to_env_var_name() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  \
+             api_key: $FIREWORKS_API_KEY\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.opencode.api_key_env.as_deref(),
+            Some("FIREWORKS_API_KEY")
+        );
+    }
+
+    #[test]
     fn validate_rejects_unsupported_tracker_kind() {
         let cfg_yaml = parse_yaml("tracker:\n  kind: jira\n");
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert!(matches!(
             validate_for_dispatch(&cfg, &["local"]),
             Err(ConfigError::UnsupportedTrackerKind(_))
+        ));
+    }
+
+    #[test]
+    fn opencode_backend_parses_with_defaults() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nagent:\n  backend: opencode\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.agent_backend, AgentBackendKind::OpenCode);
+        assert_eq!(cfg.opencode.command, "opencode");
+        assert!(cfg.opencode.model.is_none());
+        assert!(cfg.opencode.auto_approve);
+        assert_eq!(cfg.opencode.turn_timeout_ms, 3_600_000);
+        assert_eq!(cfg.opencode.stall_timeout_ms, 300_000);
+        assert!(cfg.opencode.api_key_env.is_none());
+    }
+
+    #[test]
+    fn opencode_block_overrides_parse() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  \
+             command: /usr/local/bin/opencode\n  model: fireworks/accounts/fireworks/models/kimi-k2\n  \
+             auto_approve: false\n  turn_timeout_ms: 60000\n  stall_timeout_ms: 5000\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.opencode.command, "/usr/local/bin/opencode");
+        assert_eq!(
+            cfg.opencode.model.as_deref(),
+            Some("fireworks/accounts/fireworks/models/kimi-k2")
+        );
+        assert!(!cfg.opencode.auto_approve);
+        assert_eq!(cfg.opencode.turn_timeout_ms, 60_000);
+        assert_eq!(cfg.opencode.stall_timeout_ms, 5_000);
+        assert_eq!(cfg.effective_command(), "/usr/local/bin/opencode");
+        assert_eq!(cfg.effective_stall_timeout_ms(), 5_000);
+    }
+
+    #[test]
+    fn validate_rejects_missing_opencode_command() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  command: \"\"\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(matches!(
+            validate_for_dispatch(&cfg, &["local"]),
+            Err(ConfigError::MissingAgentCommand { backend }) if backend == "opencode"
         ));
     }
 }

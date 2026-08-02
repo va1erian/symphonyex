@@ -33,6 +33,69 @@ pub const CONTAINER_PROJECT_ROOT: &str = "/project";
 /// the container). See README.md "Docker mode" for the image build steps.
 pub const CONTAINER_SYMPHONY_BIN: &str = "/usr/local/bin/symphony";
 
+/// Cancellation-safe cleanup for a `docker exec`-launched turn: killing the host-side
+/// `docker exec` client (e.g. via `kill_on_drop` when the orchestrator aborts this
+/// task) only terminates that client, not the process it was attached to *inside* the
+/// container -- so without this, an aborted turn's coding-agent process keeps running
+/// orphaned. Armed for the lifetime of a container-mode turn; `disarm()` on the normal
+/// completion path so a turn that already exited on its own doesn't also fire a
+/// needless (harmless, but pointless) `pkill` against a process that's already gone.
+/// Shared by every backend that supports Docker mode (`claude`, `opencode`) -- the
+/// cancellation-safety reasoning is identical regardless of which coding-agent CLI is
+/// actually running inside the container.
+///
+/// Every known early-return path (a backend's own `run_turn` timeout/read-error
+/// branches) calls `kill_now().await` explicitly rather than relying on `Drop` alone:
+/// `Drop::drop` can't be `async`, so it can only `tokio::spawn` a detached
+/// fire-and-forget cleanup task -- which gives no guarantee the in-container process
+/// is actually dead by the time the caller (`run_agent_attempt`'s `after_run` hook,
+/// e.g. `git commit && git push`) runs next, silently reintroducing a narrower version
+/// of the exact abort-before-cleanup-finishes race this session already fixed once at
+/// the host level (see `orchestrator.rs`'s `abort_and_run_after_run` doc comment).
+/// `Drop` remains as a last-resort backstop for the one path that structurally can't
+/// await anything -- the orchestrator cutting this task off entirely via
+/// `handle.abort()` -- which is why `abort_and_run_after_run` also issues its own
+/// explicitly-awaited kill independently, rather than trusting this guard's `Drop` to
+/// have finished by then.
+pub struct ContainerKillGuard {
+    container_name: Option<String>,
+    process_name: String,
+}
+
+impl ContainerKillGuard {
+    pub fn armed(container_name: String, process_name: String) -> Self {
+        Self {
+            container_name: Some(container_name),
+            process_name,
+        }
+    }
+
+    /// Explicitly awaited kill -- use on every early-return path where the caller is
+    /// about to do something that assumes the in-container process is already dead.
+    /// Idempotent: safe to call even if `Drop` also fires afterward (a `pkill` against
+    /// an already-dead process is a harmless no-op).
+    pub async fn kill_now(&self) {
+        if let Some(name) = &self.container_name {
+            kill_process_by_name(name, &self.process_name).await;
+        }
+    }
+
+    pub fn disarm(&mut self) {
+        self.container_name = None;
+    }
+}
+
+impl Drop for ContainerKillGuard {
+    fn drop(&mut self) {
+        if let Some(name) = self.container_name.take() {
+            let process_name = self.process_name.clone();
+            tokio::spawn(async move {
+                kill_process_by_name(&name, &process_name).await;
+            });
+        }
+    }
+}
+
 /// Best-effort: kill any process matching `process_name` running inside `container`.
 /// Used as a cancellation-safe cleanup path when the *host-side* `docker exec` client
 /// process is killed (e.g. by `kill_on_drop` on task abort) -- that only terminates

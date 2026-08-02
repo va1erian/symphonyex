@@ -88,7 +88,8 @@ branch never appeared upstream.
 
 ## Coding-agent backends
 
-Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`.
+Set `agent.backend: claude` (default), `agent.backend: codex`, or `agent.backend:
+opencode` in `WORKFLOW.md`.
 
 - **`claude`** (default, the "make it Claude-compatible" path): launches the `claude`
   CLI in headless mode (`claude -p <prompt> --output-format stream-json --resume
@@ -109,10 +110,27 @@ Set `agent.backend: claude` (default) or `agent.backend: codex` in `WORKFLOW.md`
   notification methods to detect turn completion. Treat it as a skeleton to adjust
   against your installed Codex version, not a verified client — see
   `src/agent/codex.rs` for the exact caveat.
+- **`opencode`** (the pluggable-model-provider path): launches the open-source,
+  provider-agnostic [`opencode`](https://opencode.ai) CLI in headless mode (`opencode
+  run --format json --model <provider/model> --auto --session <session_id> <prompt>`),
+  one subprocess per turn, same `--auto`-by-default high-trust posture as `claude`'s
+  `bypassPermissions` and the same reasoning (no human present to approve tool calls in
+  a headless run). This is how Fireworks AI (or any of `opencode`'s ~75 other
+  providers) plugs in: `opencode` itself owns the provider connection and
+  credentials — configure a provider once via `opencode`'s own `/connect` flow or a
+  static `opencode.json` provider block (e.g. pointing `FIREWORKS_API_KEY` at a
+  `fireworks` provider), then set `opencode.model: fireworks/<model-id>` here. Symphony
+  never sees or manages that credential directly, but `opencode.api_key: $VAR_NAME` (a
+  `$VAR_NAME` reference, mirroring `claude.api_key`) tells Symphony which env var to
+  forward into a Docker-mode container so the baked provider config's `{env:VAR_NAME}`
+  actually resolves at runtime — see "Docker mode" below. Like the Codex backend,
+  `opencode run --format json`'s exact per-event schema isn't fully documented
+  publicly; this module implements the subprocess/NDJSON transport solidly and guesses
+  at event field names leniently — see `src/agent/opencode.rs` for the exact caveat.
 
-Per-backend settings live under the `claude:` and `codex:` front-matter keys (mirroring
-each other where it makes sense); `claude.*` is a spec extension, not part of the
-normative schema.
+Per-backend settings live under the `claude:`, `codex:`, and `opencode:` front-matter
+keys (mirroring each other where it makes sense); none of these are part of the
+normative schema, they're all spec extensions.
 
 ## Docker mode
 
@@ -130,18 +148,21 @@ workspace:
 ```
 
 **Why this exists.** Workspace hooks (`hooks.rs`) run their scripts via WSL's `bash`,
-while the coding agent's own `Bash` tool — invoked by `claude` running natively on the
-host — resolves paths via Git Bash/MSYS. These disagree about how to spell a Windows
-path for the same directory (`/mnt/c/...` vs `/c/...`), and there is no single spelling
-that satisfies both; hit this twice in production (once via a hardcoded `git clone`
-URL, once via an agent "fixing" a remote URL to match its own environment and breaking
-the hooks'). Docker mode runs **both** the hooks and the `claude` process inside the
-same Linux container, bind-mounted once to the whole project directory (`workflow_dir`
-— covers the workspace, the tracker's `issues/`, and a mainline repo like
-bsky-archiver's `app/` in one mount) at a fixed path (`/project`,
+while the coding agent's own `Bash` tool — invoked by `claude`/`opencode` running
+natively on the host — resolves paths via Git Bash/MSYS. These disagree about how to
+spell a Windows path for the same directory (`/mnt/c/...` vs `/c/...`), and there is no
+single spelling that satisfies both; hit this twice in production (once via a
+hardcoded `git clone` URL, once via an agent "fixing" a remote URL to match its own
+environment and breaking the hooks'). Docker mode runs **both** the hooks and the
+coding-agent process inside the same Linux container, bind-mounted once to the whole
+project directory (`workflow_dir` — covers the workspace, the tracker's `issues/`, and
+a mainline repo like bsky-archiver's `app/` in one mount) at a fixed path (`/project`,
 `container::CONTAINER_PROJECT_ROOT`). Inside the container there is exactly one
 filesystem and one path convention, so this class of bug becomes structurally
-impossible rather than just less likely.
+impossible rather than just less likely. It's also the practical fix for a second,
+unrelated problem on Windows specifically: `opencode` itself has no first-class
+Windows installer, so running it in a container (`opencode` is baked into this repo's
+own base image) sidesteps installing it on the host at all.
 
 As a side effect this also isolates concurrent agents from each other and the host:
 each ticket gets its own persistent container (created alongside its workspace, torn
@@ -149,10 +170,11 @@ down alongside it), so a runaway agent is capped by `mem_limit`/`cpus` and can't
 anything outside the bind mount.
 
 **Building an image.** This repo's own `Dockerfile` is the base every project image
-extends: `debian:bookworm-slim` + `bash`/`git`/the `claude` CLI + a Linux build of
-`symphony` itself (for the MCP tool-server subcommand, `container::CONTAINER_SYMPHONY_BIN`
-at `/usr/local/bin/symphony`) — built inside a multi-stage Docker build, so no
-cross-compilation toolchain is needed on the host, just `docker build` itself:
+extends: `debian:bookworm-slim` + `bash`/`git`/the `claude` CLI/the `opencode` CLI + a
+Linux build of `symphony` itself (for the MCP tool-server subcommand,
+`container::CONTAINER_SYMPHONY_BIN` at `/usr/local/bin/symphony`) — built inside a
+multi-stage Docker build, so no cross-compilation toolchain is needed on the host, just
+`docker build` itself:
 
 ```bash
 docker build -t symphony-base:latest .
@@ -166,18 +188,65 @@ RUN apt-get update && apt-get install -y --no-install-recommends <your toolchain
     && rm -rf /var/lib/apt/lists/*
 ```
 
-**Currently Claude-backend only** (`agent.backend: claude`) — Codex's `start_session`
-accepts and ignores the container parameter for now.
+**Supported for `claude` and `opencode`, not yet `codex`** — Codex's `start_session`
+accepts and ignores the container parameter for now; `validate_for_dispatch` rejects
+`workspace.docker.enabled: true` with `agent.backend: codex` rather than silently
+no-op'ing the isolation.
+
+**Fireworks-via-`opencode` in Docker mode, concretely.** The base image already bakes
+in a global `opencode` provider config (`/home/agent/.config/opencode/opencode.json`)
+declaring `fireworks` as an OpenAI-compatible provider whose key is read from the
+container's own `FIREWORKS_API_KEY` env var at request time — nothing to run
+interactively inside the container. A project's `WORKFLOW.md` just needs:
+
+```yaml
+agent:
+  backend: opencode
+workspace:
+  docker:
+    enabled: true
+    image: my-project-agent:latest
+    user: "1000:1000"
+opencode:
+  model: fireworks/accounts/fireworks/models/kimi-k2p7-code
+  api_key: $FIREWORKS_API_KEY   # names the env var to forward; the value comes from
+                                  # Symphony's own process environment, never the config file
+```
+
+Fireworks' serverless catalog turns over fast (model ids get retired) -- verify
+the exact id via `GET https://api.fireworks.ai/inference/v1/models` before assuming
+any specific slug (including the one above) is still live.
+
+`FIREWORKS_API_KEY` must be set in the environment Symphony itself runs in (same
+convention as `repo.token`/`claude.api_key`) — `envsub::collect_var_refs` forwards
+exactly that name into each per-ticket container via `docker run -e`.
+
+**Gotcha: env vars only reach a container at its first creation.**
+`container::ensure_running` is idempotent by *name* (`symphony-<hash>-<ticket>`) — an
+already-existing container (from an earlier run, possibly before a secret was even
+set) is reused as-is, env vars and all; it is never recreated just because
+`WORKFLOW.md` or the process environment changed. Hit this for real testing the
+`opencode`/Fireworks path: a container created before `FIREWORKS_API_KEY` was set kept
+silently missing it across several `symphony` restarts, surfacing as `opencode`
+reporting "Model not found, inaccessible, and/or not deployed" (its generic error for
+an unauthenticated request) even once the key really was set in the shell launching
+`symphony`. Fix is `docker rm -f symphony-<hash>-<ticket>` (or blow away the whole
+`.workspaces/` dir) after changing anything that only takes effect at container
+creation (env var *values* -- not just which names get forwarded, which
+`docker inspect <name> --format '{{.Config.Env}}'` shows without printing this
+process's actual env -- `mem_limit`, `cpus`, `user`, etc.), then let the next dispatch
+recreate it fresh.
 
 **Prerequisite**: Docker Desktop (or an equivalent daemon) running, `docker` on `PATH`.
 Symphony checks this at startup when `docker.enabled: true` and fails fast with a clear
 message rather than surfacing "docker: command not found" buried in a hook failure.
 
 **Security posture — what this does and does not fix.** Real improvement: the agent's
-`bypassPermissions`-mode shell can now only reach what's bind-mounted, not the whole
-host filesystem, plus resource limits and process isolation that don't exist at all
-today. What stays exactly as risky: `bypassPermissions` itself is unchanged (the agent
-still has an unrestricted shell, just a smaller reachable filesystem); the bind mount
+auto-approved shell (`bypassPermissions` for `claude`, `--auto` for `opencode`) can now
+only reach what's bind-mounted, not the whole host filesystem, plus resource limits and
+process isolation that don't exist at all today. What stays exactly as risky: that
+auto-approval itself is unchanged (the agent still has an unrestricted shell, just a
+smaller reachable filesystem); the bind mount
 is full read-write across the *whole* project, so a bad agent on one ticket can still
 corrupt another ticket's workspace or the mainline repo; `WORKFLOW.md` hooks remain a
 trusted-script trust boundary, and running Docker at all typically requires

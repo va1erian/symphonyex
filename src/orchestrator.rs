@@ -3,7 +3,7 @@
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
 use crate::agent::{
-    AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex,
+    AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex, opencode,
 };
 use crate::config::{self, AgentBackendKind, EffectiveConfig};
 use crate::container::{self, ContainerHandle};
@@ -201,6 +201,14 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             turn_sandbox_policy: cfg.codex.turn_sandbox_policy.clone(),
             turn_timeout_ms: cfg.codex.turn_timeout_ms,
             read_timeout_ms: cfg.codex.read_timeout_ms,
+        }),
+        AgentBackendKind::OpenCode => Arc::new(opencode::OpenCodeBackend {
+            command: cfg.opencode.command.clone(),
+            model: cfg.opencode.model.clone(),
+            extra_args: cfg.opencode.args.clone(),
+            auto_approve: cfg.opencode.auto_approve,
+            turn_timeout_ms: cfg.opencode.turn_timeout_ms,
+            workflow_dir: cfg.workflow_dir.clone(),
         }),
     };
 

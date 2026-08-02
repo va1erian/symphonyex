@@ -1,12 +1,15 @@
 //! Agent Runner Protocol abstraction (Section 10): a coding-agent backend that Symphony
 //! launches inside a per-issue workspace and streams turn events from.
 //!
-//! Two backends ship: [`claude`] (Claude Code CLI headless mode; the default and the
-//! well-exercised path) and [`codex`] (Codex app-server; a best-effort JSON-RPC skeleton
-//! — see that module's docs for its verification caveat).
+//! Three backends ship: [`claude`] (Claude Code CLI headless mode; the default and the
+//! well-exercised path), [`codex`] (Codex app-server; a best-effort JSON-RPC skeleton
+//! — see that module's docs for its verification caveat), and [`opencode`] (the
+//! open-source, provider-agnostic `opencode` CLI — the "pluggable AI provider" path,
+//! e.g. for Fireworks AI; see that module's docs for its own verification caveat).
 
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
 use crate::container::ContainerHandle;
 use async_trait::async_trait;
