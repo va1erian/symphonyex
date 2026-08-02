@@ -1,0 +1,87 @@
+name: CI
+
+# Runs on every push to main and on every pull request. Restricting the push
+# trigger to main (rather than all branches) avoids a duplicate run on
+# branches that also have an open PR, where the pull_request event already
+# covers them.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: cargo test
+        run: cargo test
+
+  # Separate job from `check`: these tests need a real docker daemon (ubuntu-latest
+  # runners ship one already) and are #[ignore]d by default for exactly that reason --
+  # `docker_available()` in container.rs would otherwise be the only thing standing
+  # between a dev machine without Docker and a hard test failure.
+  docker-integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -- --ignored
+        run: cargo test -- --ignored --test-threads=1
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build symphony-base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: symphony-base:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test - required tools are present and runnable
+        run: |
+          docker run --rm symphony-base:ci bash -lc '
+            set -e
+            which symphony
+            which claude
+            which docker
+            opencode --version
+            test -f /home/agent/.config/opencode/opencode.json
+            grep -q "fireworks" /home/agent/.config/opencode/opencode.json
+          '
