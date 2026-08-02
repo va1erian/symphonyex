@@ -88,9 +88,12 @@ RUN mkdir -p /home/agent/.claude && touch /home/agent/.claude/.credentials.json 
 # WORKFLOW.md. `FIREWORKS_API_KEY` itself still has to reach the container at runtime:
 # reference it as `opencode.api_key: $FIREWORKS_API_KEY` in a project's WORKFLOW.md so
 # `envsub::collect_var_refs` forwards it via `docker run -e` (see config.rs). The one
-# model listed below is just what `opencode.model: fireworks/<model-id>` defaults
-# to if unset in WORKFLOW.md -- any other Fireworks model id works too, listed or not,
-# since `models` only affects the interactive picker, not what the API itself accepts.
+# model listed below is NOT a fallback opencode uses when `opencode.model` is unset in
+# WORKFLOW.md -- Symphony always passes `--model` explicitly when set, and omits the
+# flag entirely otherwise (opencode then falls back to whatever *its own* default
+# provider/model is, which may not even be Fireworks). This entry only affects
+# opencode's interactive model picker; any other Fireworks model id works via
+# `opencode.model: fireworks/<model-id>` whether or not it's listed here.
 RUN mkdir -p /home/agent/.config/opencode && echo '{"$schema":"https://opencode.ai/config.json","provider":{"fireworks":{"npm":"@ai-sdk/openai-compatible","name":"Fireworks AI","options":{"baseURL":"https://api.fireworks.ai/inference/v1","apiKey":"{env:FIREWORKS_API_KEY}"},"models":{"accounts/fireworks/models/kimi-k2p7-code":{"name":"Kimi K2.7 Code"}}}}}' > /home/agent/.config/opencode/opencode.json \
     && chown -R 1000:1000 /home/agent/.config
 
