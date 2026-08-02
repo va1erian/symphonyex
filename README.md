@@ -217,6 +217,22 @@ opencode:
 convention as `repo.token`/`claude.api_key`) — `envsub::collect_var_refs` forwards
 exactly that name into each per-ticket container via `docker run -e`.
 
+**Gotcha: env vars only reach a container at its first creation.**
+`container::ensure_running` is idempotent by *name* (`symphony-<hash>-<ticket>`) — an
+already-existing container (from an earlier run, possibly before a secret was even
+set) is reused as-is, env vars and all; it is never recreated just because
+`WORKFLOW.md` or the process environment changed. Hit this for real testing the
+`opencode`/Fireworks path: a container created before `FIREWORKS_API_KEY` was set kept
+silently missing it across several `symphony` restarts, surfacing as `opencode`
+reporting "Model not found, inaccessible, and/or not deployed" (its generic error for
+an unauthenticated request) even once the key really was set in the shell launching
+`symphony`. Fix is `docker rm -f symphony-<hash>-<ticket>` (or blow away the whole
+`.workspaces/` dir) after changing anything that only takes effect at container
+creation (env var *values* -- not just which names get forwarded, which
+`docker inspect <name> --format '{{.Config.Env}}'` shows without printing this
+process's actual env -- `mem_limit`, `cpus`, `user`, etc.), then let the next dispatch
+recreate it fresh.
+
 **Prerequisite**: Docker Desktop (or an equivalent daemon) running, `docker` on `PATH`.
 Symphony checks this at startup when `docker.enabled: true` and fails fast with a clear
 message rather than surfacing "docker: command not found" buried in a hook failure.
