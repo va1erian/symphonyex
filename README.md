@@ -208,10 +208,14 @@ workspace:
     image: my-project-agent:latest
     user: "1000:1000"
 opencode:
-  model: fireworks/accounts/fireworks/models/kimi-k2-instruct-0905
+  model: fireworks/accounts/fireworks/models/kimi-k2p7-code
   api_key: $FIREWORKS_API_KEY   # names the env var to forward; the value comes from
                                   # Symphony's own process environment, never the config file
 ```
+
+Fireworks' serverless catalog turns over fast (model ids get retired) -- verify
+the exact id via `GET https://api.fireworks.ai/inference/v1/models` before assuming
+any specific slug (including the one above) is still live.
 
 `FIREWORKS_API_KEY` must be set in the environment Symphony itself runs in (same
 convention as `repo.token`/`claude.api_key`) — `envsub::collect_var_refs` forwards

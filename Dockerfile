@@ -91,7 +91,7 @@ RUN mkdir -p /home/agent/.claude && touch /home/agent/.claude/.credentials.json 
 # model listed below is just what `opencode.model: fireworks/<model-id>` defaults
 # to if unset in WORKFLOW.md -- any other Fireworks model id works too, listed or not,
 # since `models` only affects the interactive picker, not what the API itself accepts.
-RUN mkdir -p /home/agent/.config/opencode && echo '{"$schema":"https://opencode.ai/config.json","provider":{"fireworks":{"npm":"@ai-sdk/openai-compatible","name":"Fireworks AI","options":{"baseURL":"https://api.fireworks.ai/inference/v1","apiKey":"{env:FIREWORKS_API_KEY}"},"models":{"accounts/fireworks/models/kimi-k2-instruct-0905":{"name":"Kimi K2 Instruct"}}}}}' > /home/agent/.config/opencode/opencode.json \
+RUN mkdir -p /home/agent/.config/opencode && echo '{"$schema":"https://opencode.ai/config.json","provider":{"fireworks":{"npm":"@ai-sdk/openai-compatible","name":"Fireworks AI","options":{"baseURL":"https://api.fireworks.ai/inference/v1","apiKey":"{env:FIREWORKS_API_KEY}"},"models":{"accounts/fireworks/models/kimi-k2p7-code":{"name":"Kimi K2.7 Code"}}}}}' > /home/agent/.config/opencode/opencode.json \
     && chown -R 1000:1000 /home/agent/.config
 
 # Every workspace hook and the coding agent itself run with a container bind-mount at
