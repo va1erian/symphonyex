@@ -1,0 +1,113 @@
+name: Release
+
+# Fires only on a version-shaped tag push (e.g. v1.2.3, v1.2.3-rc1) -- kept as its own
+# workflow, separate from ci.yml's push/pull_request triggers, so a release doesn't
+# get tangled up with (or gated behind) the branch/PR checks that already run there.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Package archive (unix)
+        if: runner.os != 'Windows'
+        run: |
+          archive="symphony-${{ github.ref_name }}-${{ matrix.name }}.tar.gz"
+          tar -czf "$archive" -C target/release symphony
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Package archive (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "symphony-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          Compress-Archive -Path target/release/symphony.exe -DestinationPath $archive
+          Add-Content -Path $env:GITHUB_ENV -Value "ARCHIVE=$archive"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: symphony-${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  docker-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR (like all Docker registries) requires a lowercase image name; github.repository
+      # preserves whatever case the repo owner/name actually have, which fails the push if
+      # either contains an uppercase letter.
+      - name: Compute lowercase image name
+        run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Build and push symphony image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    needs: [build-binaries, docker-publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Docker image: `ghcr.io/${{ github.repository }}:${{ github.ref_name }}`

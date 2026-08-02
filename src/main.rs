@@ -10,7 +10,9 @@ mod hooks;
 mod mcp;
 mod metrics;
 mod orchestrator;
+mod registry;
 mod repo_host;
+mod service;
 mod status;
 mod swebot;
 mod template;
@@ -74,6 +76,21 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+
+    /// Run the long-running, multi-repo web service (see AGENTS.md "Long-running
+    /// multi-repo service"): register GitHub repos through a browser instead of
+    /// pointing one process at one local WORKFLOW.md, and Symphony fetches each
+    /// repo's config and polls its tracker/PRs/discussions continuously. Requires
+    /// `SYMPHONY_ADMIN_TOKEN` to be set.
+    Serve {
+        /// Port to serve the web UI on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Where registered projects' fetched WORKFLOW.md files and SQLite registry
+        /// are persisted. Defaults to `./symphony-data`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -132,6 +149,16 @@ async fn main() -> std::process::ExitCode {
             .await;
         }
         Some(Command::Daemon { action }) => return run_daemon_command(action).await,
+        Some(Command::Serve { port, data_dir }) => {
+            let data_dir = data_dir.unwrap_or_else(|| PathBuf::from("symphony-data"));
+            return match service::run(port, data_dir).await {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!(error = %e, "symphony serve exited with error");
+                    std::process::ExitCode::FAILURE
+                }
+            };
+        }
         None => {}
     }
 
