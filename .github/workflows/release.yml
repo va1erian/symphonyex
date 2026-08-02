@@ -98,10 +98,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all binary artifacts
+      # Filtered to our own artifact names: docker/build-push-action (docker-publish,
+      # above) auto-uploads its own build-record artifact for GitHub's build summary
+      # UI (named "<owner>~<repo>~<random>.dockerbuild") whenever it runs in Actions.
+      # An unfiltered "download everything" pulls that one in too and fails --
+      # download-artifact can't extract it, since it isn't one of ours to begin with.
+      - name: Download binary artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: "symphony-*"
           merge-multiple: true
 
       - name: Create GitHub release
