@@ -120,10 +120,13 @@ opencode` in `WORKFLOW.md`.
   credentials — configure a provider once via `opencode`'s own `/connect` flow or a
   static `opencode.json` provider block (e.g. pointing `FIREWORKS_API_KEY` at a
   `fireworks` provider), then set `opencode.model: fireworks/<model-id>` here. Symphony
-  never sees or manages that credential. Like the Codex backend, `opencode run --format
-  json`'s exact per-event schema isn't fully documented publicly; this module
-  implements the subprocess/NDJSON transport solidly and guesses at event field names
-  leniently — see `src/agent/opencode.rs` for the exact caveat.
+  never sees or manages that credential directly, but `opencode.api_key: $VAR_NAME` (a
+  `$VAR_NAME` reference, mirroring `claude.api_key`) tells Symphony which env var to
+  forward into a Docker-mode container so the baked provider config's `{env:VAR_NAME}`
+  actually resolves at runtime — see "Docker mode" below. Like the Codex backend,
+  `opencode run --format json`'s exact per-event schema isn't fully documented
+  publicly; this module implements the subprocess/NDJSON transport solidly and guesses
+  at event field names leniently — see `src/agent/opencode.rs` for the exact caveat.
 
 Per-backend settings live under the `claude:`, `codex:`, and `opencode:` front-matter
 keys (mirroring each other where it makes sense); none of these are part of the
@@ -145,18 +148,21 @@ workspace:
 ```
 
 **Why this exists.** Workspace hooks (`hooks.rs`) run their scripts via WSL's `bash`,
-while the coding agent's own `Bash` tool — invoked by `claude` running natively on the
-host — resolves paths via Git Bash/MSYS. These disagree about how to spell a Windows
-path for the same directory (`/mnt/c/...` vs `/c/...`), and there is no single spelling
-that satisfies both; hit this twice in production (once via a hardcoded `git clone`
-URL, once via an agent "fixing" a remote URL to match its own environment and breaking
-the hooks'). Docker mode runs **both** the hooks and the `claude` process inside the
-same Linux container, bind-mounted once to the whole project directory (`workflow_dir`
-— covers the workspace, the tracker's `issues/`, and a mainline repo like
-bsky-archiver's `app/` in one mount) at a fixed path (`/project`,
+while the coding agent's own `Bash` tool — invoked by `claude`/`opencode` running
+natively on the host — resolves paths via Git Bash/MSYS. These disagree about how to
+spell a Windows path for the same directory (`/mnt/c/...` vs `/c/...`), and there is no
+single spelling that satisfies both; hit this twice in production (once via a
+hardcoded `git clone` URL, once via an agent "fixing" a remote URL to match its own
+environment and breaking the hooks'). Docker mode runs **both** the hooks and the
+coding-agent process inside the same Linux container, bind-mounted once to the whole
+project directory (`workflow_dir` — covers the workspace, the tracker's `issues/`, and
+a mainline repo like bsky-archiver's `app/` in one mount) at a fixed path (`/project`,
 `container::CONTAINER_PROJECT_ROOT`). Inside the container there is exactly one
 filesystem and one path convention, so this class of bug becomes structurally
-impossible rather than just less likely.
+impossible rather than just less likely. It's also the practical fix for a second,
+unrelated problem on Windows specifically: `opencode` itself has no first-class
+Windows installer, so running it in a container (`opencode` is baked into this repo's
+own base image) sidesteps installing it on the host at all.
 
 As a side effect this also isolates concurrent agents from each other and the host:
 each ticket gets its own persistent container (created alongside its workspace, torn
@@ -164,10 +170,11 @@ down alongside it), so a runaway agent is capped by `mem_limit`/`cpus` and can't
 anything outside the bind mount.
 
 **Building an image.** This repo's own `Dockerfile` is the base every project image
-extends: `debian:bookworm-slim` + `bash`/`git`/the `claude` CLI + a Linux build of
-`symphony` itself (for the MCP tool-server subcommand, `container::CONTAINER_SYMPHONY_BIN`
-at `/usr/local/bin/symphony`) — built inside a multi-stage Docker build, so no
-cross-compilation toolchain is needed on the host, just `docker build` itself:
+extends: `debian:bookworm-slim` + `bash`/`git`/the `claude` CLI/the `opencode` CLI + a
+Linux build of `symphony` itself (for the MCP tool-server subcommand,
+`container::CONTAINER_SYMPHONY_BIN` at `/usr/local/bin/symphony`) — built inside a
+multi-stage Docker build, so no cross-compilation toolchain is needed on the host, just
+`docker build` itself:
 
 ```bash
 docker build -t symphony-base:latest .
@@ -181,20 +188,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends <your toolchain
     && rm -rf /var/lib/apt/lists/*
 ```
 
-**Currently Claude-backend only** (`agent.backend: claude`) — both Codex's and
-OpenCode's `start_session` accept and ignore the container parameter for now;
-`validate_for_dispatch` rejects `workspace.docker.enabled: true` with either backend
-rather than silently no-op'ing the isolation.
+**Supported for `claude` and `opencode`, not yet `codex`** — Codex's `start_session`
+accepts and ignores the container parameter for now; `validate_for_dispatch` rejects
+`workspace.docker.enabled: true` with `agent.backend: codex` rather than silently
+no-op'ing the isolation.
+
+**Fireworks-via-`opencode` in Docker mode, concretely.** The base image already bakes
+in a global `opencode` provider config (`/home/agent/.config/opencode/opencode.json`)
+declaring `fireworks` as an OpenAI-compatible provider whose key is read from the
+container's own `FIREWORKS_API_KEY` env var at request time — nothing to run
+interactively inside the container. A project's `WORKFLOW.md` just needs:
+
+```yaml
+agent:
+  backend: opencode
+workspace:
+  docker:
+    enabled: true
+    image: my-project-agent:latest
+    user: "1000:1000"
+opencode:
+  model: fireworks/accounts/fireworks/models/kimi-k2-instruct-0905
+  api_key: $FIREWORKS_API_KEY   # names the env var to forward; the value comes from
+                                  # Symphony's own process environment, never the config file
+```
+
+`FIREWORKS_API_KEY` must be set in the environment Symphony itself runs in (same
+convention as `repo.token`/`claude.api_key`) — `envsub::collect_var_refs` forwards
+exactly that name into each per-ticket container via `docker run -e`.
 
 **Prerequisite**: Docker Desktop (or an equivalent daemon) running, `docker` on `PATH`.
 Symphony checks this at startup when `docker.enabled: true` and fails fast with a clear
 message rather than surfacing "docker: command not found" buried in a hook failure.
 
 **Security posture — what this does and does not fix.** Real improvement: the agent's
-`bypassPermissions`-mode shell can now only reach what's bind-mounted, not the whole
-host filesystem, plus resource limits and process isolation that don't exist at all
-today. What stays exactly as risky: `bypassPermissions` itself is unchanged (the agent
-still has an unrestricted shell, just a smaller reachable filesystem); the bind mount
+auto-approved shell (`bypassPermissions` for `claude`, `--auto` for `opencode`) can now
+only reach what's bind-mounted, not the whole host filesystem, plus resource limits and
+process isolation that don't exist at all today. What stays exactly as risky: that
+auto-approval itself is unchanged (the agent still has an unrestricted shell, just a
+smaller reachable filesystem); the bind mount
 is full read-write across the *whole* project, so a bad agent on one ticket can still
 corrupt another ticket's workspace or the mainline repo; `WORKFLOW.md` hooks remain a
 trusted-script trust boundary, and running Docker at all typically requires

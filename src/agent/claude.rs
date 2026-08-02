@@ -22,7 +22,7 @@
 //! host-mediated and adapter-scoped, not raw command/file access.
 
 use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
-use crate::container::{self, ContainerHandle};
+use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -161,65 +161,6 @@ struct ClaudeSession {
     container_workspace_path: Option<PathBuf>,
     mcp_config_path: Option<PathBuf>,
     session_id: Option<String>,
-}
-
-/// Cancellation-safe cleanup for a `docker exec`-launched turn: killing the host-side
-/// `docker exec` client (e.g. via `kill_on_drop` when the orchestrator aborts this
-/// task) only terminates that client, not the process it was attached to *inside* the
-/// container -- so without this, an aborted turn's `claude` process keeps running
-/// orphaned. Armed for the lifetime of a container-mode turn; `disarm()` on the normal
-/// completion path so a turn that already exited on its own doesn't also fire a
-/// needless (harmless, but pointless) `pkill` against a process that's already gone.
-///
-/// Every known early-return path (`run_turn`'s own timeout/read-error branches) calls
-/// `kill_now().await` explicitly rather than relying on `Drop` alone: `Drop::drop`
-/// can't be `async`, so it can only `tokio::spawn` a detached fire-and-forget cleanup
-/// task -- which gives no guarantee the in-container process is actually dead by the
-/// time the caller (`run_agent_attempt`'s `after_run` hook, e.g. `git commit && git
-/// push`) runs next, silently reintroducing a narrower version of the exact
-/// abort-before-cleanup-finishes race this session already fixed once at the host
-/// level (see `orchestrator.rs`'s `abort_and_run_after_run` doc comment). `Drop`
-/// remains as a last-resort backstop for the one path that structurally can't await
-/// anything -- the orchestrator cutting this task off entirely via `handle.abort()` --
-/// which is why `abort_and_run_after_run` also issues its own explicitly-awaited kill
-/// independently, rather than trusting this guard's `Drop` to have finished by then.
-struct ContainerKillGuard {
-    container_name: Option<String>,
-    process_name: String,
-}
-
-impl ContainerKillGuard {
-    fn armed(container_name: String, process_name: String) -> Self {
-        Self {
-            container_name: Some(container_name),
-            process_name,
-        }
-    }
-
-    /// Explicitly awaited kill -- use on every early-return path where the caller is
-    /// about to do something that assumes the in-container process is already dead.
-    /// Idempotent: safe to call even if `Drop` also fires afterward (a `pkill` against
-    /// an already-dead process is a harmless no-op).
-    async fn kill_now(&self) {
-        if let Some(name) = &self.container_name {
-            container::kill_process_by_name(name, &self.process_name).await;
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.container_name = None;
-    }
-}
-
-impl Drop for ContainerKillGuard {
-    fn drop(&mut self) {
-        if let Some(name) = self.container_name.take() {
-            let process_name = self.process_name.clone();
-            tokio::spawn(async move {
-                container::kill_process_by_name(&name, &process_name).await;
-            });
-        }
-    }
 }
 
 #[async_trait]

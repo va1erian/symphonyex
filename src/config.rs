@@ -31,6 +31,10 @@ pub enum ConfigError {
     )]
     InvalidClaudeApiKey,
     #[error(
+        "invalid_config: opencode.api_key must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidOpenCodeApiKey,
+    #[error(
         "invalid_config: repo.pull_request requires repo.url to be a github.com URL (owner/name) -- open_pull_request only supports GitHub"
     )]
     PullRequestRequiresGithubRepo,
@@ -50,12 +54,6 @@ pub enum ConfigError {
          runs on the host regardless -- so enabling both silently doesn't do what it looks like)"
     )]
     DockerNotSupportedForCodex,
-    #[error(
-        "invalid_config: workspace.docker.enabled is not supported with agent.backend=opencode yet \
-         (Docker mode only runs the Claude backend's turns inside the container -- OpenCode always \
-         runs on the host regardless -- so enabling both silently doesn't do what it looks like)"
-    )]
-    DockerNotSupportedForOpenCode,
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -131,6 +129,16 @@ pub struct OpenCodeConfig {
     pub auto_approve: bool,
     pub turn_timeout_ms: u64,
     pub stall_timeout_ms: i64,
+    /// Name of an env var holding the API key for whichever provider `model` names
+    /// (e.g. `FIREWORKS_API_KEY`). Mirrors `ClaudeConfig::api_key_env` exactly: named,
+    /// not resolved to a value here, purely so `envsub::collect_var_refs` (which walks
+    /// the raw config tree directly, not this typed struct) picks it up and forwards
+    /// it into Docker-mode containers via `docker run -e`. `opencode` itself must
+    /// already have a provider configured whose `apiKey` references this same env var
+    /// name (see README.md "Coding-agent backends") -- this field's job is documenting
+    /// and validating that convention, not driving further logic.
+    #[allow(dead_code)]
+    pub api_key_env: Option<String>,
 }
 
 /// Extension: run workspace hooks and the coding agent inside a per-ticket Docker
@@ -490,6 +498,13 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .unwrap_or(true),
         turn_timeout_ms: get_u64(opencode, "turn_timeout_ms", 3_600_000),
         stall_timeout_ms: get_i64(opencode, "stall_timeout_ms", 300_000),
+        api_key_env: get_str(opencode, "api_key")
+            .map(|k| {
+                envsub::var_name_of(&k)
+                    .map(|s| s.to_string())
+                    .ok_or(ConfigError::InvalidOpenCodeApiKey)
+            })
+            .transpose()?,
     };
 
     let cfg = EffectiveConfig {
@@ -650,9 +665,6 @@ pub fn validate_for_dispatch(
         }
         if cfg.agent_backend == AgentBackendKind::Codex {
             return Err(ConfigError::DockerNotSupportedForCodex);
-        }
-        if cfg.agent_backend == AgentBackendKind::OpenCode {
-            return Err(ConfigError::DockerNotSupportedForOpenCode);
         }
     }
     Ok(())
@@ -1098,16 +1110,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_docker_enabled_with_opencode_backend() {
+    fn validate_allows_docker_enabled_with_opencode_backend() {
         let cfg_yaml = parse_yaml(
             "tracker:\n  kind: local\nagent:\n  backend: opencode\nworkspace:\n  docker:\n    \
              enabled: true\n    image: some-image:latest\n",
         );
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(validate_for_dispatch(&cfg, &["local"]).is_ok());
+    }
+
+    #[test]
+    fn opencode_api_key_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  api_key: not-a-var\n",
+        );
         assert!(matches!(
-            validate_for_dispatch(&cfg, &["local"]),
-            Err(ConfigError::DockerNotSupportedForOpenCode)
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidOpenCodeApiKey)
         ));
+    }
+
+    #[test]
+    fn opencode_api_key_var_reference_resolves_to_env_var_name() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  backend: opencode\nopencode:\n  \
+             api_key: $FIREWORKS_API_KEY\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.opencode.api_key_env.as_deref(),
+            Some("FIREWORKS_API_KEY")
+        );
     }
 
     #[test]
@@ -1130,6 +1163,7 @@ mod tests {
         assert!(cfg.opencode.auto_approve);
         assert_eq!(cfg.opencode.turn_timeout_ms, 3_600_000);
         assert_eq!(cfg.opencode.stall_timeout_ms, 300_000);
+        assert!(cfg.opencode.api_key_env.is_none());
     }
 
     #[test]

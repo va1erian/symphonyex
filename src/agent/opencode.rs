@@ -29,8 +29,16 @@
 //! interactively, and a restrictive default would silently prevent the agent from ever
 //! running its own build/tests -- see `claude.rs`'s module doc for the identical lesson
 //! learned there first.
+//!
+//! **Docker mode**: supported, mirroring `claude.rs` exactly (`docker exec` into the
+//! per-ticket container instead of spawning `opencode` on the host, same
+//! `ContainerKillGuard` cancellation-safety handling). Installing `opencode` natively
+//! is the main friction point on Windows -- baking it (plus a static provider config)
+//! into the Symphony base image once, per README.md "Docker mode", sidesteps that
+//! entirely.
 
 use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use crate::container::{ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -46,6 +54,9 @@ pub struct OpenCodeBackend {
     pub extra_args: Vec<String>,
     pub auto_approve: bool,
     pub turn_timeout_ms: u64,
+    /// Needed to map a host workspace path to its in-container equivalent in Docker
+    /// mode (see README.md "Docker mode"), same reason `ClaudeBackend` keeps this.
+    pub workflow_dir: PathBuf,
 }
 
 #[async_trait]
@@ -55,15 +66,16 @@ impl AgentBackend for OpenCodeBackend {
         workspace: &Path,
         _issue_id: &str,
         _title: &str,
-        // v1 is host-only (see README.md "Docker mode"); accepted but ignored here,
-        // same as `codex.rs`'s own `start_session` does today for the same reason.
-        _container: Option<&crate::container::ContainerHandle>,
+        container: Option<&ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         if !workspace.is_dir() {
             return Err(AgentError::InvalidCwd(format!(
                 "{workspace:?} is not a directory"
             )));
         }
+
+        let container_workspace_path =
+            container.map(|c| c.to_container_path(&self.workflow_dir, workspace));
 
         Ok(Box::new(OpenCodeSession {
             command: self.command.clone(),
@@ -72,6 +84,8 @@ impl AgentBackend for OpenCodeBackend {
             auto_approve: self.auto_approve,
             turn_timeout_ms: self.turn_timeout_ms,
             workspace: workspace.to_path_buf(),
+            container: container.cloned(),
+            container_workspace_path,
             session_id: None,
         }))
     }
@@ -84,6 +98,8 @@ struct OpenCodeSession {
     auto_approve: bool,
     turn_timeout_ms: u64,
     workspace: PathBuf,
+    container: Option<ContainerHandle>,
+    container_workspace_path: Option<PathBuf>,
     session_id: Option<String>,
 }
 
@@ -120,10 +136,32 @@ impl AgentSession for OpenCodeSession {
         // content containing shell metacharacters.
         args.push(prompt.to_string());
 
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&args)
-            .current_dir(&self.workspace)
-            .stdin(Stdio::null())
+        // Same container-vs-host branch as `claude.rs::ClaudeSession::run_turn`: in
+        // Docker mode, `docker exec` into the per-ticket container instead of
+        // spawning `opencode` directly on the host.
+        let mut kill_guard: Option<ContainerKillGuard> = None;
+        let mut cmd = match (&self.container, &self.container_workspace_path) {
+            (Some(container), Some(container_workspace)) => {
+                let mut c = Command::new("docker");
+                c.arg("exec")
+                    .arg("-w")
+                    .arg(container_workspace.to_string_lossy().to_string())
+                    .arg(&container.name)
+                    .arg(&self.command)
+                    .args(&args);
+                kill_guard = Some(ContainerKillGuard::armed(
+                    container.name.clone(),
+                    self.command.clone(),
+                ));
+                c
+            }
+            _ => {
+                let mut c = Command::new(&self.command);
+                c.args(&args).current_dir(&self.workspace);
+                c
+            }
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -158,10 +196,16 @@ impl AgentSession for OpenCodeSession {
                 Ok(Ok(None)) => break, // stdout EOF
                 Ok(Err(e)) => {
                     let _ = child.kill().await;
+                    if let Some(guard) = &kill_guard {
+                        guard.kill_now().await;
+                    }
                     return Err(AgentError::ResponseError(e.to_string()));
                 }
                 Err(_) => {
                     let _ = child.kill().await;
+                    if let Some(guard) = &kill_guard {
+                        guard.kill_now().await;
+                    }
                     return Err(AgentError::TurnTimeout(format!(
                         "no output for {}ms",
                         self.turn_timeout_ms
@@ -187,6 +231,14 @@ impl AgentSession for OpenCodeSession {
             .wait()
             .await
             .map_err(|e| AgentError::ProcessExit(e.to_string()))?;
+
+        // The subprocess (host `opencode`, or the `docker exec` client) exited on its
+        // own by this point -- whatever it was attached to inside a container is
+        // already gone too, so disarm rather than firing a pointless `pkill`. Mirrors
+        // `claude.rs`'s identical reasoning.
+        if let Some(guard) = &mut kill_guard {
+            guard.disarm();
+        }
 
         match outcome {
             Some(o) => Ok(o),
@@ -398,6 +450,8 @@ mod tests {
             auto_approve: true,
             turn_timeout_ms: 1_000,
             workspace: PathBuf::from("."),
+            container: None,
+            container_workspace_path: None,
             session_id: None,
         }
     }
