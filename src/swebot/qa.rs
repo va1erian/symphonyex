@@ -1,8 +1,10 @@
 //! Q&A capability: answers questions asked in the repo's `Q&A`-category GitHub
-//! Discussions (`swebot.qa.discussion_category`, default `"Q&A"`), or, on GitLab,
-//! Issues carrying the `swebot.qa.label` label (default `"swebot::question"`) --
-//! see `config::SwebotConfig`'s doc comment for why the two hosts need different
-//! conversational surfaces.
+//! Discussions (`swebot.qa.discussion_category`, default `"Q&A"`), an issue label on
+//! GitLab (`swebot.qa.label`, default `"swebot::question"`), or a board on
+//! `crate::board`'s local bulletin board when `swebot.board.enabled` -- see
+//! `config::SwebotConfig`'s doc comment for why the conversational surface varies.
+//! `selector` below is whichever of those `swebot::mod::run` resolved for the
+//! current `host`; this module itself stays agnostic to which one it got.
 //!
 //! No local persistence: "which comments has SweBot already answered" is derived
 //! entirely from `<!-- swebot:answered:<comment-id> -->` markers embedded in SweBot's
@@ -11,20 +13,15 @@
 
 use super::{PERSONA, answered_marker, next_to_answer, run_turn_collect_text, transcript_up_to};
 use crate::agent::AgentBackend;
-use crate::config::{EffectiveConfig, RepoProvider};
-use crate::repo_host::RepoHost;
+use crate::repo_host::DiscussionHost;
 use std::path::Path;
 
 pub async fn poll_once(
-    cfg: &EffectiveConfig,
-    host: &dyn RepoHost,
+    host: &dyn DiscussionHost,
+    selector: &str,
     backend: &dyn AgentBackend,
     shared_clone_dir: &Path,
 ) -> Result<(), String> {
-    let selector = match host.provider_kind() {
-        RepoProvider::Github => &cfg.swebot.qa_discussion_category,
-        RepoProvider::Gitlab => &cfg.swebot.qa_label,
-    };
     let threads = host.list_swebot_threads(selector).await?;
 
     for thread in threads {
@@ -154,7 +151,14 @@ mod tests {
         let backend = FakeBackend::with_response("Auth uses OAuth, see src/auth.rs.");
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path()).await.unwrap();
+        poll_once(
+            &host,
+            &cfg.swebot.qa_discussion_category,
+            &backend,
+            dir.path(),
+        )
+        .await
+        .unwrap();
 
         let prompts = backend.prompts_seen.lock().unwrap();
         assert_eq!(prompts.len(), 1);
@@ -197,7 +201,14 @@ mod tests {
         let backend = FakeBackend::with_response("should not be called");
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path()).await.unwrap();
+        poll_once(
+            &host,
+            &cfg.swebot.qa_discussion_category,
+            &backend,
+            dir.path(),
+        )
+        .await
+        .unwrap();
 
         assert!(backend.prompts_seen.lock().unwrap().is_empty());
     }
@@ -264,7 +275,9 @@ mod tests {
         let backend = FakeBackend::with_response("Auth uses OAuth, see src/auth.rs.");
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path()).await.unwrap();
+        poll_once(&host, &cfg.swebot.qa_label, &backend, dir.path())
+            .await
+            .unwrap();
 
         let prompts = backend.prompts_seen.lock().unwrap();
         assert_eq!(prompts.len(), 1);
@@ -300,7 +313,9 @@ mod tests {
         let backend = FakeBackend::with_response("should not be called");
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path()).await.unwrap();
+        poll_once(&host, &cfg.swebot.qa_label, &backend, dir.path())
+            .await
+            .unwrap();
 
         assert!(backend.prompts_seen.lock().unwrap().is_empty());
     }

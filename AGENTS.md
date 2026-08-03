@@ -439,6 +439,35 @@ freely for exploring code and running tests during review). It answers, drafts, 
 reviews — it never edits the repo directly. That stays the coding agent's job, gated
 by the normal ticket-dispatch flow this whole document is otherwise about.
 
+**Alternative: a local bulletin board instead of GitLab's label-filtered Issues**
+(`src/board.rs`). Some projects would rather not mix SweBot's Q&A/Ideas traffic into
+their real GitLab Issues list at all, even distinguished only by label. Set
+`swebot.board.enabled: true` to swap SweBot's Q&A/drafting conversational surface for
+a small, self-hosted bulletin board instead — two fixed boards (`Q&A`, `Ideas`),
+server-rendered HTML/CSS with no JS, markdown support (sanitized server-side: raw
+HTML and non-`http(s)/mailto`-scheme links are neutralized, since posts are
+unauthenticated), mounted at `/board` alongside the status dashboard
+(`status::router`, so it needs `--port` or `symphony serve` the same way `/events`/
+`/usage` do):
+
+```yaml
+swebot:
+  enabled: true
+  board:
+    enabled: true   # use the local bulletin board instead of repo.provider's own Q&A/drafting surface
+```
+
+Only affects Q&A/drafting: `swebot.review.enabled` (PR/MR review) always goes through
+the real `repo.provider` host regardless, since a merge request is inherently a
+property of the actual code host, not something a bulletin board has any notion of.
+Works with either provider, not just GitLab — a GitHub project could use it too, to
+avoid Discussions rather than avoid Issues. `swebot::mod`'s `ConversationHost` is what
+picks between the local board (`board::BulletinBoardHost`, implementing just the
+`repo_host::DiscussionHost` half of the `RepoHost` trait — see that trait's own doc
+comment for why the split exists) and the real host per poll cycle; `qa.rs`/
+`drafting.rs` themselves stay agnostic to which one they got. Storage is `rusqlite`,
+connection-per-call, same "keep it basic" posture as `registry.rs`/`eventlog.rs`.
+
 ## Daemonizing Symphony (single project)
 
 Everything above assumes a human launches `symphony` and watches it. `symphony

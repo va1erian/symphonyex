@@ -265,8 +265,10 @@ impl RepoProvider {
 /// GitLab has no Discussions object at all, so there SweBot instead polls Issues
 /// carrying a specific label (`qa_label`/`drafting_label`) -- see
 /// `repo_host::gitlab::GitlabRepoHost::list_swebot_threads`. Both pairs of fields
-/// always coexist; `swebot::qa`/`swebot::drafting` pick the right one for the
-/// configured `repo.provider` via `RepoHost::provider_kind`.
+/// always coexist; `swebot::mod`'s `ConversationHost` picks the right one for the
+/// configured `repo.provider` (or, when `board_enabled`, ignores both and uses the
+/// local bulletin board's own fixed two boards instead -- see `board_enabled`'s own
+/// doc comment).
 #[derive(Debug, Clone)]
 pub struct SwebotConfig {
     pub enabled: bool,
@@ -278,6 +280,15 @@ pub struct SwebotConfig {
     pub qa_label: String,
     /// GitLab: issue label SweBot treats as ticket ideas to draft.
     pub drafting_label: String,
+    /// Use the local bulletin board (`crate::board`) instead of `repo.provider`'s own
+    /// Discussions/labels as SweBot's Q&A/drafting conversational surface -- an
+    /// alternative for a project that doesn't want that traffic mixed into GitLab's
+    /// real Issues list (see `board`'s own module doc comment for the full
+    /// rationale). Only affects Q&A/drafting: `review_enabled` (PR/MR review) always
+    /// goes through the real `repo.provider` host regardless of this flag, since a
+    /// merge request is inherently a property of the actual code host. Off by
+    /// default, same opt-in posture as the rest of `swebot:`.
+    pub board_enabled: bool,
     /// Whether SweBot reviews the pull requests Symphony's own coding agents open
     /// (branch name matching `issue-<identifier>`, the same convention
     /// `synthesize_repo_hooks` produces). Independent toggle from `enabled` at large
@@ -508,6 +519,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let swebot_qa = get(swebot_raw, "qa").unwrap_or(&empty);
     let swebot_drafting = get(swebot_raw, "drafting").unwrap_or(&empty);
     let swebot_review = get(swebot_raw, "review").unwrap_or(&empty);
+    let swebot_board = get(swebot_raw, "board").unwrap_or(&empty);
     let swebot_token_env = get_str(swebot_raw, "token")
         .map(|t| {
             envsub::var_name_of(&t)
@@ -524,6 +536,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         qa_label: get_str(swebot_qa, "label").unwrap_or_else(|| "swebot::question".to_string()),
         drafting_label: get_str(swebot_drafting, "label")
             .unwrap_or_else(|| "swebot::idea".to_string()),
+        board_enabled: get(swebot_board, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         review_enabled: get(swebot_review, "enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(swebot_enabled),
@@ -1104,6 +1119,24 @@ mod tests {
         let cfg_defaults = resolve(&cfg_yaml_defaults, Path::new(".")).unwrap();
         assert_eq!(cfg_defaults.swebot.qa_label, "swebot::question");
         assert_eq!(cfg_defaults.swebot.drafting_label, "swebot::idea");
+    }
+
+    #[test]
+    fn swebot_board_enabled_defaults_to_false_and_can_be_turned_on() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_BOARD_TOKEN\nswebot:\n  enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.swebot.board_enabled);
+
+        let cfg_yaml_board = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_BOARD_TOKEN_2\nswebot:\n  enabled: true\n  \
+             board:\n    enabled: true\n",
+        );
+        let cfg_board = resolve(&cfg_yaml_board, Path::new(".")).unwrap();
+        assert!(cfg_board.swebot.board_enabled);
     }
 
     #[test]

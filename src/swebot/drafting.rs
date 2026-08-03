@@ -1,16 +1,19 @@
 //! Ticket-drafting capability: turns a rough idea posted in the repo's `Ideas`-
 //! category GitHub Discussions (`swebot.drafting.discussion_category`, default
-//! `"Ideas"`), or, on GitLab, Issues carrying the `swebot.drafting.label` label
-//! (default `"swebot::idea"`), into a properly scoped issue through a clarifying
-//! dialogue.
+//! `"Ideas"`), an issue label on GitLab (`swebot.drafting.label`, default
+//! `"swebot::idea"`), or a board on `crate::board`'s local bulletin board when
+//! `swebot.board.enabled`, into a properly scoped issue through a clarifying
+//! dialogue. `selector` below is whichever of those `swebot::mod::run` resolved for
+//! the current `host`; this module itself stays agnostic to which one it got.
 //!
 //! Ends by creating a **new** issue via `TrackerAdapter::create_issue` rather than
 //! rewriting the source thread into one -- the source stays the messy conversational
 //! space, the tracker's Issues stays the clean actionable backlog Symphony's own
 //! dispatch loop watches, and a half-drafted idea is never sitting in the tracker
-//! looking dispatchable when it isn't. On GitLab, where the source thread is itself
-//! a tracker Issue, the source issue is closed once promoted (`RepoHost::close_thread`)
-//! to keep that separation from collapsing back into one undifferentiated Issues list.
+//! looking dispatchable when it isn't. On GitLab (where the source thread is itself
+//! a tracker Issue) and on the local bulletin board, the source thread is closed
+//! once promoted (`DiscussionHost::close_thread`) to keep that separation from
+//! collapsing back into one undifferentiated list.
 //!
 //! Each poll cycle starts a *fresh* `claude` session rather than resuming a previous
 //! one (a human's next reply may come hours later, well past a SweBot restart) --
@@ -24,22 +27,19 @@ use super::{
     transcript_up_to,
 };
 use crate::agent::AgentBackend;
-use crate::config::{EffectiveConfig, RepoProvider};
-use crate::repo_host::RepoHost;
+use crate::config::EffectiveConfig;
+use crate::repo_host::DiscussionHost;
 use crate::tracker::TrackerAdapter;
 use std::path::Path;
 
 pub async fn poll_once(
     cfg: &EffectiveConfig,
-    host: &dyn RepoHost,
+    host: &dyn DiscussionHost,
+    selector: &str,
     backend: &dyn AgentBackend,
     shared_clone_dir: &Path,
     tracker: &dyn TrackerAdapter,
 ) -> Result<(), String> {
-    let selector = match host.provider_kind() {
-        RepoProvider::Github => &cfg.swebot.drafting_discussion_category,
-        RepoProvider::Gitlab => &cfg.swebot.drafting_label,
-    };
     let threads = host.list_swebot_threads(selector).await?;
 
     for thread in threads {
@@ -251,9 +251,16 @@ mod tests {
             LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path(), &tracker)
-            .await
-            .unwrap();
+        poll_once(
+            &cfg,
+            &host,
+            &cfg.swebot.drafting_discussion_category,
+            &backend,
+            dir.path(),
+            &tracker,
+        )
+        .await
+        .unwrap();
 
         let created = tracker
             .fetch_issues_by_states(&["todo".to_string()])
@@ -335,8 +342,15 @@ mod tests {
             LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
         let dir = tempfile::tempdir().unwrap();
 
-        poll_once(&cfg, &host, &backend, dir.path(), &tracker)
-            .await
-            .unwrap();
+        poll_once(
+            &cfg,
+            &host,
+            &cfg.swebot.drafting_label,
+            &backend,
+            dir.path(),
+            &tracker,
+        )
+        .await
+        .unwrap();
     }
 }

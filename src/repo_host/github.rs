@@ -12,7 +12,7 @@
 //! of this codebase's GitHub calls.
 
 use super::{
-    DiscussionComment, DiscussionThread, RepoHost, ReviewOutcome, ReviewVerdict,
+    DiscussionComment, DiscussionHost, DiscussionThread, RepoHost, ReviewOutcome, ReviewVerdict,
     SymphonyPullRequest,
 };
 use crate::config::{RepoConfig, RepoProvider};
@@ -433,7 +433,10 @@ impl RepoHost for GithubRepoHost {
             Err(e) => Err(e),
         }
     }
+}
 
+#[async_trait]
+impl DiscussionHost for GithubRepoHost {
     /// Discussions in `selector` (a category name, e.g. `"Q&A"`, `"Ideas"`),
     /// newest-updated first, each with up to its first 50 comments. Filtering by
     /// category happens client-side against the category's `name` rather than

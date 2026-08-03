@@ -21,7 +21,7 @@
 //!   matching -- GitLab's exact wording is less version-stable than GitHub's.
 
 use super::{
-    DiscussionComment, DiscussionThread, RepoHost, ReviewOutcome, ReviewVerdict,
+    DiscussionComment, DiscussionHost, DiscussionThread, RepoHost, ReviewOutcome, ReviewVerdict,
     SymphonyPullRequest,
 };
 use crate::config::{RepoConfig, RepoProvider};
@@ -411,7 +411,10 @@ impl RepoHost for GitlabRepoHost {
             }
         }
     }
+}
 
+#[async_trait]
+impl DiscussionHost for GitlabRepoHost {
     /// Issues carrying `selector` (a label, e.g. `"swebot::question"`), open, newest
     /// 25 -- same "not expected to matter at realistic conversation volumes"
     /// pragmatism `github::GithubRepoHost::list_swebot_threads` documents. Each
