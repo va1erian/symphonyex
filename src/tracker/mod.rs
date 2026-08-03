@@ -2,6 +2,7 @@
 
 pub mod depends_on;
 pub mod github;
+pub mod gitlab;
 pub mod local;
 
 use crate::domain::Issue;
@@ -119,8 +120,9 @@ pub fn build(
             workflow_dir,
         )?)),
         "github" => Ok(Box::new(github::GithubTrackerAdapter::new(provider)?)),
+        "gitlab" => Ok(Box::new(gitlab::GitlabTrackerAdapter::new(provider)?)),
         other => Err(TrackerError::UnsupportedTrackerKind(other.to_string())),
     }
 }
 
-pub const SUPPORTED_TRACKER_KINDS: &[&str] = &["local", "github"];
+pub const SUPPORTED_TRACKER_KINDS: &[&str] = &["local", "github", "gitlab"];

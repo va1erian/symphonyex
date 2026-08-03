@@ -1,7 +1,8 @@
-//! SweBot: answers questions and drafts tickets in GitHub Discussions, and reviews
-//! the pull requests Symphony's coding agents open. GitHub-specific for v1 (see
-//! `config::SwebotConfig`'s doc comment for why), keyed off `repo:` rather than the
-//! tracker so it works the same regardless of `tracker.kind`.
+//! SweBot: answers questions and drafts tickets, and reviews the pull/merge requests
+//! Symphony's coding agents open. Works against either GitHub or GitLab (see
+//! `config::SwebotConfig`'s doc comment for how the Q&A/drafting conversational
+//! surface differs per provider), keyed off `repo:` rather than the tracker so it
+//! works the same regardless of `tracker.kind`.
 //!
 //! Runs as an additional task inside the *same* orchestrator process (spawned from
 //! `orchestrator::run` when `cfg.swebot.enabled`), sharing its polling cadence and the
@@ -21,7 +22,7 @@ pub mod review;
 use crate::agent::claude::ClaudeBackend;
 use crate::agent::{AgentEvent, AgentSession, TurnOutcome};
 use crate::config::EffectiveConfig;
-use crate::repo_host::{DiscussionThread, GithubRepoHost};
+use crate::repo_host::{self, DiscussionThread};
 use crate::tracker::TrackerAdapter;
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,7 +126,7 @@ const DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
 /// A `ClaudeBackend` configured the same way ticket dispatch's is (same command,
 /// model, timeout) but with file-mutating tools explicitly disallowed and no MCP
 /// tool wiring -- SweBot's drivers parse each turn's text/JSON response themselves
-/// and act via `GithubRepoHost`/`TrackerAdapter` directly, rather than routing
+/// and act via `RepoHost`/`TrackerAdapter` directly, rather than routing
 /// through an agent-invoked tool call the way ticket dispatch's `update_issue_state`
 /// does (that plumbing exists for a long tool-using coding session; SweBot's turns
 /// are single-shot conversational exchanges, so parsing the final response is enough).
@@ -215,10 +216,10 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
         );
         return;
     };
-    let host = match GithubRepoHost::new(&swebot_repo) {
+    let host = match repo_host::build(&swebot_repo) {
         Ok(h) => h,
         Err(e) => {
-            tracing::error!(error = %e, "swebot: failed to build GithubRepoHost, not starting");
+            tracing::error!(error = %e, "swebot: failed to build repo host, not starting");
             return;
         }
     };
@@ -231,18 +232,23 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
         if let Err(e) = git::ensure_shared_clone(&swebot_repo, &shared_clone_dir).await {
             tracing::warn!(error = %e, "swebot: failed to refresh shared clone; Q&A/drafting will retry next cycle");
         } else {
-            if let Err(e) = qa::poll_once(&cfg, &host, &backend, &shared_clone_dir).await {
+            if let Err(e) = qa::poll_once(&cfg, host.as_ref(), &backend, &shared_clone_dir).await {
                 tracing::warn!(error = %e, "swebot: Q&A poll failed");
             }
-            if let Err(e) =
-                drafting::poll_once(&cfg, &host, &backend, &shared_clone_dir, tracker.as_ref())
-                    .await
+            if let Err(e) = drafting::poll_once(
+                &cfg,
+                host.as_ref(),
+                &backend,
+                &shared_clone_dir,
+                tracker.as_ref(),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "swebot: drafting poll failed");
             }
         }
         if cfg.swebot.review_enabled
-            && let Err(e) = review::poll_once(&cfg, &host, &backend, tracker.as_ref()).await
+            && let Err(e) = review::poll_once(&cfg, host.as_ref(), &backend, tracker.as_ref()).await
         {
             tracing::warn!(error = %e, "swebot: review poll failed");
         }

@@ -4,6 +4,10 @@
 //! `Depends-On: #N` line in the issue body instead of a YAML field) gets the exact
 //! same "AND dispatchable with every dependency being done, populate blocked_by"
 //! semantics rather than a second, possibly-diverging implementation.
+//!
+//! `parse_depends_on` below (the `Depends-On:` line scanner itself) is likewise shared
+//! -- `github.rs` and `gitlab.rs` both source `depends_on` from an issue body line
+//! rather than a native field, and the `#12, #45` syntax is identical on both hosts.
 
 use crate::domain::{BlockerRef, Issue};
 use std::collections::HashMap;
@@ -12,6 +16,28 @@ use std::collections::HashMap;
 pub struct RawIssue {
     pub issue: Issue,
     pub depends_on: Vec<String>,
+}
+
+/// Extract `#12`/`#45`-style issue numbers from a case-insensitive `Depends-On:` line
+/// in an issue body. Shared by `github.rs` and `gitlab.rs` -- neither host has a
+/// native blocking-dependency field reachable via plain REST, so both source it from
+/// this same body-text convention.
+pub fn parse_depends_on(body: &str) -> Vec<String> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.to_lowercase().strip_prefix("depends-on:").map(|_| {
+            trimmed[trimmed.find(':').map(|i| i + 1).unwrap_or(trimmed.len())..].to_string()
+        }) else {
+            continue;
+        };
+        return rest
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|tok| tok.trim().strip_prefix('#'))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// `(some caller-chosen key, parsed issue or an error describing why it didn't parse)`.
@@ -144,6 +170,18 @@ mod tests {
             .unwrap();
         assert!(down.dispatchable);
         assert!(down.blocked_by.is_empty());
+    }
+
+    #[test]
+    fn parses_depends_on_line() {
+        assert_eq!(
+            parse_depends_on("Some text\nDepends-On: #12, #45\nmore text"),
+            vec!["12".to_string(), "45".to_string()]
+        );
+        assert_eq!(
+            parse_depends_on("no dependency line here"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

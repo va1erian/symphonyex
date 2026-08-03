@@ -1,22 +1,29 @@
-//! PR-review capability: reviews the pull requests Symphony's own coding agents open
-//! (branch name matching `issue-<identifier>`, the same convention
-//! `synthesize_repo_hooks`/`open_pull_request` produce -- not every PR a human might
-//! open by hand) and posts an approve/request-changes/comment verdict.
+//! PR/MR-review capability: reviews the pull/merge requests Symphony's own coding
+//! agents open (branch name matching `issue-<identifier>`, the same convention
+//! `synthesize_repo_hooks`/`open_pull_request` produce -- not every PR/MR a human
+//! might open by hand) and posts an approve/request-changes/comment verdict.
 //!
 //! Never merges: a human always does that (confirmed product decision -- see
-//! README.md "SweBot"). Idempotent per commit: `GithubRepoHost::has_reviewed_sha`
-//! skips a PR whose current head has already been reviewed, so a poll cycle only
-//! reviews an unreviewed PR once and re-reviews only after the branch actually moves.
+//! README.md "SweBot"). Idempotent per commit: `RepoHost::has_reviewed_sha` skips a
+//! PR/MR whose current head has already been reviewed, so a poll cycle only reviews
+//! an unreviewed one once and re-reviews only after the branch actually moves.
+//!
+//! Self-approval fallback (a host refusing to let the reviewing identity approve a
+//! PR/MR it also authored) is handled inside each `RepoHost` impl, not here --
+//! GitHub's and GitLab's rejection shapes differ enough (see
+//! `repo_host::gitlab::GitlabRepoHost::post_pr_review`'s doc comment) that this
+//! driver only needs to log whatever `ReviewOutcome::posted_as` comes back, not
+//! provider-specific error text.
 
 use super::{PERSONA, extract_json_block, git, run_turn_collect_text};
 use crate::agent::AgentBackend;
 use crate::config::EffectiveConfig;
-use crate::repo_host::{GithubRepoHost, extract_closes_issue_number};
+use crate::repo_host::{RepoHost, ReviewVerdict, extract_closes_issue_number};
 use crate::tracker::TrackerAdapter;
 
 pub async fn poll_once(
     cfg: &EffectiveConfig,
-    host: &GithubRepoHost,
+    host: &dyn RepoHost,
     backend: &dyn AgentBackend,
     tracker: &dyn TrackerAdapter,
 ) -> Result<(), String> {
@@ -111,51 +118,26 @@ pub async fn poll_once(
 
         let parsed = extract_json_block(&raw)
             .map_err(|e| format!("PR #{}: {e} (raw response: {raw})", pr.number))?;
-        let verdict = parsed
-            .get("verdict")
-            .and_then(|v| v.as_str())
-            .unwrap_or("comment");
+        let verdict = match parsed.get("verdict").and_then(|v| v.as_str()) {
+            Some("approve") => ReviewVerdict::Approve,
+            Some("request_changes") => ReviewVerdict::RequestChanges,
+            _ => ReviewVerdict::Comment,
+        };
         let summary = parsed
             .get("summary")
             .and_then(|v| v.as_str())
             .unwrap_or("(no summary provided)");
-        let event = match verdict {
-            "approve" => "APPROVE",
-            "request_changes" => "REQUEST_CHANGES",
-            _ => "COMMENT",
-        };
 
-        match host
-            .post_pr_review(pr.number, &pr.head_sha, event, summary)
+        let outcome = host
+            .post_pr_review(pr.number, &pr.head_sha, verdict, summary)
             .await
-        {
-            Ok(()) => {
-                tracing::info!(pr = pr.number, url = %pr.html_url, verdict, "swebot: posted PR review");
-            }
-            // GitHub refuses to let an account approve its own pull request. When
-            // the same token authenticates both the coding agent (PR author) and
-            // SweBot (reviewer) -- the default when `swebot.token` isn't set, see
-            // `config::EffectiveConfig::swebot_repo_config` -- an "approve" verdict
-            // always hits this. Falling back to a plain comment with the same
-            // reasoning means the review still gets posted and recorded
-            // (has_reviewed_sha becomes true), rather than retrying and 422ing again
-            // on every single poll forever -- a real failure mode hit running this
-            // live: it silently burned a full review turn on every cycle with
-            // nothing ever actually landing. Setting `swebot.token` to a second
-            // GitHub identity avoids hitting this fallback at all.
-            Err(e) if event == "APPROVE" && e.contains("Can not approve your own pull request") => {
-                let note = format!(
-                    "(SweBot would approve this, but GitHub doesn't allow approving your own \
-                     pull request -- the coding agent and SweBot are using the same token \
-                     here. Posting as a comment instead. Set `swebot.token` to a separate \
-                     GitHub identity to avoid this.)\n\n{summary}"
-                );
-                host.post_pr_review(pr.number, &pr.head_sha, "COMMENT", &note)
-                    .await?;
-                tracing::info!(pr = pr.number, url = %pr.html_url, verdict, "swebot: posted PR review (as comment -- self-approval not permitted)");
-            }
-            Err(e) => return Err(format!("PR #{}: {e}", pr.number)),
-        }
+            .map_err(|e| format!("PR #{}: {e}", pr.number))?;
+        tracing::info!(
+            pr = pr.number,
+            url = %pr.html_url,
+            verdict = ?outcome.posted_as,
+            "swebot: posted PR review"
+        );
     }
     Ok(())
 }
@@ -164,7 +146,7 @@ pub async fn poll_once(
 mod tests {
     use super::*;
     use crate::config::{self, RepoConfig};
-    use crate::repo_host::GithubRepoHost;
+    use crate::repo_host::github::GithubRepoHost;
     use crate::swebot::test_support::FakeBackend;
     use crate::tracker::local::LocalTrackerAdapter;
     use serde_json::json;
@@ -235,6 +217,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REVIEW_TOKEN".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri())
@@ -475,5 +458,69 @@ mod tests {
         poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
 
         assert!(backend.prompts_seen.lock().unwrap().is_empty());
+    }
+
+    fn test_gitlab_host(server: &MockServer) -> crate::repo_host::gitlab::GitlabRepoHost {
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_REVIEW_GITLAB_TOKEN", "t");
+        }
+        crate::repo_host::gitlab::GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/owner/name.git".to_string(),
+            provider: crate::config::RepoProvider::Gitlab,
+            api_base_url: Some(server.uri()),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REVIEW_GITLAB_TOKEN".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// End-to-end through `poll_once`: an unreviewed MR gets approved, which on
+    /// GitLab means both the `/approve` call *and* a marker note land (see
+    /// `repo_host::gitlab::GitlabRepoHost::post_pr_review`'s doc comment for why
+    /// approve alone isn't enough -- it carries no text field `has_reviewed_sha`
+    /// could scan later).
+    #[tokio::test]
+    async fn gitlab_reviews_an_unreviewed_mr_and_approves_it() {
+        let origin = real_repo_with_a_ticket_branch();
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/projects/owner%2Fname/merge_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+                "iid": 42, "web_url": "https://gitlab.com/owner/name/-/merge_requests/42",
+                "description": "no closes reference here",
+                "source_branch": "issue-42", "sha": "fakesha123"
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/owner%2Fname/merge_requests/42/notes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/projects/owner%2Fname/merge_requests/42/approve"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/projects/owner%2Fname/merge_requests/42/notes"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg(origin.path());
+        let host = test_gitlab_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"verdict\": \"approve\", \"summary\": \"Looks correct and well-tested.\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+
+        poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
     }
 }
