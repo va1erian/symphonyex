@@ -26,8 +26,12 @@ use std::path::PathBuf;
 
 /// Symphony: orchestrates coding agents against a configured issue tracker.
 /// See SPEC.md for the full specification this implements.
+///
+/// `version`: baked in by `build.rs` as `<Cargo.toml version> (<branch>@<short-sha>)` --
+/// plain `CARGO_PKG_VERSION` alone can't tell two worktrees of this repo on different
+/// branches apart, which is exactly the confusion `--version`/`-V` exists to resolve.
 #[derive(Parser)]
-#[command(name = "symphony")]
+#[command(name = "symphony", version = env!("SYMPHONY_VERSION"))]
 struct Cli {
     /// Path to WORKFLOW.md. Defaults to ./WORKFLOW.md (Section 5.1).
     workflow_path: Option<PathBuf>,
