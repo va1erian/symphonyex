@@ -329,19 +329,19 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let importance_toggle = if include_low_importance {
         format!(
             r#"<a href="{}">Hide low-importance (e.g. streaming heartbeats)</a>"#,
-            events_link(&q, offset, Some("normal"), base)
+            events_link(&q, offset, Some("normal"), None, base)
         )
     } else {
         format!(
             r#"<a href="{}">Show all (incl. low-importance)</a>"#,
-            events_link(&q, offset, Some("all"), base)
+            events_link(&q, offset, Some("all"), None, base)
         )
     };
 
     let prev = if offset > 0 {
         format!(
             r#"<a href="{}">&larr; Newer</a>"#,
-            events_link(&q, (offset - limit).max(0), None, base)
+            events_link(&q, (offset - limit).max(0), None, None, base)
         )
     } else {
         String::new()
@@ -349,21 +349,28 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let next = if rows.len() as i64 == limit {
         format!(
             r#"<a href="{}">Older &rarr;</a>"#,
-            events_link(&q, offset + limit, None, base)
+            events_link(&q, offset + limit, None, None, base)
         )
     } else {
         String::new()
     };
+    let event_types = eventlog::distinct_event_types(&state.eventlog_db_path()).unwrap_or_default();
+    let type_options: String = event_types
+        .iter()
+        .map(|t| format!(r#"<option value="{}">"#, escape(t)))
+        .collect();
 
     let body = format!(
         r#"<form class="filters" method="get">
   <label for="f-issue">Issue</label>
   <input type="text" id="f-issue" name="issue" placeholder="issue id" value="{issue}">
   <label for="f-type">Type</label>
-  <input type="text" id="f-type" name="type" placeholder="event type" value="{event_type}">
+  <input type="text" id="f-type" name="type" placeholder="event type" value="{event_type}" list="event-types">
+  <datalist id="event-types">{type_options}</datalist>
   <button type="submit">Filter</button>
   {importance_toggle}
 </form>
+{chips}
 <div class="table-wrap">
 <table>
 <thead><tr><th data-sort>ID</th><th data-sort>Time</th><th data-sort>Issue</th><th data-sort>Session</th><th data-sort>Type</th><th>Message</th><th data-sort>Tokens</th></tr></thead>
@@ -375,7 +382,9 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
 <div class="pager">{prev} {next}</div>"#,
         issue = escape(q.issue.as_deref().unwrap_or("")),
         event_type = escape(q.event_type.as_deref().unwrap_or("")),
+        type_options = type_options,
         importance_toggle = importance_toggle,
+        chips = chips(&q, base),
         table_rows = table_rows,
         prev = prev,
         next = next,
@@ -383,19 +392,28 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     Html(page_shell("events", "/events", &body, "", base))
 }
 
+/// Which active filter a "clear" chip link should drop -- see `chips()` below.
+enum ClearFilter {
+    Issue,
+    Type,
+}
+
 fn events_link(
     q: &EventsQuery,
     offset: i64,
     importance_override: Option<&str>,
+    clear: Option<ClearFilter>,
     base: &str,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(issue) = &q.issue
+    if !matches!(clear, Some(ClearFilter::Issue))
+        && let Some(issue) = &q.issue
         && !issue.is_empty()
     {
         parts.push(format!("issue={}", urlencode(issue)));
     }
-    if let Some(t) = &q.event_type
+    if !matches!(clear, Some(ClearFilter::Type))
+        && let Some(t) = &q.event_type
         && !t.is_empty()
     {
         parts.push(format!("type={}", urlencode(t)));
@@ -406,6 +424,37 @@ fn events_link(
     }
     parts.push(format!("offset={offset}"));
     format!("{base}/events?{}", parts.join("&"))
+}
+
+/// Active-filter chips row: one chip per non-empty filter with a small "x" that links
+/// to the same page minus that one filter, plus a "clear all" link when more than one
+/// filter is active. Previously the only feedback that a filter was applied was the
+/// URL itself.
+fn chips(q: &EventsQuery, base: &str) -> String {
+    let mut items = Vec::new();
+    if let Some(issue) = q.issue.as_deref().filter(|s| !s.is_empty()) {
+        items.push(format!(
+            r#"<span class="chip">issue: {}<a href="{}" aria-label="clear issue filter">&times;</a></span>"#,
+            escape(issue),
+            events_link(q, 0, None, Some(ClearFilter::Issue), base)
+        ));
+    }
+    if let Some(t) = q.event_type.as_deref().filter(|s| !s.is_empty()) {
+        items.push(format!(
+            r#"<span class="chip">type: {}<a href="{}" aria-label="clear type filter">&times;</a></span>"#,
+            escape(t),
+            events_link(q, 0, None, Some(ClearFilter::Type), base)
+        ));
+    }
+    if items.is_empty() {
+        return String::new();
+    }
+    if items.len() > 1 {
+        items.push(format!(
+            r#"<span class="chip"><a href="{base}/events">clear all</a></span>"#
+        ));
+    }
+    format!(r#"<div class="chips">{}</div>"#, items.join(""))
 }
 
 fn event_row(r: &eventlog::EventRow, base: &str) -> String {
@@ -573,5 +622,36 @@ mod tests {
         };
         let html = event_row(&row, "");
         assert!(html.contains(">-<"));
+    }
+
+    #[test]
+    fn chips_empty_when_no_filters_active() {
+        let q = EventsQuery::default();
+        assert_eq!(chips(&q, ""), "");
+    }
+
+    #[test]
+    fn chips_shows_one_per_active_filter_and_clear_all_when_multiple() {
+        let q = EventsQuery {
+            issue: Some("42".to_string()),
+            event_type: Some("tool_call".to_string()),
+            ..Default::default()
+        };
+        let html = chips(&q, "/base");
+        assert!(html.contains("issue: 42"));
+        assert!(html.contains("type: tool_call"));
+        assert!(html.contains("clear all"));
+        assert!(html.contains("/base/events"));
+    }
+
+    #[test]
+    fn chips_omits_clear_all_when_only_one_filter_active() {
+        let q = EventsQuery {
+            issue: Some("42".to_string()),
+            ..Default::default()
+        };
+        let html = chips(&q, "");
+        assert!(html.contains("issue: 42"));
+        assert!(!html.contains("clear all"));
     }
 }

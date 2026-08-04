@@ -252,6 +252,17 @@ pub fn recent_events(
     rows.collect()
 }
 
+/// Distinct `event_type` values seen so far, most-recent-first -- feeds `/events`'s
+/// type filter `<datalist>` (`status.rs`) so an operator can pick from what's actually
+/// been recorded instead of guessing/misspelling a type name into a plain text box.
+pub fn distinct_event_types(db_path: &Path) -> rusqlite::Result<Vec<String>> {
+    let conn = open(db_path)?;
+    let mut stmt =
+        conn.prepare("SELECT event_type FROM events GROUP BY event_type ORDER BY MAX(id) DESC")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.collect()
+}
+
 pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
     let conn = open(db_path)?;
     conn.query_row(
@@ -371,6 +382,21 @@ mod tests {
         };
         let all = recent_events(&db, &all_filter, 50, 0).unwrap();
         assert_eq!(all.len(), 2, "{all:?}");
+    }
+
+    #[tokio::test]
+    async fn distinct_event_types_deduplicates_and_orders_most_recent_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "turn_started")).unwrap();
+        insert(&conn, &new_event("2", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "tool_call")).unwrap();
+        drop(conn);
+
+        let types = distinct_event_types(&db).unwrap();
+        assert_eq!(types, vec!["tool_call", "dispatched", "turn_started"]);
     }
 
     #[tokio::test]
