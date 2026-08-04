@@ -253,6 +253,32 @@ fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("could not parse a JSON object from the response: {e}"))
 }
 
+/// Every fenced ```json ... ``` block in `text`, each parsed independently -- a
+/// ticket-drafting turn may propose *several* tickets in one response (one block
+/// per ticket), and `extract_json_block`'s `rfind` only ever sees the last one,
+/// silently dropping every ticket but the last (the bug this exists to fix). Falls
+/// back to `extract_json_block`'s single bare-JSON behavior when no fence is found
+/// at all. A block that fails to parse is skipped rather than failing the whole
+/// turn -- one malformed ticket shouldn't sink the others.
+fn extract_json_blocks(text: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(idx) = rest.find("```json") {
+        rest = &rest[idx + "```json".len()..];
+        let candidate = rest.trim_start();
+        let mut de = serde_json::Deserializer::from_str(candidate);
+        if let Ok(v) = serde::Deserialize::deserialize(&mut de) {
+            out.push(v);
+        }
+    }
+    if out.is_empty() {
+        if let Ok(v) = extract_json_block(text) {
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Entry point spawned by `orchestrator::run` when `cfg.swebot.enabled`. Loops
 /// forever at the same cadence as ticket dispatch (`polling.interval_ms`); each
 /// capability's own poll failure is logged and doesn't stop the others or the next
@@ -585,5 +611,33 @@ mod tests {
         let v = extract_json_block(text).unwrap();
         assert_eq!(v["ready"], serde_json::json!(true));
         assert!(v["body"].as_str().unwrap().contains("fn f() {}"));
+    }
+
+    /// Regression test for the reported bug: a response drafting several tickets at
+    /// once put multiple ```json blocks in one message, and `extract_json_block`'s
+    /// `rfind` only ever surfaced the last one, so only the last ticket got created.
+    #[test]
+    fn extract_json_blocks_parses_every_fenced_block_not_just_the_last() {
+        let text = "Here are three tickets.\n\n\
+                     ```json\n{\"ready\": true, \"title\": \"one\"}\n```\n\n\
+                     ```json\n{\"ready\": true, \"title\": \"two\"}\n```\n\n\
+                     ```json\n{\"ready\": true, \"title\": \"three\"}\n```\n";
+        let v = extract_json_blocks(text);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0]["title"], serde_json::json!("one"));
+        assert_eq!(v[1]["title"], serde_json::json!("two"));
+        assert_eq!(v[2]["title"], serde_json::json!("three"));
+    }
+
+    #[test]
+    fn extract_json_blocks_falls_back_to_bare_json_when_no_fence_is_found() {
+        let v = extract_json_blocks("{\"ready\": true, \"title\": \"x\"}");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["title"], serde_json::json!("x"));
+    }
+
+    #[test]
+    fn extract_json_blocks_returns_empty_on_malformed_output() {
+        assert!(extract_json_blocks("just some prose, no JSON at all").is_empty());
     }
 }
