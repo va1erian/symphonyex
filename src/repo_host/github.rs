@@ -493,8 +493,9 @@ impl RepoHost for GithubRepoHost {
             "{}/repos/{}/{}/pulls/{pr_number}/reviews",
             self.base_url, self.owner, self.repo
         );
+        let req = self.client.get(&url).query(&[("per_page", "100")]);
         let resp = self
-            .auth_headers(self.client.get(&url))
+            .auth_headers(req)
             .send()
             .await
             .map_err(|e| e.to_string())?;

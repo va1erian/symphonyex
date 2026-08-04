@@ -403,25 +403,26 @@ impl ChatStore {
     /// Mark delivered assistant messages as read (the web UI calls this once the
     /// browser has actually shown them). Only touches assistant rows still in a
     /// deliverable state, so an already-read message isn't re-flagged.
-    pub fn mark_read(&self, ids: &[i64]) -> Result<(), ChatError> {
+    pub fn mark_read(&self, conversation_id: i64, ids: &[i64]) -> Result<(), ChatError> {
         if ids.is_empty() {
             return Ok(());
         }
         let now = chrono::Utc::now().to_rfc3339();
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+        let placeholders: Vec<String> = (2..=ids.len() + 1).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "UPDATE messages SET status='{read}', read_at=?{n} \
-             WHERE role='assistant' AND status IN ('sent','streaming') \
+            "UPDATE messages SET status='{read}', read_at=?1 \
+             WHERE conversation_id=?{conv_n} AND role='assistant' AND status IN ('sent','streaming') \
              AND id IN ({})",
             placeholders.join(","),
             read = STATUS_READ,
-            n = ids.len() + 1,
+            conv_n = ids.len() + 2,
         );
         let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        vals.push(Box::new(now.to_owned()));
         for id in ids {
             vals.push(Box::new(id.to_owned()));
         }
-        vals.push(Box::new(now.to_owned()));
+        vals.push(Box::new(conversation_id));
         let c = self.conn()?;
         c.execute(&sql, rusqlite::params_from_iter(vals.iter().map(|b| &**b)))?;
         Ok(())
@@ -831,7 +832,7 @@ mod tests {
         let sent_user = s
             .insert_message(c, ROLE_USER, "question", STATUS_PROCESSED, &json!({}), None)
             .unwrap();
-        s.mark_read(&[a, sent_user]).unwrap();
+        s.mark_read(c, &[a, sent_user]).unwrap();
         let msgs = s.messages_of_conversation(c, 0).unwrap();
         let assistant = msgs.iter().find(|m| m.id == a).unwrap();
         assert_eq!(assistant.status, STATUS_READ);
