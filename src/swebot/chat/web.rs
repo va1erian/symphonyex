@@ -341,6 +341,23 @@ function md(raw) {
   s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Shield the anchors the line above just created before auto-linking bare URLs
+  // below, or a `[text](url)` link's own URL (appearing again inside its now-set
+  // href="...") would get wrapped a second time, nesting an <a> inside its own href.
+  s = s.replace(/<a [^>]*>[^<]*<\/a>/g, (tag) => {
+    blocks.push(tag);
+    return "\x00" + (blocks.length - 1) + "\x00";
+  });
+  // Auto-link anything else that looks like a bare URL (no markdown [text](url)
+  // wrapper) -- e.g. a link pasted straight into the chat.
+  s = s.replace(/https?:\/\/[^\s<>"]+/g, (url) => {
+    // Trim common trailing punctuation a sentence would leave stuck to the URL
+    // (".", ",", ")", etc.) so "see https://x.com." doesn't link-wrap the period.
+    const trailing = url.match(/[.,;:!?)]+$/);
+    const clean = trailing ? url.slice(0, -trailing[0].length) : url;
+    const rest = trailing ? trailing[0] : "";
+    return '<a href="' + clean + '" target="_blank" rel="noopener">' + clean + "</a>" + rest;
+  });
   s = s.replace(/(?:^|\n)((?:[-*] .*(?:\n|$))+)/g, (m) => {
     const items = m.trim().split("\n").map((l) => "<li>" + l.replace(/^[-*] /, "") + "</li>").join("");
     return "\n<ul>" + items + "</ul>";

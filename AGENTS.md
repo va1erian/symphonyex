@@ -717,23 +717,40 @@ back, an issue never leaves its active state, so the orchestrator just keeps
 redispatching it forever (continuation retries) once the agent thinks it's done.
 
 `LocalTrackerAdapter` fixes this by exposing one provider-native tool,
-`update_issue_state({state})`. The wiring (`claude`-backend only):
+`update_issue_state({state})`. The wiring (`claude` and `opencode` backends):
 
 1. `TrackerAdapter` has two default (opt-in) methods, `agent_tool_specs()` and
    `execute_agent_tool()` — an adapter with nothing to expose just doesn't override
    them (Section 10.5's `agent_tool_specs()` / `execute_agent_tool()` hooks).
-2. If the active adapter returns any specs, `ClaudeSession::start_session` writes a
-   `--mcp-config` file into the workspace pointing back at **this same `symphony`
-   binary**, run as `symphony __mcp_tool_server --tracker-kind ... --issue-id ...` (a
-   hidden subcommand; see `src/mcp.rs`). `claude` spawns that as its own MCP server
-   subprocess whenever the model calls the tool.
+2. If the active adapter returns any specs, `start_session` wires an MCP server
+   pointing back at **this same `symphony` binary**, run as
+   `symphony __mcp_tool_server --tracker-kind ... --issue-id ...` (a hidden
+   subcommand; see `src/mcp.rs`). How that wiring reaches the agent CLI differs per
+   backend, since neither exposes an equivalent flag:
+   - `claude`: `ClaudeSession::start_session` writes a `--mcp-config` file into the
+     workspace and passes `--mcp-config <file> --strict-mcp-config`.
+   - `opencode`: has no per-invocation config flag, only config-file discovery, but
+     does have `OPENCODE_CONFIG_CONTENT` (inline config content via env var) as its
+     own escape hatch for exactly this — `mcp_config_env` (`src/agent/opencode.rs`)
+     sets it to a `{"mcp": {"symphony": {"type": "local", "command": [...]}}}` blob.
+     Confirmed against opencode's own docs: config layers (global/project/env-var
+     inline) *deep-merge*, they don't replace each other, so this never disturbs the
+     separately-baked-in provider config (e.g. the image's own Fireworks setup) —
+     the inline blob only ever adds the `mcp` key.
+   Either way, the agent CLI spawns that command as its own MCP server subprocess
+   whenever the model calls the tool.
 3. That subprocess rebuilds the tracker adapter from the same config and executes the
-   write itself — the `claude` agent process never touches `issues/*.md` directly. This
+   write itself — the coding agent process never touches `issues/*.md` directly. This
    matches the spec's tracker-write boundary (Section 11.5): mutations happen host-side,
    through the adapter, not via raw agent file access.
-4. The tool is always auto-approved (`--allowedTools mcp__symphony__*`,
-   `--strict-mcp-config`) independent of `claude.permission_mode`, since it's
-   host-mediated and scoped to exactly one tool.
+4. The tool is always auto-approved independent of `claude.permission_mode`/
+   `opencode`'s own permission config, since it's host-mediated and scoped to exactly
+   one tool: `claude` via `--allowedTools mcp__symphony__* --strict-mcp-config`;
+   `opencode` has no equivalent allowlist flag, but `--auto` (its own high-trust
+   default, see above) already approves every tool call, MCP included, and a
+   restricted `OPENCODE_PERMISSION` deny-rule (SweBot's own sessions) only ever
+   targets `edit`/`write`/`patch`, not MCP tool calls, so this reaches the same
+   effective posture without needing one.
 
 `codex` doesn't get this wiring yet — Codex's own dynamic-tool-call mechanism
 (Section 10.5) would need separate plumbing in the (already best-effort) Codex client.

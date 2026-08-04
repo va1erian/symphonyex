@@ -231,6 +231,7 @@ fn build_restricted_backend(cfg: &EffectiveConfig) -> Option<Box<dyn AgentBacken
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
             permission_config: Some(DISALLOWED_OPENCODE_PERMISSION.to_string()),
+            mcp_wiring: None,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
         AgentBackendKind::Codex => {

@@ -209,6 +209,7 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
             permission_config: None,
+            mcp_wiring,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
     };
