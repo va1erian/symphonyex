@@ -31,6 +31,7 @@ pub use github::{fetch_file, parse_github_owner_repo};
 use crate::config::{RepoConfig, RepoProvider};
 use crate::tracker::{ToolResult, ToolSpec};
 use async_trait::async_trait;
+use std::path::Path;
 
 /// The verdict SweBot's review driver (`swebot::review`) asks a host to post.
 /// Provider-agnostic: `RequestChanges` has no formal counterpart on GitLab core (see
@@ -90,13 +91,19 @@ pub trait DiscussionHost: Send + Sync {
 pub trait RepoHost: DiscussionHost {
     fn provider_kind(&self) -> RepoProvider;
 
-    // --- PR/MR automation (repo.pull_request) ---
+    // --- PR/MR automation (repo.pull_request), and evidence attachment
+    // (repo.evidence) -- both routed through the same tool-name dispatch. `workspace_dir`
+    // is this turn's workspace path exactly as seen by the `__mcp_tool_server` process
+    // itself (the in-container path in Docker mode, the host path otherwise -- mirroring
+    // `--workflow-dir`'s own container-aware resolution), needed only by `attach_evidence`
+    // to resolve the agent-supplied image path; every other tool ignores it.
     fn agent_tool_specs(&self) -> Vec<ToolSpec>;
     async fn execute_agent_tool(
         &self,
         name: &str,
         arguments: serde_json::Value,
         issue_id: &str,
+        workspace_dir: &Path,
     ) -> ToolResult;
 
     // --- SweBot: PR/MR review ---

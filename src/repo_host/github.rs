@@ -19,8 +19,10 @@ use crate::config::{RepoConfig, RepoProvider};
 use crate::tracker::{ToolResult, ToolSpec};
 use crate::workspace;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use std::path::Path;
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com";
 
@@ -32,6 +34,9 @@ pub struct GithubRepoHost {
     repo: String,
     token: String,
     default_branch: String,
+    /// `repo.evidence` -- whether `attach_evidence` should be offered alongside
+    /// `open_pull_request` (see `RepoConfig::evidence`'s own doc comment).
+    evidence: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +125,7 @@ impl GithubRepoHost {
             repo: name,
             token,
             default_branch: repo.default_branch.clone(),
+            evidence: repo.evidence,
         })
     }
 
@@ -196,6 +202,82 @@ impl GithubRepoHost {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 ToolResult::error(format!("PATCH {url} -> {status}: {text}"))
+            }
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
+    /// Upload a file the agent already produced somewhere inside its own workspace
+    /// (`image_path`, resolved against `workspace_dir` -- the workspace path exactly as
+    /// seen by this process, see `RepoHost::execute_agent_tool`'s doc comment) to this
+    /// repo's ticket branch via the Contents API, and hand back a ready-to-paste
+    /// markdown image snippet pointing at the committed file's `raw.githubusercontent.com`
+    /// URL. The repo path is content-hashed (`sha2`, already a dependency) rather than
+    /// reusing `image_path`'s own name verbatim: the Contents API's create-or-update
+    /// call requires the *existing* file's blob `sha` to update it, which would mean an
+    /// extra round-trip (or a stale-sha race) just to re-attach a same-named screenshot
+    /// across retries -- hashing the content into the path means every distinct
+    /// screenshot gets its own path and a plain create always succeeds, while an
+    /// identical retry harmlessly no-ops (GitHub is fine with re-creating a file whose
+    /// content already matches).
+    async fn attach_evidence(
+        &self,
+        workspace_dir: &Path,
+        image_path: &str,
+        caption: &str,
+        issue_id: &str,
+    ) -> ToolResult {
+        let full_path = workspace_dir.join(image_path);
+        let bytes = match tokio::fs::read(&full_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                return ToolResult::error(format!(
+                    "could not read image at '{image_path}' (resolved to {}): {e}",
+                    full_path.display()
+                ));
+            }
+        };
+        let file_name = Path::new(image_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("evidence.png");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        let short_hash = digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let branch = format!("issue-{}", workspace::derive_workspace_key(issue_id));
+        let repo_path = format!(
+            ".symphony/evidence/{}/{short_hash}-{file_name}",
+            workspace::derive_workspace_key(issue_id)
+        );
+        let url = format!(
+            "{}/repos/{}/{}/contents/{repo_path}",
+            self.base_url, self.owner, self.repo
+        );
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let req = self.client.put(&url).json(&json!({
+            "message": format!("Attach evidence: {caption}"),
+            "content": content_b64,
+            "branch": branch,
+        }));
+        match self.auth_headers(req).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let raw_url = format!(
+                    "https://raw.githubusercontent.com/{}/{}/{branch}/{repo_path}",
+                    self.owner, self.repo
+                );
+                ToolResult::ok(format!(
+                    "Evidence uploaded. Paste this into the pull request body to embed it:\n\n![{caption}]({raw_url})"
+                ))
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                ToolResult::error(format!(
+                    "PUT {url} -> {status}: {text} (has this branch been pushed yet?)"
+                ))
             }
             Err(e) => ToolResult::error(e.to_string()),
         }
@@ -280,7 +362,7 @@ impl RepoHost for GithubRepoHost {
     }
 
     fn agent_tool_specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
+        let mut specs = vec![ToolSpec {
             name: "open_pull_request".to_string(),
             description: "Open (or update, if one already exists) a pull request for this \
                 ticket's branch, with a title and a body describing the work and the \
@@ -306,7 +388,36 @@ impl RepoHost for GithubRepoHost {
                 },
                 "required": ["title", "body"]
             }),
-        }]
+        }];
+        if self.evidence {
+            specs.push(ToolSpec {
+                name: "attach_evidence".to_string(),
+                description: "Upload an image file you already saved somewhere inside this \
+                    workspace (e.g. a screenshot of the app running, taken with a headless \
+                    browser) to this pull request's branch, and get back a markdown image \
+                    snippet. Paste that snippet into the pull request body (open_pull_request's \
+                    'body' argument) so a reviewer can see the evidence directly instead of \
+                    taking your word for it. Call this before open_pull_request so the \
+                    snippet is ready to include; calling open_pull_request again afterwards \
+                    with an updated body works too."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "image_path": {
+                            "type": "string",
+                            "description": "Path to the image file, relative to this workspace's root"
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Short caption describing what the image shows"
+                        }
+                    },
+                    "required": ["image_path", "caption"]
+                }),
+            });
+        }
+        specs
     }
 
     async fn execute_agent_tool(
@@ -314,22 +425,35 @@ impl RepoHost for GithubRepoHost {
         name: &str,
         arguments: serde_json::Value,
         issue_id: &str,
+        workspace_dir: &Path,
     ) -> ToolResult {
-        if name != "open_pull_request" {
-            return ToolResult::error(format!("unsupported tool '{name}'"));
-        }
-        let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'title'");
-        };
-        let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'body'");
-        };
-        let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
+        match name {
+            "open_pull_request" => {
+                let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'title'");
+                };
+                let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'body'");
+                };
+                let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
 
-        match self.find_open_pr(&head).await {
-            Ok(Some(number)) => self.update_pr(number, title, body).await,
-            Ok(None) => self.create_pr(&head, title, body).await,
-            Err(e) => ToolResult::error(e),
+                match self.find_open_pr(&head).await {
+                    Ok(Some(number)) => self.update_pr(number, title, body).await,
+                    Ok(None) => self.create_pr(&head, title, body).await,
+                    Err(e) => ToolResult::error(e),
+                }
+            }
+            "attach_evidence" if self.evidence => {
+                let Some(image_path) = arguments.get("image_path").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'image_path'");
+                };
+                let Some(caption) = arguments.get("caption").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'caption'");
+                };
+                self.attach_evidence(workspace_dir, image_path, caption, issue_id)
+                    .await
+            }
+            _ => ToolResult::error(format!("unsupported tool '{name}'")),
         }
     }
 
@@ -711,6 +835,7 @@ mod tests {
                 "open_pull_request",
                 json!({"title": "t", "body": "b"}),
                 "42",
+                std::path::Path::new("."),
             )
             .await;
         assert!(result.success, "{}", result.content);
@@ -756,6 +881,7 @@ mod tests {
                 "open_pull_request",
                 json!({"title": "t2", "body": "b2"}),
                 "42",
+                std::path::Path::new("."),
             )
             .await;
         assert!(result.success, "{}", result.content);
@@ -796,10 +922,111 @@ mod tests {
                 "open_pull_request",
                 json!({"title": "t", "body": "b"}),
                 "42",
+                std::path::Path::new("."),
             )
             .await;
         assert!(!result.success);
         assert!(result.content.contains("No commits"));
+    }
+
+    #[tokio::test]
+    async fn attach_evidence_uploads_the_file_and_returns_a_markdown_image_snippet() {
+        let server = MockServer::start().await;
+        set_token("SYMPHONY_TEST_REPO_HOST_EVIDENCE_1", "t");
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/repos/owner/name/contents/\.symphony/evidence/.*$",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"content": {}})))
+            .mount(&server)
+            .await;
+
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_EVIDENCE_1".to_string()),
+            pull_request: true,
+            evidence: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri());
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("screenshot.png"), b"fake-png-bytes").unwrap();
+
+        let result = host
+            .execute_agent_tool(
+                "attach_evidence",
+                json!({"image_path": "screenshot.png", "caption": "App running"}),
+                "42",
+                workspace.path(),
+            )
+            .await;
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("![App running]"));
+        assert!(
+            result
+                .content
+                .contains("raw.githubusercontent.com/owner/name/issue-42/")
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_evidence_is_not_offered_or_executable_when_repo_evidence_is_off() {
+        set_token("SYMPHONY_TEST_REPO_HOST_EVIDENCE_2", "t");
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_EVIDENCE_2".to_string()),
+            pull_request: true,
+            evidence: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            !host
+                .agent_tool_specs()
+                .iter()
+                .any(|s| s.name == "attach_evidence")
+        );
+
+        let result = host
+            .execute_agent_tool(
+                "attach_evidence",
+                json!({"image_path": "screenshot.png", "caption": "App running"}),
+                "42",
+                std::path::Path::new("."),
+            )
+            .await;
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn attach_evidence_errors_clearly_when_the_image_file_is_missing() {
+        set_token("SYMPHONY_TEST_REPO_HOST_EVIDENCE_3", "t");
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_EVIDENCE_3".to_string()),
+            pull_request: true,
+            evidence: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        let result = host
+            .execute_agent_tool(
+                "attach_evidence",
+                json!({"image_path": "does-not-exist.png", "caption": "App running"}),
+                "42",
+                workspace.path(),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.content.contains("does-not-exist.png"));
     }
 
     #[test]
@@ -1075,6 +1302,6 @@ mod tests {
         assert_eq!(id, "C_99");
     }
 
-    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 }

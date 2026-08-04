@@ -81,6 +81,12 @@ enum Command {
         /// enabled -- see `agent::claude::McpToolWiring::repo_pr_json`.
         #[arg(long)]
         repo_pr: Option<String>,
+        /// This turn's workspace path exactly as seen by this process itself (the
+        /// in-container path in Docker mode, the host path otherwise) -- needed by
+        /// `attach_evidence` (`repo.evidence`) to resolve the agent-supplied image
+        /// path. Unused by every other tool.
+        #[arg(long)]
+        workspace_dir: PathBuf,
     },
 
     /// Run Symphony itself as a long-lived, auto-restarting, single-instance Docker
@@ -152,6 +158,7 @@ async fn main() -> std::process::ExitCode {
             workflow_dir,
             issue_id,
             repo_pr,
+            workspace_dir,
         }) => {
             return run_mcp_tool_server(
                 &tracker_kind,
@@ -159,6 +166,7 @@ async fn main() -> std::process::ExitCode {
                 &workflow_dir,
                 &issue_id,
                 repo_pr.as_deref(),
+                &workspace_dir,
             )
             .await;
         }
@@ -239,6 +247,7 @@ async fn run_mcp_tool_server(
     workflow_dir: &std::path::Path,
     issue_id: &str,
     repo_pr_json: Option<&str>,
+    workspace_dir: &std::path::Path,
 ) -> std::process::ExitCode {
     let provider: serde_yaml::Value = match serde_yaml::from_str(tracker_provider_json) {
         Ok(v) => v,
@@ -267,7 +276,7 @@ async fn run_mcp_tool_server(
         },
         None => None,
     };
-    match mcp::run_stdio_server(adapter, repo_host, issue_id).await {
+    match mcp::run_stdio_server(adapter, repo_host, issue_id, workspace_dir).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");

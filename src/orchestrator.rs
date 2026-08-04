@@ -166,8 +166,11 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
 
     let tracker_adapter = tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, workflow_dir)?;
     // `repo.pull_request` needs the MCP subprocess spawned to expose open_pull_request
-    // even when the tracker itself has no tools of its own (e.g. tracker.kind: local),
-    // since a PR is a property of repo: config, not of the tracker.
+    // (and, when `repo.evidence` is also on, attach_evidence too -- `config::resolve`
+    // already rejects `evidence: true` without `pull_request: true`, so gating on
+    // `pull_request` alone here is enough) even when the tracker itself has no tools of
+    // its own (e.g. tracker.kind: local), since these are properties of repo: config,
+    // not of the tracker.
     let repo_pr_json = cfg
         .repo
         .as_ref()

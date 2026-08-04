@@ -368,6 +368,43 @@ Off by default: this is a real behavior change (a live PR gets opened on the rea
 repo, and "done" no longer means what it used to), so a project opts in
 deliberately, same posture as `workspace.docker.mount_claude_credentials`.
 
+## Evidence collection
+
+`repo.evidence: true` (requires `repo.pull_request: true` -- there has to be a PR/MR
+to attach evidence to) exposes a second agent tool alongside `open_pull_request`:
+`attach_evidence({image_path, caption})`. The coding agent produces an image itself
+somewhere inside its own workspace -- typically a screenshot of the app it just built
+or changed, taken with whatever headless-browser tooling the project's own agent
+Docker image provides (nothing built into Symphony launches a browser; that's the
+project's job, same as `cargo test`/`npm test` already is) -- and calls the tool with
+the image's path (relative to the workspace root) and a short caption. The tool
+uploads the file to the ticket branch via the code host's contents API
+(`repo_host::github::GithubRepoHost::attach_evidence` /
+`repo_host::gitlab::GitlabRepoHost::attach_evidence`) at a content-hashed path under
+`.symphony/evidence/` (hashed, not the agent's own filename, so a same-named retry
+never collides with an existing blob and never needs that blob's `sha`/lock token to
+update it -- a plain create always succeeds) and returns a ready-to-paste markdown
+image snippet pointing at the committed file (`raw.githubusercontent.com` on GitHub, a
+`-/raw/<branch>/<path>` URL on GitLab). The agent pastes that snippet into
+`open_pull_request`'s `body` so a reviewer sees the working app directly instead of
+taking the agent's word for it.
+
+**Resolving the image path**: `attach_evidence` needs to read a file from whatever
+filesystem the `__mcp_tool_server` subprocess itself is running on -- the in-container
+path in Docker mode (since `claude`/`opencode` and their MCP subprocess all run inside
+the container there), the host path otherwise. This is threaded through as a new
+`--workspace-dir` argument to `__mcp_tool_server` (`main.rs`), computed with the same
+container-aware mapping `--workflow-dir` already uses
+(`claude::write_mcp_config`/`opencode::mcp_config_env`), and passed down through
+`mcp::run_stdio_server` into `RepoHost::execute_agent_tool`'s new `workspace_dir`
+parameter -- every tool but `attach_evidence` ignores it.
+
+Off by default, same posture as `repo.pull_request` itself: this commits a real file
+to the real repo. A project enabling this should also tell its agent, in its own
+`WORKFLOW.md` prompt, how to actually get a screenshot in the first place (start the
+app, point a headless browser at it, save a PNG) -- Symphony only handles getting that
+file from the workspace onto the PR/MR, not producing it.
+
 ## SweBot
 
 A software-engineering assistant with three capabilities, working against either

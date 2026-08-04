@@ -129,7 +129,7 @@ impl AgentBackend for OpenCodeBackend {
         let mcp_config_env = self
             .mcp_wiring
             .as_ref()
-            .map(|wiring| mcp_config_env(wiring, issue_id, container));
+            .map(|wiring| mcp_config_env(wiring, issue_id, workspace, container));
 
         Ok(Box::new(OpenCodeSession {
             command: self.command.clone(),
@@ -543,6 +543,7 @@ fn permission_env(config: Option<&str>) -> Option<(String, String)> {
 fn mcp_config_env(
     wiring: &McpToolWiring,
     issue_id: &str,
+    workspace: &Path,
     container: Option<&ContainerHandle>,
 ) -> (String, String) {
     let (command, workflow_dir_arg) = match container {
@@ -557,6 +558,16 @@ fn mcp_config_env(
             wiring.workflow_dir.to_string_lossy().to_string(),
         ),
     };
+    // Same container-aware mapping as `workflow_dir_arg` above (see
+    // `claude.rs::write_mcp_config`'s identical comment): the subprocess must see this
+    // path exactly as its own filesystem does.
+    let workspace_dir_arg = match container {
+        Some(c) => c
+            .to_container_path(&wiring.workflow_dir, workspace)
+            .to_string_lossy()
+            .to_string(),
+        None => workspace.to_string_lossy().to_string(),
+    };
     let mut argv = vec![
         command,
         "__mcp_tool_server".to_string(),
@@ -568,6 +579,8 @@ fn mcp_config_env(
         workflow_dir_arg,
         "--issue-id".to_string(),
         issue_id.to_string(),
+        "--workspace-dir".to_string(),
+        workspace_dir_arg,
     ];
     if let Some(repo_pr_json) = &wiring.repo_pr_json {
         argv.push("--repo-pr".to_string());
@@ -801,7 +814,7 @@ mod tests {
 
     #[test]
     fn mcp_config_env_wires_the_symphony_tool_server_on_the_host() {
-        let (key, value) = mcp_config_env(&test_wiring(), "42", None);
+        let (key, value) = mcp_config_env(&test_wiring(), "42", Path::new("/wf/ws-42"), None);
         assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
         let parsed: Value = serde_json::from_str(&value).unwrap();
         let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
@@ -822,7 +835,9 @@ mod tests {
                 "--workflow-dir",
                 "/wf",
                 "--issue-id",
-                "42"
+                "42",
+                "--workspace-dir",
+                "/wf/ws-42"
             ]
         );
         assert_eq!(parsed["mcp"]["symphony"]["type"], "local");
@@ -833,7 +848,7 @@ mod tests {
     fn mcp_config_env_includes_repo_pr_json_when_pull_request_is_enabled() {
         let mut wiring = test_wiring();
         wiring.repo_pr_json = Some(r#"{"url":"https://github.com/o/r.git"}"#.to_string());
-        let (_, value) = mcp_config_env(&wiring, "42", None);
+        let (_, value) = mcp_config_env(&wiring, "42", Path::new("/wf/ws-42"), None);
         let parsed: Value = serde_json::from_str(&value).unwrap();
         let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
         let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
@@ -850,7 +865,12 @@ mod tests {
             name: "symphony-abc-42".to_string(),
             container_root: PathBuf::from("/project"),
         };
-        let (_, value) = mcp_config_env(&test_wiring(), "42", Some(&container));
+        let (_, value) = mcp_config_env(
+            &test_wiring(),
+            "42",
+            Path::new("/wf/ws-42"),
+            Some(&container),
+        );
         let parsed: Value = serde_json::from_str(&value).unwrap();
         let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
         let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
@@ -858,6 +878,9 @@ mod tests {
         assert_eq!(argv[0], container::CONTAINER_SYMPHONY_BIN);
         let workflow_dir_idx = argv.iter().position(|a| *a == "--workflow-dir").unwrap() + 1;
         assert_eq!(argv[workflow_dir_idx], "/project");
+        let workspace_dir_idx = argv.iter().position(|a| *a == "--workspace-dir").unwrap() + 1;
+        // "/wf/ws-42" is under the workflow_dir "/wf" mapped to container_root "/project".
+        assert_eq!(argv[workspace_dir_idx], "/project/ws-42");
     }
 
     #[test]
