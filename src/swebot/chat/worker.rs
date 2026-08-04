@@ -35,7 +35,7 @@ use super::store::{
 };
 use crate::agent::{AgentBackend, AgentEvent, AgentSession, TurnOutcome};
 use crate::config::EffectiveConfig;
-use crate::swebot::{PERSONA, extract_json_block};
+use crate::swebot::{PERSONA, extract_json_blocks};
 use crate::tracker::TrackerAdapter;
 use serde_json::json;
 use std::path::Path;
@@ -275,82 +275,109 @@ async fn respond_to(
         .set_message_body(assistant_id, &raw)
         .map_err(|e| e.to_string())?;
 
-    // Drafting decision from the response's trailing JSON block, if present.
-    if let Ok(parsed) = extract_json_block(&raw) {
-        if let Some(ready) = parsed.get("ready").and_then(|r| r.as_bool()) {
-            if ready {
-                let title = parsed
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("Drafted ticket")
-                    .to_string();
-                let body = parsed
-                    .get("body")
-                    .and_then(|b| b.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                return finish_draft(
-                    cfg,
-                    tracker,
-                    store,
-                    assistant_id,
-                    &strip_json_block(&raw),
-                    &title,
-                    &body,
-                )
-                .await;
-            }
-            // Clarifying question / needs more info: make the actual question the
-            // visible body (drop the JSON scaffold).
-            if let Some(reply) = parsed.get("reply").and_then(|r| r.as_str())
-                && !reply.trim().is_empty()
-            {
-                store
-                    .set_message_body(assistant_id, reply.trim())
-                    .map_err(|e| e.to_string())?;
-            } else {
-                store
-                    .set_message_body(assistant_id, &strip_json_block(&raw))
-                    .map_err(|e| e.to_string())?;
-            }
-        } else {
-            store
-                .set_message_body(assistant_id, &strip_json_block(&raw))
-                .map_err(|e| e.to_string())?;
-        }
-    } else {
+    // Drafting decision from the response's trailing JSON block(s), if present -- a
+    // scoping turn can propose several tickets at once (one ```json block each), so
+    // every block is parsed, not just the last.
+    let blocks = extract_json_blocks(&raw);
+    if blocks.is_empty() {
         store
             .set_message_body(assistant_id, &raw)
             .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let drafts: Vec<(String, String)> = blocks
+        .iter()
+        .filter(|b| b.get("ready").and_then(|r| r.as_bool()) == Some(true))
+        .map(|b| {
+            let title = b
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Drafted ticket")
+                .to_string();
+            let body = b
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (title, body)
+        })
+        .collect();
+
+    if !drafts.is_empty() {
+        return finish_drafts(
+            cfg,
+            tracker,
+            store,
+            assistant_id,
+            &strip_json_block(&raw),
+            drafts,
+        )
+        .await;
+    }
+
+    // No ready draft in any block: fall back to the first block's clarifying
+    // question, if any (make the actual question the visible body, dropping the
+    // JSON scaffold), else just strip the scaffold out of the reply.
+    let reply = blocks
+        .first()
+        .and_then(|b| b.get("reply"))
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    match reply {
+        Some(reply) => store
+            .set_message_body(assistant_id, reply)
+            .map_err(|e| e.to_string())?,
+        None => store
+            .set_message_body(assistant_id, &strip_json_block(&raw))
+            .map_err(|e| e.to_string())?,
     }
     Ok(())
 }
 
-/// Record a ready-to-file draft: create the issue immediately (`auto_create_issue`)
-/// or stash the draft in the assistant message's `meta` and ask the user to confirm.
+/// Record one or more ready-to-file drafts (a scoping turn can propose several
+/// tickets at once): create them immediately (`auto_create_issue`) or stash them in
+/// the assistant message's `meta` as a `drafts` array and ask the user to confirm.
 /// (System notices were already resolved by the streaming turn's collector, so
 /// there's nothing conversation-wide left to do here.)
-async fn finish_draft(
+async fn finish_drafts(
     cfg: &EffectiveConfig,
     tracker: &dyn TrackerAdapter,
     store: &ChatStore,
     assistant_id: i64,
     reply_body: &str,
-    title: &str,
-    body: &str,
+    drafts: Vec<(String, String)>,
 ) -> Result<(), String> {
+    let plural = |n: usize| if n == 1 { "it" } else { "them" };
     if cfg.swebot.chat.auto_create_issue {
         let initial = cfg.active_states.first().ok_or_else(|| {
             "tracker.active_states is empty -- nowhere to create the drafted issue into".to_string()
         })?;
-        let issue = tracker
-            .create_issue(title, body, initial)
-            .await
-            .map_err(|e| format!("create_issue failed: {e}"))?;
-        let ref_str = issue.url.as_deref().unwrap_or(&issue.identifier);
+        let mut created = Vec::with_capacity(drafts.len());
+        let mut lines = Vec::with_capacity(drafts.len());
+        for (title, body) in &drafts {
+            let issue = tracker
+                .create_issue(title, body, initial)
+                .await
+                .map_err(|e| format!("create_issue failed: {e}"))?;
+            let ref_str = issue
+                .url
+                .as_deref()
+                .unwrap_or(&issue.identifier)
+                .to_string();
+            lines.push(format!("Drafted and created: **{title}** ({ref_str})"));
+            created.push(json!({
+                "title": title,
+                "body": body,
+                "issue_url": issue.url,
+                "issue_id": issue.identifier,
+            }));
+        }
         let footer = format!(
-            "\n\nDrafted and created: **{title}** ({ref_str}) — Symphony will pick it up on \
-             its next poll."
+            "\n\n{}\n\nSymphony will pick {} up on its next poll.",
+            lines.join("\n"),
+            plural(created.len()),
         );
         store
             .set_message_body(assistant_id, &format!("{reply_body}{footer}"))
@@ -361,16 +388,24 @@ async fn finish_draft(
                 &json!({
                     "kind": "draft",
                     "ready": true,
-                    "title": title,
-                    "body": body,
-                    "issue_url": issue.url,
-                    "issue_id": issue.identifier,
+                    "drafts": created,
                     "created": true,
                 }),
             )
             .map_err(|e| e.to_string())?;
     } else {
-        let footer = "\n\nI'm ready to file this ticket. Reply \"create it\" to confirm.";
+        let footer = if drafts.len() == 1 {
+            "\n\nI'm ready to file this ticket. Reply \"create it\" to confirm.".to_string()
+        } else {
+            format!(
+                "\n\nI'm ready to file these {} tickets. Reply \"create it\" to confirm.",
+                drafts.len()
+            )
+        };
+        let stashed: Vec<_> = drafts
+            .iter()
+            .map(|(title, body)| json!({"title": title, "body": body}))
+            .collect();
         store
             .set_message_body(assistant_id, &format!("{reply_body}{footer}"))
             .map_err(|e| e.to_string())?;
@@ -380,8 +415,7 @@ async fn finish_draft(
                 &json!({
                     "kind": "draft",
                     "ready": true,
-                    "title": title,
-                    "body": body,
+                    "drafts": stashed,
                     "created": false,
                 }),
             )
@@ -405,24 +439,41 @@ async fn create_from_pending_draft(
     else {
         return Ok(false);
     };
-    let title = meta
-        .get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or("Drafted ticket");
-    let body = meta
-        .get("body")
-        .and_then(|b| b.as_str())
-        .unwrap_or_default();
+    let drafts: Vec<(String, String)> = meta
+        .get("drafts")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+        .map(|d| {
+            let title = d
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("Drafted ticket")
+                .to_string();
+            let body = d
+                .get("body")
+                .and_then(|b| b.as_str())
+                .unwrap_or_default()
+                .to_string();
+            (title, body)
+        })
+        .collect();
     let initial = cfg.active_states.first().ok_or_else(|| {
         "tracker.active_states is empty -- nowhere to create the drafted issue".to_string()
     })?;
-    let issue = tracker
-        .create_issue(title, body, initial)
-        .await
-        .map_err(|e| format!("create_issue failed: {e}"))?;
-    let ref_str = issue.url.as_deref().unwrap_or(&issue.identifier);
+    let mut lines = Vec::with_capacity(drafts.len());
+    for (title, body) in &drafts {
+        let issue = tracker
+            .create_issue(title, body, initial)
+            .await
+            .map_err(|e| format!("create_issue failed: {e}"))?;
+        let ref_str = issue.url.as_deref().unwrap_or(&issue.identifier);
+        lines.push(format!("**{title}** ({ref_str})"));
+    }
     let reply = format!(
-        "Done — created **{title}** ({ref_str}). Symphony will pick it up on its next poll."
+        "Done — created {}. Symphony will pick {} up on its next poll.",
+        lines.join(", "),
+        if lines.len() == 1 { "it" } else { "them" },
     );
     store
         .insert_message(
@@ -432,8 +483,6 @@ async fn create_from_pending_draft(
             STATUS_SENT,
             &json!({
                 "kind": "draft-confirm",
-                "issue_url": issue.url,
-                "issue_id": issue.identifier,
                 "created": true,
             }),
             Some(msg.id), // links the reply to the confirmation message for marker delivery
@@ -621,9 +670,12 @@ fn unified_instructions(clone_dir: &Path) -> String {
          When the user asks you to draft or file a ticket, drive a short scoping dialogue: \
          ask only the clarifying questions that actually change scope (acceptance \
          criteria, edge cases, what's out of scope), then -- once you have enough to \
-         write a properly scoped ticket -- END your response with exactly one fenced \
-         ```json block:\n\
+         write a properly scoped ticket -- END your response with a fenced ```json \
+         block:\n\
          {{\"ready\": true, \"title\": \"<ticket title>\", \"body\": \"<full ticket body: what, why, acceptance criteria>\"}}\n\
+         If the user asked for *several* separate tickets, write one such block per \
+         ticket, one right after another -- each is created as its own issue, so don't \
+         merge unrelated tickets into a single block's title/body.\n\
          While you're answering a question you don't need the JSON block at all -- plain \
          text only.",
         clone_dir.display(),
@@ -666,11 +718,13 @@ fn truncate_body(body: &str) -> String {
     }
 }
 
-/// Cut a trailing fenced ```json … ``` block (and surrounding whitespace) out of a
-/// turn's raw response so the JSON scaffold never shows up in the chat UI. A bare
-/// JSON object (model skipped the fence) is left alone -- it's short and inline.
+/// Cut every trailing fenced ```json … ``` block (and surrounding whitespace) out of
+/// a turn's raw response so the JSON scaffold never shows up in the chat UI. Uses
+/// the *first* fence, not the last, so a multi-ticket response (several ```json
+/// blocks in a row) has all of them stripped, not just the last. A bare JSON object
+/// (model skipped the fence) is left alone -- it's short and inline.
 fn strip_json_block(text: &str) -> String {
-    match text.rfind("```json") {
+    match text.find("```json") {
         Some(start) => text[..start].trim_end().to_string(),
         None => text.to_string(),
     }
@@ -785,9 +839,34 @@ mod tests {
         assert!(assistant.body.contains("Drafted and created"));
         assert!(!assistant.body.contains("```json"));
         assert_eq!(assistant.meta["created"], true);
-        assert_eq!(assistant.meta["title"], "Add rate limiting");
+        assert_eq!(assistant.meta["drafts"][0]["title"], "Add rate limiting");
         // The issue really landed in the local tracker dir.
         assert_eq!(std::fs::read_dir(tracker_dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn multiple_ready_blocks_in_one_response_create_an_issue_each() {
+        let cfg = test_cfg("");
+        let (store, _tmp) = seeded("draft tickets for the three things we discussed");
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        let backend = FakeBackend::with_response(
+            "Here are three tickets.\n\n\
+             ```json\n{\"ready\": true, \"title\": \"One\", \"body\": \"body one\"}\n```\n\n\
+             ```json\n{\"ready\": true, \"title\": \"Two\", \"body\": \"body two\"}\n```\n\n\
+             ```json\n{\"ready\": true, \"title\": \"Three\", \"body\": \"body three\"}\n```\n",
+        );
+        let msg = one_pending(&store);
+        respond_to(&cfg, &backend, tracker.as_ref(), &store, &msg)
+            .await
+            .unwrap();
+
+        let assistant = last_assistant(&store, msg.conversation_id);
+        assert!(!assistant.body.contains("```json"));
+        assert_eq!(assistant.body.matches("Drafted and created").count(), 3);
+        assert_eq!(assistant.meta["drafts"].as_array().unwrap().len(), 3);
+        // All three issues really landed in the local tracker dir, not just the last.
+        assert_eq!(std::fs::read_dir(tracker_dir.path()).unwrap().count(), 3);
     }
 
     #[tokio::test]

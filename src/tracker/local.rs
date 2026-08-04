@@ -153,11 +153,12 @@ impl TrackerAdapter for LocalTrackerAdapter {
     }
 
     /// Generates an identifier from the current millisecond timestamp rather than a
-    /// real auto-increment (this adapter has no central sequence to draw from) --
-    /// collisions would require two `create_issue` calls in the same millisecond,
-    /// which doesn't happen given this adapter's own already-declared role (dev/test
-    /// iteration without a real tracker credential, not a production system of
-    /// record -- see this module's own doc comment).
+    /// real auto-increment (this adapter has no central sequence to draw from). Two
+    /// `create_issue` calls landing in the same millisecond used to silently
+    /// overwrite each other -- observed live once SweBot chat started filing several
+    /// drafted tickets back-to-back in one turn -- so a numeric suffix is appended
+    /// and bumped until the filename is actually free, rather than assuming the
+    /// timestamp alone is unique.
     async fn create_issue(
         &self,
         title: &str,
@@ -167,14 +168,26 @@ impl TrackerAdapter for LocalTrackerAdapter {
         std::fs::create_dir_all(&self.dir).map_err(|e| {
             TrackerError::Request(format!("failed to create tracker dir {:?}: {e}", self.dir))
         })?;
-        let id = format!("draft-{}", Utc::now().timestamp_millis());
+        let base = Utc::now().timestamp_millis();
+        let mut suffix = 0u32;
+        let (id, path) = loop {
+            let id = if suffix == 0 {
+                format!("draft-{base}")
+            } else {
+                format!("draft-{base}-{suffix}")
+            };
+            let path = self.dir.join(format!("{id}.md"));
+            if !path.exists() {
+                break (id, path);
+            }
+            suffix += 1;
+        };
         let now = Utc::now().to_rfc3339();
         let escaped_title = title.replace('"', "\\\"");
         let contents = format!(
             "---\nidentifier: {id}\ntitle: \"{escaped_title}\"\nstate: {state}\n\
              created_at: {now}\nupdated_at: {now}\n---\n{body}\n"
         );
-        let path = self.dir.join(format!("{id}.md"));
         std::fs::write(&path, contents)
             .map_err(|e| TrackerError::Request(format!("failed to write {path:?}: {e}")))?;
         Ok(Issue {
