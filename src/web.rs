@@ -1,9 +1,10 @@
 //! Shared HTML rendering primitives used by every hand-rolled web UI in this crate
-//! (`status.rs`, `board.rs`, `service.rs`, `metrics.rs`). Previously each module carried
-//! its own near-duplicate copy of the stylesheet, `escape()`, and `urlencode()` -- three
-//! independent copies that had already drifted (`service.rs`'s admin dashboard had no
-//! `.badge`/`.tabs`/form styling `board.rs` had, and no persistent nav at all). One theme,
-//! one escaper, one shell now.
+//! (`status.rs`, `service.rs`, `metrics.rs`, `swebot::chat::web`). Previously each
+//! module carried its own near-duplicate copy of the stylesheet, `escape()`, and
+//! `urlencode()` -- independent copies that had already drifted (`service.rs`'s admin
+//! dashboard had no `.badge`/`.tabs`/form styling, and no persistent nav at all; the
+//! chat UI had its own hardcoded dark-only palette). One theme, one escaper, one
+//! shell now.
 //!
 //! Colors are CSS custom properties (`--bg`, `--fg`, `--accent`, ...) rather than
 //! hardcoded hex values, set once in `:root` and overridden under
@@ -49,7 +50,7 @@ pub const STYLE: &str = r#"
     }
   }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 24px; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0 auto; padding: 24px; max-width: 1180px; }
   h1 { font-size: 1.1rem; font-weight: 600; color: var(--accent); margin: 0 0 4px; }
   h2 { font-size: 1rem; color: var(--fg-strong); margin: 0 0 8px; }
   a { color: var(--accent); }
@@ -130,12 +131,47 @@ pub const STYLE: &str = r#"
   .error-banner { background: var(--bad-bg); color: var(--bad-fg); border: 1px solid var(--bad-fg); border-radius: 6px; padding: 10px 14px; margin: 12px 0; font-size: 0.88rem; }
   .error-banner a { color: var(--bad-fg); text-decoration: underline; }
   :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+  /* Chat-bubble transcript: the shared markup/style contract between the chat UI
+     (`swebot::chat::web`, client-rendered from JSON via matching JS) and the
+     issue-filtered `/events` view (`status.rs::render_transcript`, server-rendered
+     from the same `.msg`/`.bubble`/`.status` shape) -- one visual language for "a
+     conversation," whichever side produced it. */
+  .transcript { display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 78%; animation: msg-in 0.22s ease-out; }
+  .msg.user { align-self: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+  .msg.system, .msg.tool { align-self: center; max-width: 92%; }
+  .bubble { border-radius: 10px; padding: 8px 12px; font-size: 0.9rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+  .bubble :first-child { margin-top: 0; }
+  .bubble :last-child { margin-bottom: 0; }
+  .bubble code { background: rgba(127,184,255,0.14); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+  .bubble pre { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; overflow-x: auto; white-space: pre; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 4px; font-size: 1em; color: var(--accent); }
+  .bubble ul, .bubble ol { margin: 4px 0; padding-left: 20px; }
+  .bubble a { color: var(--accent); }
+  .msg.user .bubble { background: var(--bg-alt); border: 1px solid var(--accent); }
+  .msg.assistant .bubble { background: var(--bg-alt); border: 1px solid var(--border); }
+  .msg.system .bubble { color: var(--fg-dim); background: var(--bg-alt); font-style: italic; border: 1px dashed var(--border); }
+  .msg.tool .bubble { color: var(--fg-dim); background: var(--bg-alt); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.82rem; border: 1px solid var(--border-soft); }
+  .status { font-size: 0.72rem; color: var(--fg-dimmer); margin-top: 3px; }
+  .status .read { color: var(--good-fg); }
+  .status a { color: var(--fg-dimmer); }
+  @keyframes msg-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .msg { animation: none; }
+  }
   @media (max-width: 640px) {
     body { padding: 14px; }
     .card { flex-basis: 100%; }
     form.admin input { width: 100%; }
     .stats { gap: 8px; }
     .stats .stat { min-width: 0; flex: 1 1 40%; }
+    .msg { max-width: 94%; }
   }
 "#;
 
@@ -145,7 +181,7 @@ pub const STYLE: &str = r#"
 /// on the page -- server-side pagination is unaffected, sorting only the current
 /// page), a `confirm()` gate on any `<form data-confirm="...">` before it submits
 /// (used for destructive actions like removing a registered repo), and a live
-/// character counter under any `[maxlength]` field (board.rs's compose/reply forms).
+/// character counter under any `[maxlength]` field.
 pub const SCRIPT: &str = r#"
 document.addEventListener('click', function (e) {
   var msg = e.target.closest('.msg, .msg-cell');
@@ -255,18 +291,42 @@ pub fn nav(links: &[NavLink], active: &str, base: &str) -> String {
     format!("<nav>{items}</nav>")
 }
 
+/// The one nav every per-project surface shares: `status.rs`'s dashboard/events/usage
+/// pages and `swebot::chat::web`'s chat UI, all nested under the same `base_path`
+/// (single-project root, or `/projects/<id>` under the multi-project service -- see
+/// `status.rs`'s `AppState::base_path` doc comment). Each href below is mount-relative;
+/// `nav()` prepends `base` at render time.
+pub const NAV_LINKS: &[NavLink] = &[
+    NavLink {
+        href: "/",
+        label: "Status",
+    },
+    NavLink {
+        href: "/events",
+        label: "Events",
+    },
+    NavLink {
+        href: "/usage",
+        label: "Usage",
+    },
+    NavLink {
+        href: "/chat",
+        label: "Chat",
+    },
+];
+
 /// The one page shell every hand-rolled page in this crate renders through. `nav_html`
 /// is pre-rendered (via `nav()`, or `""` for pages that don't want one) rather than
-/// built here, since board.rs's tabs and status.rs's top nav differ enough in shape
-/// that forcing one nav-building function to cover both isn't worth it.
+/// built here, since callers' nav shapes differ enough that forcing one nav-building
+/// function to cover all of them isn't worth it.
 ///
-/// `app_title`/`page_title` are escaped here, unconditionally -- `board.rs` passes a
-/// board thread's own (anonymously user-submitted, persisted) title straight through
-/// as `page_title`, and `<title>` content is parsed as RCDATA: an unescaped `</title>`
-/// in that title would close the element early and let whatever follows (e.g.
-/// `<script>...`) execute as real markup, a stored XSS from an unauthenticated post.
-/// `body` is deliberately NOT escaped here -- every caller already builds it out of a
-/// mix of literal markup and its own already-escaped dynamic pieces.
+/// `app_title`/`page_title` are escaped here, unconditionally -- a caller could pass a
+/// persisted, user-supplied title straight through as `page_title`, and `<title>`
+/// content is parsed as RCDATA: an unescaped `</title>` in that title would close the
+/// element early and let whatever follows (e.g. `<script>...`) execute as real markup,
+/// a stored XSS. `body` is deliberately NOT escaped here -- every caller already
+/// builds it out of a mix of literal markup and its own already-escaped dynamic
+/// pieces.
 pub fn page_shell(
     app_title: &str,
     page_title: &str,
@@ -358,13 +418,13 @@ mod tests {
         assert!(html.contains("<p>BODY</p>"));
     }
 
-    /// Regression test: `board.rs` passes an anonymously user-submitted, persisted
-    /// thread title straight through as `page_title` -- an unescaped `</title>` would
-    /// close the element early and let whatever follows execute as real markup.
+    /// Regression test: a caller could pass a persisted, user-submitted title straight
+    /// through as `page_title` -- an unescaped `</title>` would close the element
+    /// early and let whatever follows execute as real markup.
     #[test]
     fn page_shell_escapes_page_title_against_title_tag_breakout() {
         let html = page_shell(
-            "Symphony Board",
+            "Symphony",
             "</title><script>alert(1)</script>",
             "",
             "",

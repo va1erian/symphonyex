@@ -1,5 +1,4 @@
 mod agent;
-mod board;
 mod config;
 mod container;
 mod daemon;

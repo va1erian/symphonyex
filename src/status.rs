@@ -18,12 +18,6 @@
 //! initial paint -- no HTML templating duplicated into JS, everything server-rendered
 //! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
-//!
-//! Also nests `crate::board`'s bulletin-board UI at `/board`, unconditionally --
-//! harmless when a project isn't using `swebot.board.enabled` (an empty board, same
-//! posture as `/events`/`/usage` showing "nothing recorded yet" until something
-//! populates them), and avoids threading a project's `swebot.board.enabled` value
-//! through this constructor just to decide whether to mount one more route.
 
 use crate::eventlog;
 use crate::web::{escape, urlencode};
@@ -48,6 +42,12 @@ pub struct StatusSnapshot {
 
 #[derive(Clone, Serialize)]
 pub struct RunningRow {
+    /// The tracker's internal issue id -- distinct from `identifier` (the
+    /// human-readable label rendered on the card), and the same value
+    /// `eventlog::EventRow::issue_id`/the `/events?issue=` filter key on -- so a click
+    /// on a running card's title can deep-link straight to that issue's events
+    /// (`running_card` below).
+    pub issue_id: String,
     pub identifier: String,
     pub title: String,
     pub session_id: String,
@@ -70,11 +70,8 @@ pub struct RetryRow {
 struct AppState {
     status_rx: watch::Receiver<StatusSnapshot>,
     /// A project's `EffectiveConfig::workflow_dir` -- where `symphony.db`
-    /// (`eventlog::DB_FILENAME`) and `board.db` (`board::DB_FILENAME`) both live,
-    /// same directory `symphony-report.html` already defaults to. Stored as the
-    /// directory (not a pre-joined file path) so this one field can feed both
-    /// `eventlog`'s functions (which want the full `.../symphony.db` path) and
-    /// `board::router` (which wants the directory and joins its own filename).
+    /// (`eventlog::DB_FILENAME`) lives, same directory `symphony-report.html`
+    /// already defaults to.
     workflow_dir: PathBuf,
     /// URL path this router is mounted under -- `""` when served at the root (the
     /// single-project CLI path, `serve` below), or `/projects/<id>` when nested into
@@ -121,7 +118,6 @@ pub fn router(
     workflow_dir: PathBuf,
     base_path: &str,
 ) -> Router {
-    let board_router = crate::board::router(workflow_dir.clone(), &format!("{base_path}/board"));
     let state = AppState {
         status_rx,
         workflow_dir,
@@ -134,7 +130,6 @@ pub fn router(
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
         .with_state(state)
-        .nest("/board", board_router)
 }
 
 pub async fn serve_composite(
@@ -159,34 +154,11 @@ pub async fn serve_composite(
     Ok(())
 }
 
-/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`,
-/// `"/board"`); `base` (`AppState::base_path`) is prepended only to the emitted `href`
-/// by `web::nav`, so callers keep comparing/passing the same unprefixed identifiers
-/// regardless of where this router ends up mounted.
-const NAV_LINKS: &[crate::web::NavLink] = &[
-    crate::web::NavLink {
-        href: "/",
-        label: "Status",
-    },
-    crate::web::NavLink {
-        href: "/events",
-        label: "Events",
-    },
-    crate::web::NavLink {
-        href: "/usage",
-        label: "Usage",
-    },
-    crate::web::NavLink {
-        href: "/board",
-        label: "Board",
-    },
-];
-
 fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base: &str) -> String {
     crate::web::page_shell(
         "Symphony",
         title,
-        &crate::web::nav(NAV_LINKS, active_nav, base),
+        &crate::web::nav(crate::web::NAV_LINKS, active_nav, base),
         body,
         extra_head,
     )
@@ -199,10 +171,57 @@ async fn dashboard(State(state): State<AppState>) -> Html<String> {
     // requests when nothing's happening, and updates land as soon as they occur
     // rather than up to 2s late. `EventSource` reconnects automatically on its own
     // (with backoff) if the connection drops, so no reconnect logic is needed here.
+    //
+    // Each push used to be a flat `innerHTML` replace of the whole fragment --
+    // simple, but it also silently collapsed any `.msg.expanded` click-to-expand
+    // state and would have clobbered a text selection inside the fragment on every
+    // update. `diffChildren` instead keys each running card (`#run-<issue_id>`) and
+    // retry row (`#retry-<identifier>`) and only touches nodes whose rendered HTML
+    // actually changed, reordering/adding/removing by id rather than tearing down
+    // the whole subtree -- same approach `swebot::chat::web`'s `patchNode`/
+    // `renderThreadList` use for the same reason.
     let script = format!(
         r#"<script>
+function diffChildren(container, incoming) {{
+  const existing = new Map();
+  Array.from(container.children).forEach(function (el) {{ existing.set(el.id, el); }});
+  const seen = new Set();
+  let prev = null;
+  Array.from(incoming.children).forEach(function (el) {{
+    seen.add(el.id);
+    let node = existing.get(el.id);
+    if (node) {{
+      if (node.id && node.outerHTML !== el.outerHTML) {{
+        // A card being replaced loses its expanded state along with the rest of
+        // the node -- restore it on the freshly rendered replacement.
+        const wasExpanded = node.querySelector('.msg.expanded') != null;
+        node.replaceWith(el);
+        if (wasExpanded) {{
+          const msg = el.querySelector('.msg[data-expandable]');
+          if (msg) msg.classList.add('expanded');
+        }}
+        node = el;
+      }}
+    }} else {{
+      node = el;
+    }}
+    const wantNext = prev ? prev.nextSibling : container.firstChild;
+    if (wantNext !== node) container.insertBefore(node, wantNext);
+    prev = node;
+  }});
+  existing.forEach(function (el, id) {{
+    if (!seen.has(id)) el.remove();
+  }});
+}}
 new EventSource('{base}/fragment-stream').onmessage = function (e) {{
-  document.getElementById('symphony-fragment').innerHTML = e.data;
+  const incoming = document.createElement('div');
+  incoming.innerHTML = e.data;
+  const runningCount = incoming.querySelector('#running-count');
+  const retryingCount = incoming.querySelector('#retrying-count');
+  if (runningCount) document.getElementById('running-count').textContent = runningCount.textContent;
+  if (retryingCount) document.getElementById('retrying-count').textContent = retryingCount.textContent;
+  diffChildren(document.getElementById('running-grid'), incoming.querySelector('#running-grid'));
+  diffChildren(document.getElementById('retry-tbody'), incoming.querySelector('#retry-tbody'));
 }};
 </script>"#,
         base = state.base_path,
@@ -211,7 +230,7 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
         r#"<div class="meta">generated {generated} &middot; live-updates in place, pushed as they happen (no page reload, no polling)</div>
 <div id="symphony-fragment" aria-live="polite" role="status">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
-        fragment = render_fragment(&snapshot),
+        fragment = render_fragment(&snapshot, &state.base_path),
     );
     Html(page_shell(
         "live status",
@@ -224,7 +243,7 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
 
 async fn fragment(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
-    Html(render_fragment(&snapshot))
+    Html(render_fragment(&snapshot, &state.base_path))
 }
 
 /// Server-Sent Events push of the same fragment `/fragment` renders on demand, but
@@ -237,16 +256,17 @@ async fn fragment(State(state): State<AppState>) -> Html<String> {
 async fn fragment_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let base = state.base_path.clone();
     let stream = WatchStream::new(state.status_rx.clone())
-        .map(|snapshot| Ok(Event::default().data(render_fragment(&snapshot))));
+        .map(move |snapshot| Ok(Event::default().data(render_fragment(&snapshot, &base))));
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn render_fragment(s: &StatusSnapshot) -> String {
+fn render_fragment(s: &StatusSnapshot, base: &str) -> String {
     let running_cards: String = if s.running.is_empty() {
         "<p class=\"empty\">No agents running.</p>".to_string()
     } else {
-        s.running.iter().map(running_card).collect()
+        s.running.iter().map(|r| running_card(r, base)).collect()
     };
 
     let retry_rows: String = if s.retrying.is_empty() {
@@ -257,17 +277,17 @@ fn render_fragment(s: &StatusSnapshot) -> String {
 
     format!(
         r#"<section>
-<h3>Running <span class="badge">{running}</span></h3>
-<div class="grid">
+<h3>Running <span class="badge" id="running-count">{running}</span></h3>
+<div class="grid" id="running-grid">
 {running_cards}
 </div>
 </section>
 
 <section>
-<h3>Retry queue <span class="badge">{retrying}</span></h3>
+<h3>Retry queue <span class="badge" id="retrying-count">{retrying}</span></h3>
 <table>
 <thead><tr><th>Issue</th><th>Attempt</th><th>Due in</th><th>Last error</th></tr></thead>
-<tbody>
+<tbody id="retry-tbody">
 {retry_rows}
 </tbody>
 </table>
@@ -279,7 +299,7 @@ fn render_fragment(s: &StatusSnapshot) -> String {
     )
 }
 
-fn running_card(r: &RunningRow) -> String {
+fn running_card(r: &RunningRow, base: &str) -> String {
     let message = r.last_message.as_deref().unwrap_or("");
     // Only hint "click to expand" when the message is actually long enough that the
     // 4.5-line clamp (`.msg`'s `max-height` in web::STYLE) would clip it -- showing the
@@ -290,14 +310,17 @@ fn running_card(r: &RunningRow) -> String {
         ""
     };
     format!(
-        r#"<div class="card">
-  <h2>{identifier}</h2>
+        r#"<div class="card" id="run-{id_attr}">
+  <h2><a href="{base}/events?issue={issue_link}">{identifier}</a></h2>
   <div class="row">{title}</div>
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
   <div class="row"><b>last event</b> {event}</div>
   <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
+        id_attr = escape(&r.issue_id),
+        base = base,
+        issue_link = urlencode(&r.issue_id),
         identifier = escape(&r.identifier),
         title = escape(&r.title),
         session = escape(&r.session_id),
@@ -311,7 +334,8 @@ fn running_card(r: &RunningRow) -> String {
 
 fn retry_row(r: &RetryRow) -> String {
     format!(
-        "<tr><td>{identifier}</td><td>{attempt}</td><td>{due:.1}s</td><td>{error}</td></tr>",
+        r#"<tr id="retry-{id_attr}"><td>{identifier}</td><td>{attempt}</td><td>{due:.1}s</td><td>{error}</td></tr>"#,
+        id_attr = escape(&r.identifier),
         identifier = escape(&r.identifier),
         attempt = r.attempt,
         due = r.due_in_secs,
@@ -331,6 +355,12 @@ struct EventsQuery {
     importance: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// `"table"` forces the plain sortable table even when `issue` is set; any other
+    /// value (or unset) gets the chat-style transcript instead, but only when an
+    /// `issue` filter is actually active -- the unfiltered full history stays a
+    /// table regardless, since a wall of every issue's events interleaved doesn't
+    /// read as one conversation the way a single issue's does.
+    view: Option<String>,
 }
 
 async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>) -> Html<String> {
@@ -346,6 +376,24 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let rows = eventlog::recent_events(&state.eventlog_db_path(), &filter, limit, offset)
         .unwrap_or_default();
     let base = state.base_path.as_str();
+
+    let has_issue_filter = filter.issue_id.is_some();
+    let use_transcript_view = has_issue_filter && q.view.as_deref() != Some("table");
+    let view_toggle = if has_issue_filter {
+        if use_transcript_view {
+            format!(
+                r#" &middot; <a href="{}">Plain table</a>"#,
+                events_link_with_view(&q, offset, None, None, Some("table"), base)
+            )
+        } else {
+            format!(
+                r#" &middot; <a href="{}">Conversation view</a>"#,
+                events_link_with_view(&q, offset, None, None, Some("chat"), base)
+            )
+        }
+    } else {
+        String::new()
+    };
 
     let table_rows: String = if rows.is_empty() {
         "<tr><td colspan=\"6\" class=\"empty\">No events recorded yet.</td></tr>".to_string()
@@ -387,6 +435,24 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
         .map(|t| format!(r#"<option value="{}">"#, escape(t)))
         .collect();
 
+    let listing = if use_transcript_view {
+        format!(
+            r#"<div class="transcript">{}</div>"#,
+            render_transcript(&rows, base)
+        )
+    } else {
+        format!(
+            r#"<div class="table-wrap">
+<table>
+<thead><tr><th data-sort>ID</th><th data-sort>Time</th><th data-sort>Issue</th><th data-sort>Session</th><th data-sort>Type</th><th>Message</th><th data-sort>Tokens</th></tr></thead>
+<tbody>
+{table_rows}
+</tbody>
+</table>
+</div>"#
+        )
+    };
+
     let body = format!(
         r#"<form class="filters" method="get">
   <label for="f-issue">Issue</label>
@@ -395,24 +461,18 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
   <input type="text" id="f-type" name="type" placeholder="event type" value="{event_type}" list="event-types">
   <datalist id="event-types">{type_options}</datalist>
   <button type="submit">Filter</button>
-  {importance_toggle}
+  {importance_toggle}{view_toggle}
 </form>
 {chips}
-<div class="table-wrap">
-<table>
-<thead><tr><th data-sort>ID</th><th data-sort>Time</th><th data-sort>Issue</th><th data-sort>Session</th><th data-sort>Type</th><th>Message</th><th data-sort>Tokens</th></tr></thead>
-<tbody>
-{table_rows}
-</tbody>
-</table>
-</div>
+{listing}
 <div class="pager">{prev} {next}</div>"#,
         issue = escape(q.issue.as_deref().unwrap_or("")),
         event_type = escape(q.event_type.as_deref().unwrap_or("")),
         type_options = type_options,
         importance_toggle = importance_toggle,
+        view_toggle = view_toggle,
         chips = chips(&q, base),
-        table_rows = table_rows,
+        listing = listing,
         prev = prev,
         next = next,
     );
@@ -432,6 +492,20 @@ fn events_link(
     clear: Option<ClearFilter>,
     base: &str,
 ) -> String {
+    events_link_with_view(q, offset, importance_override, clear, None, base)
+}
+
+/// `events_link` plus an optional `view=` override -- its own function rather than a
+/// blanket extra param on every `events_link` call site, since only the transcript/
+/// table toggle (`events_page`) ever needs to set it.
+fn events_link_with_view(
+    q: &EventsQuery,
+    offset: i64,
+    importance_override: Option<&str>,
+    clear: Option<ClearFilter>,
+    view_override: Option<&str>,
+    base: &str,
+) -> String {
     let mut parts = Vec::new();
     if !matches!(clear, Some(ClearFilter::Issue))
         && let Some(issue) = &q.issue
@@ -448,6 +522,10 @@ fn events_link(
     let importance = importance_override.or(q.importance.as_deref());
     if let Some(importance) = importance {
         parts.push(format!("importance={}", urlencode(importance)));
+    }
+    let view = view_override.or(q.view.as_deref());
+    if let Some(view) = view {
+        parts.push(format!("view={}", urlencode(view)));
     }
     parts.push(format!("offset={offset}"));
     format!("{base}/events?{}", parts.join("&"))
@@ -516,6 +594,66 @@ fn event_row(r: &eventlog::EventRow, base: &str) -> String {
         event_type = event_type,
         message = escape(r.message.as_deref().unwrap_or("-")),
         tokens = escape(&tokens),
+    )
+}
+
+/// Chat-style rendering of a single issue's events -- the "jump to this running
+/// job's events" view (`running_card`'s link). Reuses the exact `.msg`/`.bubble`/
+/// `.status` markup and classes `swebot::chat::web`'s JS renders for live chat
+/// messages (both draw on the shared rules in `web::STYLE`'s "Chat-bubble
+/// transcript" block), so an issue's dispatch/turn/tool-call history reads as one
+/// conversation instead of a table row per event. `rows` comes in newest-first
+/// (`eventlog::recent_events`'s own order, matching the table view); a transcript
+/// reads top-to-bottom oldest-first, so this reverses it for display.
+fn render_transcript(rows: &[eventlog::EventRow], base: &str) -> String {
+    if rows.is_empty() {
+        return r#"<p class="empty">No events recorded yet.</p>"#.to_string();
+    }
+    rows.iter().rev().map(|r| transcript_bubble(r, base)).collect()
+}
+
+/// Which bubble variant an event type reads as: `other_message` (and anything else
+/// with "message" in its name) is Claude's own streamed text -- the thing a human
+/// actually wants to read, so it renders full-size like a chat reply. Anything
+/// naming a tool call gets a distinct monospace "tool" bubble. Everything else
+/// (dispatched, turn started, retry scheduled, worker exited, ...) is dispatch
+/// bookkeeping -- present for completeness but not the point of reading this
+/// transcript, so it renders small/muted like chat's own system notices.
+fn transcript_role(event_type: &str) -> &'static str {
+    if event_type.contains("tool") {
+        "tool"
+    } else if event_type.contains("message") {
+        "assistant"
+    } else {
+        "system"
+    }
+}
+
+fn transcript_bubble(r: &eventlog::EventRow, base: &str) -> String {
+    let role = transcript_role(&r.event_type);
+    let message = r.message.as_deref().unwrap_or("");
+    let body = if message.is_empty() {
+        format!(r#"<em class="empty">{}</em>"#, escape(&r.event_type))
+    } else {
+        escape(message)
+    };
+    let tokens = r
+        .total_tokens
+        .map(|t| format!(" &middot; {t} tokens"))
+        .unwrap_or_default();
+    format!(
+        r#"<div class="msg {role}">
+  <div class="bubble">{body}</div>
+  <div class="status"><span class="time">{time}</span> &middot; <a href="{base}/events?issue={issue_link}&amp;type={type_link}">{event_type}</a>{tokens}</div>
+</div>"#,
+        role = role,
+        body = body,
+        time = escape(&r.created_at),
+        base = base,
+        issue_link = urlencode(&r.issue_id),
+        type_link = urlencode(&r.event_type),
+        event_type = escape(&r.event_type),
+        tokens = tokens,
     )
 }
 
@@ -615,6 +753,7 @@ mod tests {
         tx.send(StatusSnapshot {
             generated_at: "now".to_string(),
             running: vec![RunningRow {
+                issue_id: "42".to_string(),
                 identifier: "AR-1".to_string(),
                 title: "Scaffold".to_string(),
                 session_id: "sess".to_string(),
@@ -640,7 +779,7 @@ mod tests {
     #[test]
     fn render_fragment_shows_empty_states() {
         let snapshot = StatusSnapshot::default();
-        let html = render_fragment(&snapshot);
+        let html = render_fragment(&snapshot, "");
         assert!(html.contains("No agents running"));
         assert!(html.contains("Retry queue is empty"));
     }
@@ -648,6 +787,7 @@ mod tests {
     #[test]
     fn running_card_escapes_untrusted_content() {
         let row = RunningRow {
+            issue_id: "1".to_string(),
             identifier: "1".to_string(),
             title: "<script>alert(1)</script>".to_string(),
             session_id: "sess".to_string(),
@@ -657,9 +797,26 @@ mod tests {
             last_event: None,
             last_message: None,
         };
-        let html = running_card(&row);
+        let html = running_card(&row, "");
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn running_card_links_to_events_filtered_by_issue_id() {
+        let row = RunningRow {
+            issue_id: "issue-42".to_string(),
+            identifier: "AR-1".to_string(),
+            title: "Scaffold".to_string(),
+            session_id: "sess".to_string(),
+            started_secs_ago: 1.0,
+            turn_count: 1,
+            tool_call_count: 0,
+            last_event: None,
+            last_message: None,
+        };
+        let html = running_card(&row, "/projects/p1");
+        assert!(html.contains(r#"<a href="/projects/p1/events?issue=issue-42">AR-1</a>"#));
     }
 
     #[test]
@@ -700,6 +857,54 @@ mod tests {
         };
         let html = event_row(&row, "");
         assert!(html.contains(">-<"));
+    }
+
+    #[test]
+    fn transcript_role_prioritizes_messages_and_tool_calls_over_bookkeeping() {
+        assert_eq!(transcript_role("other_message"), "assistant");
+        assert_eq!(transcript_role("tool_call"), "tool");
+        assert_eq!(transcript_role("dispatched"), "system");
+    }
+
+    fn event_row_fixture(event_type: &str, message: Option<&str>) -> eventlog::EventRow {
+        eventlog::EventRow {
+            id: 1,
+            issue_id: "42".to_string(),
+            identifier: "AR-1".to_string(),
+            title: "Some issue".to_string(),
+            session_id: None,
+            event_type: event_type.to_string(),
+            importance: "normal".to_string(),
+            message: message.map(str::to_string),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn render_transcript_renders_oldest_first_and_escapes_message_bodies() {
+        let rows = vec![
+            event_row_fixture("other_message", Some("newest reply")),
+            event_row_fixture("dispatched", Some("<script>alert(1)</script>")),
+        ];
+        let html = render_transcript(&rows, "");
+        let dispatched_pos = html.find("dispatched").unwrap();
+        let reply_pos = html.find("newest reply").unwrap();
+        assert!(
+            dispatched_pos < reply_pos,
+            "oldest (dispatched) event should render before the newer reply"
+        );
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains(r#"class="msg assistant""#));
+        assert!(html.contains(r#"class="msg system""#));
+    }
+
+    #[test]
+    fn render_transcript_shows_empty_state() {
+        assert!(render_transcript(&[], "").contains("No events recorded yet"));
     }
 
     #[test]

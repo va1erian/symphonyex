@@ -3,9 +3,8 @@
 //! PR/MR review -- abstracted over the underlying host (GitHub or GitLab) behind the
 //! `RepoHost` trait below, the same pattern `tracker::TrackerAdapter` already
 //! established for the issue-tracker side. The Q&A/drafting half is further split
-//! out into its own `DiscussionHost` supertrait so a non-code-host conversational
-//! backend (`crate::board`'s local bulletin board) can implement just that much --
-//! see `DiscussionHost`'s own doc comment.
+//! out into its own `DiscussionHost` supertrait -- see `DiscussionHost`'s own doc
+//! comment.
 //!
 //! Deliberately independent of `tracker::TrackerAdapter`: these are properties of
 //! `repo:` (the code host), not `tracker:` (the issue board). They usually point at
@@ -55,33 +54,27 @@ pub struct ReviewOutcome {
 }
 
 /// The Q&A/drafting conversational surface `swebot::qa`/`swebot::drafting` poll and
-/// post into -- deliberately its own trait, separate from `RepoHost` below, so a
-/// conversational backend that *isn't* a code host at all (`crate::board`'s local
-/// bulletin board -- see its own module doc comment) can implement just this half
-/// without having to fake PR/MR automation methods that would never make sense for
-/// it. Every `RepoHost` is a `DiscussionHost` (see the supertrait bound below), so
-/// GitHub/GitLab work exactly as before; `swebot::mod`'s `ConversationHost` is what
-/// picks which implementor a given poll cycle actually talks to.
+/// post into -- deliberately its own trait, separate from `RepoHost` below. Every
+/// `RepoHost` is a `DiscussionHost` (see the supertrait bound below); `swebot::run`
+/// picks the right selector/field for the configured `repo.provider`.
 #[async_trait]
 pub trait DiscussionHost: Send + Sync {
-    /// `selector` is a Discussions category name on GitHub, an issue label on
-    /// GitLab, or a board name on `crate::board`'s bulletin board -- interpreted
-    /// per-impl; callers pick the right config field/value (see
-    /// `swebot::mod::ConversationHost`).
+    /// `selector` is a Discussions category name on GitHub or an issue label on
+    /// GitLab -- interpreted per-impl; callers pick the right config field/value
+    /// (see `swebot::run`).
     async fn list_swebot_threads(&self, selector: &str) -> Result<Vec<DiscussionThread>, String>;
     async fn post_discussion_comment(&self, thread_id: &str, body: &str) -> Result<String, String>;
     /// Mark a Q&A-category discussion comment as the accepted answer. Default: a
-    /// silent no-op -- GitLab and the local bulletin board have no equivalent
-    /// concept, and this must not surface as an error `qa.rs` has to swallow on
-    /// every single answer.
+    /// silent no-op -- GitLab has no equivalent concept, and this must not surface as
+    /// an error `qa.rs` has to swallow on every single answer.
     async fn mark_discussion_comment_as_answer(&self, _comment_id: &str) -> Result<(), String> {
         Ok(())
     }
     /// Close the source thread once ticket drafting has promoted it to a real tracker
     /// issue. Default: a no-op -- GitHub Discussions were never closed by this flow
-    /// (Discussions and Issues are already visually separate there); GitLab and the
-    /// local bulletin board override this to close/mark-closed the source thread
-    /// (see `gitlab::GitlabRepoHost::close_thread`, `board::BulletinBoardHost`).
+    /// (Discussions and Issues are already visually separate there); GitLab overrides
+    /// this to close/mark-closed the source thread (see
+    /// `gitlab::GitlabRepoHost::close_thread`).
     async fn close_thread(&self, _thread_id: &str) -> Result<(), String> {
         Ok(())
     }

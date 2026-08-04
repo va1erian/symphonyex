@@ -2,10 +2,16 @@
 //! talks to, both backed directly by the shared `ChatStore` (no remote platform to
 //! poll, so `ingest`/`deliver` are no-ops -- the store *is* the platform here).
 //!
-//! Server-rendered like `status.rs`'s dashboard, with the same minimal-JS posture:
-//! one static page, a narrow JSON API (`/threads`, `/send`, `/messages`, `/read`),
-//! small inline JS that polls the *active* thread's `/messages` roughly every 1.5s
-//! and renders into the page in place. Multiple threads (`conversations` rows with
+//! Server-rendered like `status.rs`'s dashboard, on the same shared `web::page_shell`/
+//! `web::STYLE`/`web::nav` shell (so this page matches the dashboard's theme, font
+//! sizes, centered layout, and light/dark support instead of carrying its own
+//! hand-rolled copy) plus a small `CHAT_STYLE` addendum for the bubble/sidebar/
+//! composer look. Same minimal-JS posture as before: one static page, a narrow JSON
+//! API (`/threads`, `/send`, `/messages`, `/read`), small inline JS that polls the
+//! *active* thread's `/messages` roughly every 1.5s and patches the page in place
+//! (see `patchNode`/`renderThreadList` below -- both update existing DOM nodes rather
+//! than replacing whole subtrees, so an in-progress text selection elsewhere on the
+//! page survives a poll tick). Multiple threads (`conversations` rows with
 //! `connector='web'`) can coexist -- the sidebar lists them, a click switches the
 //! active one, "+ New chat" creates another; each is independent (its own
 //! `has_active_work`/typing state), and the worker answers pending messages across
@@ -142,11 +148,20 @@ async fn require_web_conversation(
 }
 
 async fn index(State(state): State<WebState>) -> Html<String> {
-    let page = PAGE_TEMPLATE
-        .replace("{STYLE}", STYLE)
-        .replace("{base}", &state.base_path)
-        .replace("{navbase}", &state.nav_path);
-    Html(page)
+    let body = BODY_TEMPLATE;
+    let extra_head = format!(
+        "<style>{CHAT_STYLE}</style>\n<script>{}</script>",
+        CHAT_SCRIPT
+            .replace("{base}", &state.base_path)
+            .replace("{navbase}", &state.nav_path)
+    );
+    Html(crate::web::page_shell(
+        "Symphony",
+        "chat",
+        &crate::web::nav(crate::web::NAV_LINKS, "/chat", &state.nav_path),
+        body,
+        &extra_head,
+    ))
 }
 
 fn thread_json(c: &super::store::ConversationRow) -> Value {
@@ -262,55 +277,87 @@ async fn mark_read(
     Ok(Json(json!({})))
 }
 
-const STYLE: &str = r#"
-  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; max-width: 1180px; margin: 0 auto; }
-  h1 { font-size: 1.1rem; font-weight: 600; color: #9cf; margin: 0 0 4px; }
-  .meta { color: #888; font-size: 0.8rem; margin-bottom: 12px; }
-  nav a { color: #9cf; text-decoration: none; margin-right: 16px; font-size: 0.85rem; }
-  nav a:hover { text-decoration: underline; }
+/// Layered on top of `web::STYLE`'s shared theme/vars and shared `.msg`/`.bubble`/
+/// `.status`/`.transcript` bubble rules (see that module's own doc comment on the
+/// "Chat-bubble transcript" block -- the same markup this page's JS produces is also
+/// what `status.rs::render_transcript` server-renders for the issue-filtered
+/// `/events` view). This addendum is only the sidebar/composer/typing-indicator
+/// chrome specific to the interactive chat page. `typing-pulse` is the only
+/// animation added here (the message entrance animation lives in the shared
+/// `.msg`/`msg-in` rule); both respect `prefers-reduced-motion: reduce`.
+const CHAT_STYLE: &str = r#"
   #layout { display: flex; gap: 20px; margin-top: 16px; align-items: flex-start; }
   #sidebar { width: 220px; flex-shrink: 0; }
-  #newThreadBtn { width: 100%; background: #1c3a5f; border: 1px solid #2a5a8f; color: #cde; padding: 8px 10px; border-radius: 6px; font-size: 0.85rem; cursor: pointer; margin-bottom: 10px; }
-  #newThreadBtn:hover { background: #234a78; }
+  #newThreadBtn { width: 100%; background: var(--bg-alt); border: 1px solid var(--border); color: var(--fg); padding: 8px 10px; border-radius: 6px; font-size: 0.85rem; cursor: pointer; margin-bottom: 10px; }
+  #newThreadBtn:hover { filter: brightness(1.2); }
   #threadList { display: flex; flex-direction: column; gap: 4px; }
-  .thread-item { padding: 8px 10px; border-radius: 6px; font-size: 0.82rem; color: #bbb; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid transparent; }
-  .thread-item:hover { background: #1a1a1a; }
-  .thread-item.active { background: #242424; border-color: #383838; color: #eee; }
+  .thread-item { padding: 8px 10px; border-radius: 6px; font-size: 0.82rem; color: var(--fg-dim); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid transparent; transition: background-color 0.15s ease, border-color 0.15s ease; }
+  .thread-item:hover { background: var(--bg-alt); }
+  .thread-item.active { background: var(--bg-alt); border-color: var(--border); color: var(--fg-strong); }
   #chatMain { flex: 1; min-width: 0; }
-  #messages { display: flex; flex-direction: column; gap: 10px; }
-  .msg { max-width: 78%; }
-  .msg.user { align-self: flex-end; }
-  .msg.assistant { align-self: flex-start; }
-  .msg.system { align-self: center; max-width: 100%; }
-  .bubble { border-radius: 10px; padding: 8px 12px; font-size: 0.9rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
-  .bubble :first-child { margin-top: 0; }
-  .bubble :last-child { margin-bottom: 0; }
-  .bubble code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
-  .bubble pre { background: #0d0d0d; border: 1px solid #333; border-radius: 6px; padding: 8px 10px; overflow-x: auto; white-space: pre; }
-  .bubble pre code { background: none; padding: 0; }
-  .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 4px; font-size: 1em; color: #9cf; }
-  .bubble ul, .bubble ol { margin: 4px 0; padding-left: 20px; }
-  .bubble a { color: #9cf; }
-  .msg.user .bubble { background: #1c3a5f; border: 1px solid #2a5a8f; }
-  .msg.assistant .bubble { background: #242424; border: 1px solid #383838; }
-  .msg.system .bubble { color: #aaa; background: #181818; font-style: italic; border: 1px dashed #333; }
-  .status { font-size: 0.72rem; color: #777; margin-top: 3px; }
-  .status .read { color: #8c8; }
-  #typing { color: #9cf; font-size: 0.8rem; font-style: italic; min-height: 1.2em; margin-top: 14px; }
-  form#chat-form { display: flex; gap: 8px; margin-top: 8px; }
-  form#chat-form input { flex: 1; background: #1c1c1c; border: 1px solid #333; color: #eee; padding: 10px 12px; border-radius: 6px; font-size: 0.9rem; }
-  form#chat-form button { background: #2d4d2d; border: 1px solid #3a6a3a; color: #9f9; padding: 10px 18px; border-radius: 6px; font-size: 0.9rem; cursor: pointer; }
+  #typing { color: var(--accent); font-size: 0.8rem; font-style: italic; min-height: 1.2em; margin-top: 14px; }
+  #typing.visible { animation: typing-pulse 1.4s ease-in-out infinite; }
+  form#chat-form { display: flex; gap: 8px; margin-top: 8px; align-items: flex-end; }
+  form#chat-form textarea { flex: 1; background: var(--bg-alt); border: 1px solid var(--border); color: var(--fg); padding: 10px 12px; border-radius: 6px; font-size: 0.9rem; font-family: inherit; resize: none; min-height: 40px; max-height: 160px; line-height: 1.4; }
+  form#chat-form textarea:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+  form#chat-form button { background: var(--good-bg); border: 1px solid var(--good-fg); color: var(--good-fg); padding: 10px 18px; border-radius: 6px; font-size: 0.9rem; cursor: pointer; }
+  form#chat-form button:hover:not(:disabled) { filter: brightness(1.15); }
   form#chat-form button:disabled { opacity: 0.5; cursor: default; }
-  .empty { color: #666; font-style: italic; }
+  .composer-hint { font-size: 0.72rem; color: var(--fg-dimmer); margin-top: 4px; }
+  .empty { color: var(--fg-dimmer); font-style: italic; }
+  @keyframes typing-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    #typing.visible { animation: none; }
+  }
+  /* Same breakpoint web::STYLE's own responsive block uses, so this page tightens up
+     at the same viewport width every other page does. The two-column layout (fixed
+     220px sidebar + main pane) has no room to breathe under that width -- collapse
+     to a single column instead, with the thread list turned into a horizontally
+     scrollable row of pills (rather than a tall stack) so it doesn't push the
+     composer off the bottom of a phone-height screen. */
+  @media (max-width: 640px) {
+    #layout { flex-direction: column; gap: 12px; }
+    #sidebar { width: 100%; display: flex; align-items: center; gap: 8px; }
+    #newThreadBtn { width: auto; margin-bottom: 0; flex-shrink: 0; }
+    #threadList { flex-direction: row; overflow-x: auto; gap: 8px; padding-bottom: 2px; }
+    .thread-item { flex-shrink: 0; max-width: 60vw; }
+    /* Send next to the textarea eats too much of an already-narrow width (the
+       placeholder wraps and gets clipped) -- stack it below instead so the textarea
+       gets the full row. 16px keeps iOS Safari from auto-zooming the page on focus. */
+    form#chat-form { flex-wrap: wrap; }
+    form#chat-form textarea { font-size: 16px; flex-basis: 100%; }
+    form#chat-form button { flex: 1; }
+  }
 "#;
 
-const PAGE_TEMPLATE: &str = r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Symphony &mdash; SweBot chat</title>
-<style>{STYLE}</style>
-<script>
+/// The page body -- everything below `web::page_shell`'s own `<h1>`/nav. `{base}`/
+/// `{navbase}` are not needed here (only the script references them); `index` embeds
+/// this verbatim as `page_shell`'s `body` argument.
+const BODY_TEMPLATE: &str = r#"<div class="meta">unified Q&amp;A and ticket drafting &middot; live updates every 1.5s, in place</div>
+<div id="layout">
+  <aside id="sidebar">
+    <button id="newThreadBtn" type="button">+ New chat</button>
+    <div id="threadList"></div>
+  </aside>
+  <main id="chatMain">
+    <div id="messages" class="transcript"><p class="empty">No messages yet &mdash; ask a question about the repo, or ask SweBot to draft a ticket.</p></div>
+    <div id="typing" style="display:none"></div>
+    <form id="chat-form">
+      <textarea id="text" autocomplete="off" rows="1" placeholder="Ask something, or: draft a ticket for &hellip;"></textarea>
+      <button id="sendBtn" type="submit">Send</button>
+    </form>
+    <div class="composer-hint">Shift+Enter for a newline</div>
+  </main>
+</div>"#;
+
+/// Embedded into `web::page_shell`'s `extra_head` (inside `<head>`, same spot
+/// `PAGE_TEMPLATE`'s inline `<script>` used to live) -- everything below still runs
+/// after `DOMContentLoaded`, so its position in `<head>` vs. end-of-`<body>` doesn't
+/// matter. `index` substitutes `{base}`/`{navbase}` before embedding.
+const CHAT_SCRIPT: &str = r#"
     const BASE = "{base}";
 let NAVBASE = "{navbase}";
 let lastId = 0;
@@ -412,14 +459,27 @@ function render(m) {
     '</div>';
 }
 
-function updateNode(m) {
+// Patches an existing message node's bubble/status text in place instead of
+// replacing the whole node (the old `node.outerHTML = render(m)` did that, tearing
+// down and recreating the element on every poll tick -- which also collapses any
+// text selection the user had started inside it). Only touches the DOM when the
+// rendered content actually changed, so a poll tick with nothing new to say for this
+// message is a no-op.
+function patchNode(m) {
   const node = document.getElementById("msg-" + m.id);
   if (!node) return;
   if (isDoneNotice(m)) {
     node.remove();
     return;
   }
-  node.outerHTML = render(m);
+  const bubble = node.querySelector(".bubble");
+  const newBody = md(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
+  if (bubble.innerHTML !== newBody) bubble.innerHTML = newBody;
+  const statusEl = node.querySelector(".status");
+  const status = statusLine(m);
+  const time = esc(formatTime(m.created_at));
+  const newStatusHtml = '<span class="time">' + time + '</span>' + (status ? ' &middot; ' + status : '');
+  if (statusEl.innerHTML !== newStatusHtml) statusEl.innerHTML = newStatusHtml;
 }
 
 async function poll() {
@@ -442,7 +502,7 @@ async function poll() {
   // `messages`, so read-marking has to happen here too, not just in the append
   // loop below, or a finished reply never gets marked read at all.
   for (const m of (data.recent || [])) {
-    updateNode(m);
+    patchNode(m);
     if (m.role === "assistant" && m.status === "sent") {
       readIds.push(m.id);
     }
@@ -472,6 +532,7 @@ async function poll() {
     if (last) last.scrollIntoView({behavior: "smooth", block: "nearest"});
   }
   typing.style.display = data.active ? "block" : "none";
+  typing.classList.toggle("visible", !!data.active);
   typing.innerHTML = data.active ? "SweBot is working&hellip;" : "";
   if (readIds.length) {
     fetch(BASE + "/read", {
@@ -482,12 +543,36 @@ async function poll() {
   }
 }
 
+// Diffs against the sidebar's existing DOM nodes by thread id instead of rebuilding
+// `#threadList.innerHTML` from scratch on every call (this runs after every send and
+// every new-thread action) -- reusing existing nodes means any state anchored to them
+// (e.g. an in-progress selection spanning into the sidebar) survives a refresh.
 function renderThreadList(threads) {
   const list = document.getElementById("threadList");
-  list.innerHTML = threads.map((t) =>
-    '<div class="thread-item' + (t.id === currentConv ? ' active' : '') + '" data-id="' + t.id + '">' +
-      esc(t.title) + '</div>'
-  ).join("");
+  const existing = new Map();
+  list.querySelectorAll(".thread-item").forEach((el) => existing.set(Number(el.dataset.id), el));
+  const seen = new Set();
+  let prevNode = null;
+  threads.forEach((t) => {
+    seen.add(t.id);
+    const isActive = t.id === currentConv;
+    let el = existing.get(t.id);
+    if (el) {
+      if (el.textContent !== t.title) el.textContent = t.title;
+    } else {
+      el = document.createElement("div");
+      el.className = "thread-item";
+      el.dataset.id = t.id;
+      el.textContent = t.title;
+    }
+    el.classList.toggle("active", isActive);
+    const wantNext = prevNode ? prevNode.nextSibling : list.firstChild;
+    if (wantNext !== el) list.insertBefore(el, wantNext);
+    prevNode = el;
+  });
+  existing.forEach((el, id) => {
+    if (!seen.has(id)) el.remove();
+  });
 }
 
 async function loadThreads(selectId) {
@@ -532,6 +617,14 @@ async function newThread() {
   await loadThreads(t.id);
 }
 
+// Grows the composer textarea to fit its content (up to CHAT_STYLE's `max-height`,
+// past which it scrolls) instead of a fixed single-line height -- needed now that
+// Shift+Enter can put multiple lines into it.
+function autoGrow(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 160) + "px";
+}
+
 async function sendMessage(ev) {
   ev.preventDefault();
   if (currentConv == null) return;
@@ -549,6 +642,7 @@ async function sendMessage(ev) {
     });
     if (res.ok) {
       input.value = "";
+      autoGrow(input);
       await poll();
       // The first message on a thread renames it (server-side) -- refresh the
       // sidebar so the new title shows up without a manual reload.
@@ -562,39 +656,27 @@ async function sendMessage(ev) {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  const textEl = document.getElementById("text");
   document.getElementById("chat-form").addEventListener("submit", sendMessage);
   document.getElementById("newThreadBtn").addEventListener("click", newThread);
   document.getElementById("threadList").addEventListener("click", (ev) => {
     const item = ev.target.closest(".thread-item");
     if (item) selectThread(Number(item.dataset.id));
   });
+  // Enter sends; Shift+Enter inserts a newline (the textarea's own default for
+  // Enter, so only the plain-Enter case needs intercepting).
+  textEl.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      document.getElementById("chat-form").requestSubmit();
+    }
+  });
+  textEl.addEventListener("input", () => autoGrow(textEl));
   await loadThreads();
   await poll();
   setInterval(poll, 1500);
-  document.getElementById("text").focus();
+  textEl.focus();
 });
-</script>
-</head>
-<body>
-<h1>SweBot chat</h1>
-<nav><a href="{navbase}/">Status</a></nav>
-<div class="meta">unified Q&amp;A and ticket drafting &middot; live updates every 1.5s, in place</div>
-<div id="layout">
-  <aside id="sidebar">
-    <button id="newThreadBtn" type="button">+ New chat</button>
-    <div id="threadList"></div>
-  </aside>
-  <main id="chatMain">
-    <div id="messages"><p class="empty">No messages yet &mdash; ask a question about the repo, or ask SweBot to draft a ticket.</p></div>
-    <div id="typing" style="display:none"></div>
-    <form id="chat-form">
-      <input id="text" autocomplete="off" placeholder="Ask something, or: draft a ticket for &hellip;">
-      <button id="sendBtn" type="submit">Send</button>
-    </form>
-  </main>
-</div>
-</body>
-</html>
 "#;
 
 #[cfg(test)]
@@ -644,10 +726,11 @@ mod tests {
             .await
             .unwrap();
         let html = String::from_utf8_lossy(&bytes).to_string();
-        assert!(html.contains("SweBot chat"));
+        assert!(html.contains("Symphony"));
+        assert!(html.contains(r#"<a href="/chat" class="active">Chat</a>"#));
         assert!(html.contains(r#"const BASE = "/chat";"#));
         assert!(html.contains("unified Q&amp;A"));
-        // PAGE_TEMPLATE is only ever run through plain `.replace()`, never `format!` --
+        // CHAT_SCRIPT is only ever run through plain `.replace()`, never `format!` --
         // a stray `{{`/`}}` written as if this were format!-escaped (as it once was)
         // ends up literally in the served <script>, which is invalid JS syntax.
         assert!(!html.contains("{{"));

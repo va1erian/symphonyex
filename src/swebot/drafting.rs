@@ -1,19 +1,18 @@
 //! Ticket-drafting capability: turns a rough idea posted in the repo's `Ideas`-
 //! category GitHub Discussions (`swebot.drafting.discussion_category`, default
-//! `"Ideas"`), an issue label on GitLab (`swebot.drafting.label`, default
-//! `"swebot::idea"`), or a board on `crate::board`'s local bulletin board when
-//! `swebot.board.enabled`, into a properly scoped issue through a clarifying
-//! dialogue. `selector` below is whichever of those `swebot::mod::run` resolved for
-//! the current `host`; this module itself stays agnostic to which one it got.
+//! `"Ideas"`) or an issue label on GitLab (`swebot.drafting.label`, default
+//! `"swebot::idea"`) into a properly scoped issue through a clarifying dialogue.
+//! `selector` below is whichever of those `swebot::run` resolved for the current
+//! `host`; this module itself stays agnostic to which one it got.
 //!
 //! Ends by creating a **new** issue via `TrackerAdapter::create_issue` rather than
 //! rewriting the source thread into one -- the source stays the messy conversational
 //! space, the tracker's Issues stays the clean actionable backlog Symphony's own
 //! dispatch loop watches, and a half-drafted idea is never sitting in the tracker
 //! looking dispatchable when it isn't. On GitLab (where the source thread is itself
-//! a tracker Issue) and on the local bulletin board, the source thread is closed
-//! once promoted (`DiscussionHost::close_thread`) to keep that separation from
-//! collapsing back into one undifferentiated list.
+//! a tracker Issue), the source thread is closed once promoted
+//! (`DiscussionHost::close_thread`) to keep that separation from collapsing back into
+//! one undifferentiated list.
 //!
 //! Each poll cycle starts a *fresh* `claude` session rather than resuming a previous
 //! one (a human's next reply may come hours later, well past a SweBot restart) --

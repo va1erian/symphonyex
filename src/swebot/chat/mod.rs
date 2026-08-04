@@ -50,8 +50,8 @@ pub struct ChatHandles {
 ///
 /// Ownership split when it IS on: chat's GitHub connector owns a *GitHub* repo's
 /// Discussions (and `swebot::run` skips its standalone Q&A/drafting for GitHub),
-/// while GitLab and the bulletin-board surface keep the standalone loops -- chat has
-/// no non-GitHub connector today. The bundled web UI is always enabled here.
+/// while GitLab keeps the standalone loop -- chat has no non-GitHub connector today.
+/// The bundled web UI is always enabled here.
 ///
 /// Errors are logged and the project continues without chat (same best-effort posture
 /// as `swebot::run`).
@@ -70,7 +70,7 @@ pub fn start(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) -> Option<C
 
     let mut connectors: Vec<Box<dyn connector::ChatConnector>> = Vec::new();
 
-    // GitHub Discussions connector (GitHub only -- chat doesn't speak GitLab/board).
+    // GitHub Discussions connector (GitHub only -- chat doesn't speak GitLab).
     if let Some(repo) = cfg
         .swebot_repo_config()
         .filter(|r| matches!(r.provider, RepoProvider::Github))
