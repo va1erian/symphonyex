@@ -204,21 +204,7 @@ impl AgentSession for OpenCodeSession {
         let mut cmd = match (&self.container, &self.container_workspace_path) {
             (Some(container), Some(container_workspace)) => {
                 let mut c = Command::new("docker");
-                c.arg("exec")
-                    .arg("-w")
-                    .arg(container_workspace.to_string_lossy().to_string())
-                    .arg(&container.name)
-                    .arg(&self.command)
-                    .args(&args);
-                // A container doesn't inherit the `docker` client's process env the
-                // way a plain child does, so a restricted session's permission JSON
-                // has to be forwarded explicitly via `-e`.
-                if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
-                    c.arg("-e").arg(format!("{k}={v}"));
-                }
-                if let Some((k, v)) = &self.mcp_config_env {
-                    c.arg("-e").arg(format!("{k}={v}"));
-                }
+                c.args(self.docker_exec_args(container_workspace, &container.name, &args));
                 kill_guard = Some(ContainerKillGuard::armed(
                     container.name.clone(),
                     self.command.clone(),
@@ -365,6 +351,45 @@ impl OpenCodeSession {
         // `claude.rs`'s `-p <prompt>` handling -- no injection surface from prompt
         // content containing shell metacharacters.
         args.push(prompt.to_string());
+        args
+    }
+
+    /// The full `docker exec` argv (everything after `docker`) for one Docker-mode
+    /// turn. Extracted from `run_turn` so tests can assert flag ordering without
+    /// spawning a process -- this is the exact ordering that matters: `docker exec
+    /// [OPTIONS] CONTAINER COMMAND [ARG...]` treats anything after CONTAINER as the
+    /// command and its own arguments, not a docker option. A real regression put
+    /// `-e` *after* `.arg(&container.name).arg(&self.command).args(&args)`, which
+    /// silently handed `-e OPENCODE_CONFIG_CONTENT=...` to `opencode` itself instead
+    /// of to `docker exec`; `opencode run` has no `-e` flag, so its yargs parser
+    /// rejected it and dumped its own usage/help text with exit 1 and zero NDJSON --
+    /// hit live once ticket dispatch started wiring `OPENCODE_CONFIG_CONTENT` through
+    /// this path (see `mcp_config_env`).
+    fn docker_exec_args(
+        &self,
+        container_workspace: &Path,
+        container_name: &str,
+        run_args: &[String],
+    ) -> Vec<String> {
+        let mut args = vec![
+            "exec".to_string(),
+            "-w".to_string(),
+            container_workspace.to_string_lossy().to_string(),
+        ];
+        // A container doesn't inherit the `docker` client's process env the way a
+        // plain child does, so a restricted session's permission JSON has to be
+        // forwarded explicitly via `-e`.
+        if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        if let Some((k, v)) = &self.mcp_config_env {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(container_name.to_string());
+        args.push(self.command.clone());
+        args.extend_from_slice(run_args);
         args
     }
 
@@ -717,6 +742,52 @@ mod tests {
         session.auto_approve = false;
         let args = session.run_args("just the prompt");
         assert_eq!(args, vec!["run", "--format", "json", "just the prompt"]);
+    }
+
+    /// Regression test for a real bug found running this live: `-e` flags built for
+    /// `mcp_config_env`/`permission_env` were being appended *after* the container
+    /// name and command, so `docker exec` handed them to `opencode` itself instead
+    /// of consuming them as its own options -- `opencode run` has no `-e` flag, so
+    /// it rejected the extra argument and dumped its own usage text with exit 1 and
+    /// zero NDJSON, wasting a real ticket-dispatch turn. Every `-e` must land before
+    /// the container name.
+    #[test]
+    fn docker_exec_args_puts_env_flags_before_the_container_name() {
+        let mut session = new_session();
+        session.mcp_config_env = Some(("OPENCODE_CONFIG_CONTENT".to_string(), "{}".to_string()));
+        let run_args = session.run_args("do the thing");
+        let args = session.docker_exec_args(Path::new("/project"), "my-container", &run_args);
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-w",
+                "/project",
+                "-e",
+                "OPENCODE_CONFIG_CONTENT={}",
+                "my-container",
+                "opencode",
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "do the thing",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_exec_args_includes_permission_env_before_the_container_name_too() {
+        let mut session = new_session();
+        session.permission_config = Some(r#"{"edit":"deny"}"#.to_string());
+        let run_args = session.run_args("prompt");
+        let args = session.docker_exec_args(Path::new("/project"), "my-container", &run_args);
+        let container_pos = args.iter().position(|a| a == "my-container").unwrap();
+        let env_pos = args.iter().position(|a| a == "-e").unwrap();
+        assert!(
+            env_pos < container_pos,
+            "-e must come before the container name: {args:?}"
+        );
     }
 
     fn test_wiring() -> McpToolWiring {
