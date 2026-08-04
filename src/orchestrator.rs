@@ -987,7 +987,33 @@ async fn reconcile_stalled(
         .collect();
 
     for (issue_id, identifier) in stalled {
-        tracing::warn!(issue_id = %issue_id, %identifier, stall_timeout_ms = stall_ms, "stall timeout exceeded; terminating worker");
+        // Everything already tracked on the entry, bundled into the one line that
+        // actually fires when a stall happens -- diagnosing "why did this go quiet"
+        // after the fact otherwise means grepping back through the full "agent
+        // event" log by hand for this issue_id/session_id to reconstruct the same
+        // picture (last event type/text, how long it had been silent, how much work
+        // it had done before going quiet).
+        if let Some(e) = state.running.get(&issue_id) {
+            let silent_for_ms = e
+                .last_event_at
+                .unwrap_or(e.started_at)
+                .elapsed()
+                .as_millis();
+            tracing::warn!(
+                issue_id = %issue_id,
+                %identifier,
+                stall_timeout_ms = stall_ms,
+                session_id = %e.session_id,
+                silent_for_ms,
+                running_for_ms = e.started_at.elapsed().as_millis(),
+                turn_count = e.turn_count,
+                tool_call_count = e.tool_call_count,
+                last_event = ?e.last_event,
+                last_message = ?e.last_message,
+                total_tokens = e.tokens.total_tokens,
+                "stall timeout exceeded; terminating worker"
+            );
+        }
         let attempt = state
             .running
             .get(&issue_id)

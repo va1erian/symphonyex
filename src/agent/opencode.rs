@@ -149,6 +149,16 @@ impl AgentSession for OpenCodeSession {
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AgentError> {
         let args = self.run_args(prompt);
+        // Everything but the prompt itself (last arg, and often long): enough to
+        // reproduce a hung/stalled turn's exact invocation by hand outside Symphony
+        // (`opencode <these args> "<the actual prompt>"`) without dumping a
+        // potentially huge prompt into every turn's log at debug level.
+        tracing::debug!(
+            command = %self.command,
+            workspace = %self.workspace.display(),
+            args = ?&args[..args.len().saturating_sub(1)],
+            "opencode: starting turn"
+        );
 
         // Same container-vs-host branch as `claude.rs::ClaudeSession::run_turn`: in
         // Docker mode, `docker exec` into the per-ticket container instead of
@@ -238,6 +248,14 @@ impl AgentSession for OpenCodeSession {
             if line.trim().is_empty() {
                 continue;
             }
+            // `handle_message` only ever surfaces a bare `type` string for anything
+            // it doesn't specifically recognize (`other_message`/`tool` with no
+            // name) -- the full raw line is the only way to actually see what an
+            // unrecognized event carried (a tool's arguments, a nested error, an id
+            // to correlate against). Opt-in (debug) since a chatty turn can be many
+            // lines; `RUST_LOG=debug` (or `RUST_LOG=symphony::agent::opencode=debug`)
+            // turns this on when diagnosing a stalled/hung turn after the fact.
+            tracing::debug!(target: "opencode_ndjson", "{line}");
             match serde_json::from_str::<Value>(&line) {
                 Ok(v) => {
                     if let Some(o) = self.handle_message(&v, &events) {
