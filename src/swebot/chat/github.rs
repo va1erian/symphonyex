@@ -447,7 +447,11 @@ mod tests {
                         &format!("{NOTICE_MARKER}\nStill working on that — checking the code."),
                         "swebot"
                     ),
-                    comment(11, &format!("{}\nAuth uses OAuth.", answered_marker(0)), "swebot"),
+                    comment(
+                        11,
+                        &format!("{}\nAuth uses OAuth.", answered_marker(0)),
+                        "swebot"
+                    ),
                 ]),
             ))
             .mount(&server)
@@ -461,6 +465,9 @@ mod tests {
         // notice at comment 10 must never have been enqueued as a question.
         let conv = store.list_conversations().unwrap()[0].id;
         let msgs = store.messages_of_conversation(conv, 0).unwrap();
-        assert!(msgs.is_empty(), "expected no enqueued messages, got {msgs:?}");
+        assert!(
+            msgs.is_empty(),
+            "expected no enqueued messages, got {msgs:?}"
+        );
     }
 }

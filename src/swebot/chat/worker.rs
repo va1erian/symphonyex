@@ -100,16 +100,44 @@ async fn process_cycle(
     store: &ChatStore,
 ) -> Result<(), String> {
     refresh_shared_clone(cfg).await;
+    answer_pending(cfg, backend, tracker, store).await
+}
 
+/// Claim and answer up to `max_concurrent_replies` pending messages -- one per
+/// conversation (`pending_user_messages`' own ordering guarantee), answered
+/// *concurrently* rather than one after another. Each turn is I/O-bound (a
+/// subprocess + waiting on the model), so awaiting them together via `join_all`
+/// lets multiple chat threads' turns genuinely overlap instead of one thread's
+/// (possibly tens-of-seconds-long) turn queuing up every other thread's reply
+/// behind it -- the whole reason `max_concurrent_replies` exists, but the previous
+/// sequential-for-loop version never actually delivered on the name. Split out from
+/// `process_cycle` so tests can exercise the concurrency itself without also paying
+/// for (or depending on the network access of) `refresh_shared_clone`'s git pull.
+async fn answer_pending(
+    cfg: &EffectiveConfig,
+    backend: &dyn AgentBackend,
+    tracker: &dyn TrackerAdapter,
+    store: &ChatStore,
+) -> Result<(), String> {
     let limit = cfg.swebot.chat.max_concurrent_replies.max(1) as usize;
     let pending = store
         .pending_user_messages(limit)
         .map_err(|e| format!("pending query failed: {e}"))?;
-    for msg in pending {
+    for msg in &pending {
         store
             .set_message_status(msg.id, STATUS_PROCESSING)
             .map_err(|e| format!("claim failed: {e}"))?;
-        match respond_to(cfg, backend, tracker, store, &msg).await {
+    }
+
+    let results = futures::future::join_all(
+        pending
+            .iter()
+            .map(|msg| respond_to(cfg, backend, tracker, store, msg)),
+    )
+    .await;
+
+    for (msg, result) in pending.iter().zip(results) {
+        match result {
             Ok(()) => {
                 store
                     .set_message_status(msg.id, STATUS_PROCESSED)
@@ -833,6 +861,69 @@ mod tests {
         let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
         assert_eq!(assistant.body, "finally");
         assert_eq!(assistant.status, STATUS_SENT);
+    }
+
+    /// Regression test: two different conversations each with a pending message must
+    /// be answered *concurrently*, not one after the other. Before this fix,
+    /// `process_cycle` awaited each `respond_to` inside a plain `for` loop, so with
+    /// multiple chat threads in use at once, one thread's (possibly tens-of-seconds)
+    /// turn queued up every other thread's reply behind it. A 300ms-per-turn backend
+    /// answering two pending messages should take close to 300ms total, not ~600ms.
+    /// Calls `answer_pending` directly (not `process_cycle`) so this only measures
+    /// the answering step, not `refresh_shared_clone`'s unrelated git pull.
+    #[tokio::test]
+    async fn two_conversations_pending_at_once_are_answered_concurrently() {
+        let cfg = test_cfg("    max_concurrent_replies: 2\n");
+        let (store, _tmp) = chat_store();
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        let backend = SlowBackend {
+            first_text_delay_ms: 1_000,
+            body: "done".to_string(),
+        };
+        let conv_a = store.create_conversation("test", None, "u", "a").unwrap();
+        let conv_b = store.create_conversation("test", None, "u", "b").unwrap();
+        store
+            .insert_message(
+                conv_a,
+                ROLE_USER,
+                "question a",
+                STATUS_PENDING,
+                &json!({}),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                conv_b,
+                ROLE_USER,
+                "question b",
+                STATUS_PENDING,
+                &json!({}),
+                None,
+            )
+            .unwrap();
+
+        let start = tokio::time::Instant::now();
+        answer_pending(&cfg, &backend, tracker.as_ref(), &store)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        // Sequential would be at least 2s of guaranteed sleep alone, before any of
+        // this store's own (real SQLite, real disk) per-call overhead; concurrent
+        // overlaps both turns' sleeps, so total stays well under that regardless of
+        // how much overhead the store itself adds on top.
+        assert!(
+            elapsed < Duration::from_millis(1_700),
+            "expected two 1000ms turns to overlap (well under 2000ms total), took {elapsed:?}"
+        );
+
+        for conv in [conv_a, conv_b] {
+            let msgs = store.messages_of_conversation(conv, 0).unwrap();
+            let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
+            assert_eq!(assistant.body, "done");
+            assert_eq!(assistant.status, STATUS_SENT);
+        }
     }
 
     #[test]

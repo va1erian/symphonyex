@@ -140,7 +140,6 @@ impl ChatStore {
     // Conversations
     // ---------------------------------------------------------------------------
 
-    #[allow(dead_code)] // exercised by the GitHub-Discussions connector (Phase D)
     pub fn create_conversation(
         &self,
         connector: &str,
@@ -191,35 +190,6 @@ impl ChatStore {
         self.create_conversation(connector, Some(remote_id), user_handle, title)
     }
 
-    /// The web connector's default conversation for a user handle: the earliest web
-    /// one, created on first use.
-    pub fn get_or_create_web_conversation(&self, user_handle: &str) -> Result<i64, ChatError> {
-        let c = self.conn()?;
-        if let Some(id) = c
-            .query_row(
-                "SELECT id FROM conversations WHERE connector='web' AND user_handle=?1 \
-                 ORDER BY id LIMIT 1",
-                params![user_handle],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-        {
-            return Ok(id);
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        c.execute(
-            "INSERT INTO conversations (connector, remote_id, user_handle, title, created_at, \
-             updated_at) VALUES ('web', NULL, ?1, ?2, ?3, ?3)",
-            params![
-                user_handle,
-                format!("Chat with SweBot ({user_handle})"),
-                now
-            ],
-        )?;
-        Ok(c.last_insert_rowid())
-    }
-
-    #[allow(dead_code)] // exercised by the GitHub-Discussions connector (Phase D)
     pub fn conversation(&self, id: i64) -> Result<Option<ConversationRow>, ChatError> {
         let c = self.conn()?;
         Ok(c.query_row(
@@ -240,6 +210,33 @@ impl ChatStore {
         )?;
         let rows = stmt.query_map([], row_to_conversation)?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Non-archived conversations for one connector only (e.g. `"web"`, to list a
+    /// user's own chat threads without GitHub Discussions mixed in), newest-updated
+    /// first -- what the web UI's thread sidebar renders.
+    pub fn list_conversations_by_connector(
+        &self,
+        connector: &str,
+    ) -> Result<Vec<ConversationRow>, ChatError> {
+        let c = self.conn()?;
+        let mut stmt = c.prepare(
+            "SELECT id, connector, remote_id, user_handle, title, created_at, updated_at \
+             FROM conversations WHERE connector=?1 AND archived=0 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![connector], row_to_conversation)?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Rename a conversation -- the web UI auto-titles a new thread from its first
+    /// message once sent (a fresh thread starts as "New chat").
+    pub fn set_conversation_title(&self, id: i64, title: &str) -> Result<(), ChatError> {
+        let c = self.conn()?;
+        c.execute(
+            "UPDATE conversations SET title=?1 WHERE id=?2",
+            params![title, id],
+        )?;
+        Ok(())
     }
 
     fn touch(&self, c: &Connection, conversation_id: i64) -> Result<(), ChatError> {
@@ -701,12 +698,30 @@ mod tests {
     }
 
     #[test]
-    fn web_conversation_is_created_once_and_reused() {
+    fn multiple_web_conversations_can_coexist_and_be_listed_newest_first() {
         let (s, _d) = store();
-        let a = s.get_or_create_web_conversation("you").unwrap();
-        let b = s.get_or_create_web_conversation("you").unwrap();
-        assert_eq!(a, b);
-        assert_eq!(s.list_conversations().unwrap().len(), 1);
+        let a = s
+            .create_conversation("web", None, "you", "New chat")
+            .unwrap();
+        let b = s
+            .create_conversation("web", None, "you", "New chat")
+            .unwrap();
+        assert_ne!(a, b);
+        let threads = s.list_conversations_by_connector("web").unwrap();
+        assert_eq!(threads.len(), 2);
+        // `b` was created (and so touched) after `a`, so it's newest-first.
+        assert_eq!(threads[0].id, b);
+        assert_eq!(threads[1].id, a);
+    }
+
+    #[test]
+    fn set_conversation_title_renames_it() {
+        let (s, _d) = store();
+        let c = s
+            .create_conversation("web", None, "you", "New chat")
+            .unwrap();
+        s.set_conversation_title(c, "auth question").unwrap();
+        assert_eq!(s.conversation(c).unwrap().unwrap().title, "auth question");
     }
 
     #[test]
@@ -795,7 +810,10 @@ mod tests {
 
         ChatStore::open(s.path.clone()).unwrap();
 
-        assert_eq!(s.message(assistant_id).unwrap().unwrap().status, STATUS_FAILED);
+        assert_eq!(
+            s.message(assistant_id).unwrap().unwrap().status,
+            STATUS_FAILED
+        );
         assert_eq!(
             s.message(notice_id).unwrap().unwrap().status,
             STATUS_NOTICE_DONE
