@@ -472,12 +472,20 @@ swebot:
   backend: opencode
   chat:
     enabled: true
-    connectors: [web]          # interactive connectors: 'web' is the chat UI
-    poll_interval_ms: 5000     # how often the worker looks for new messages
-    max_concurrent_replies: 2  # answers per processing cycle (1-2 is plenty)
-    auto_create_issue: true    # file a finished draft immediately (default)
-    first_text_deadline_ms: 5000
+    connectors: [web]              # interactive connectors: 'web' is the chat UI
+    poll_interval_ms: 5000         # how often the worker answers pending messages (local only)
+    remote_poll_interval_ms: 30000 # how often each remote connector (github) polls its own API
+    max_concurrent_replies: 2      # answers per processing cycle (1-2 is plenty)
+    auto_create_issue: true        # file a finished draft immediately (default)
+    first_text_deadline_ms: 2000
 ```
+
+`poll_interval_ms` and `remote_poll_interval_ms` are deliberately separate: answering a
+pending message is a local SQLite read plus a model turn, so polling for it often costs
+nothing external -- but a remote connector's `ingest`/`deliver` (GitHub Discussions'
+GraphQL API today) burns real rate-limit budget every tick, so it defaults to a much
+slower cadence. `web` has no remote platform to poll (`ingest`/`deliver` are no-ops
+there), so `remote_poll_interval_ms` only matters once a remote connector is active.
 
 **How it's structured** (`src/swebot/chat/`): a SQLite store (`symphony-chat.db` next to
 `symphony.db`, `store.rs`) holds conversations and messages; a connector-agnostic

@@ -337,10 +337,22 @@ pub struct SwebotChatConfig {
     /// chat UI served by the status dashboard. Future connectors (e.g. `teams`) plug
     /// in here; see `swebot::chat::connector::ChatConnector` for the contract.
     pub connectors: Vec<String>,
-    /// How often the chat worker polls for new/pending user messages. Independent of
-    /// `polling.interval_ms` (ticket dispatch's cadence) -- chat is interactive and
-    /// wants a snappier turn-around ("responds in a reasonable time, not instant").
+    /// How often the worker looks for pending user messages to answer -- purely
+    /// local (a SQLite query), regardless of which connector a message came from.
+    /// Independent of `polling.interval_ms` (ticket dispatch's cadence) -- chat is
+    /// interactive and wants a snappier turn-around ("responds in a reasonable time,
+    /// not instant"). Deliberately *not* the cadence remote connectors poll their own
+    /// platform on -- see `remote_poll_interval_ms` for that.
     pub poll_interval_ms: u64,
+    /// How often each remote connector's own `ingest`/`deliver` runs against its
+    /// platform (e.g. GitHub Discussions' GraphQL API) -- separate from
+    /// `poll_interval_ms` specifically so a fast, free-to-poll-often local answering
+    /// cadence doesn't force an equally aggressive cadence against a rate-limited
+    /// remote API. `web` has no remote platform to poll (`ingest`/`deliver` are
+    /// no-ops there), so this only matters once a remote connector (`github` today)
+    /// is active. Higher than `poll_interval_ms` by default: GitHub's GraphQL rate
+    /// limit is easy to burn through polling every few seconds indefinitely.
+    pub remote_poll_interval_ms: u64,
     /// How many pending user messages the worker answers per tick, across all
     /// conversations. 1-2 is plenty: one reply turn can take tens of seconds.
     pub max_concurrent_replies: u32,
@@ -599,6 +611,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             chat_connectors
         },
         poll_interval_ms: get_u64(swebot_chat, "poll_interval_ms", 5_000).max(100),
+        remote_poll_interval_ms: get_u64(swebot_chat, "remote_poll_interval_ms", 30_000).max(100),
         max_concurrent_replies: get_u64(swebot_chat, "max_concurrent_replies", 2).max(1) as u32,
         auto_create_issue: get(swebot_chat, "auto_create_issue")
             .and_then(|v| v.as_bool())
@@ -1353,6 +1366,7 @@ mod tests {
             "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
              token: $SYMPHONY_TEST_SWEBOT_TOKEN_10\nswebot:\n  enabled: true\n  \
              chat:\n    enabled: true\n    connectors: [web]\n    poll_interval_ms: 1500\n    \
+             remote_poll_interval_ms: 45000\n    \
              max_concurrent_replies: 3\n    auto_create_issue: false\n    max_history_messages: 10\n    \
              first_text_deadline_ms: 2500\n",
         );
@@ -1361,10 +1375,23 @@ mod tests {
         assert!(chat.enabled);
         assert_eq!(chat.connectors, vec!["web".to_string()]);
         assert_eq!(chat.poll_interval_ms, 1500);
+        assert_eq!(chat.remote_poll_interval_ms, 45_000);
         assert_eq!(chat.max_concurrent_replies, 3);
         assert!(!chat.auto_create_issue);
         assert_eq!(chat.max_history_messages, 10);
         assert_eq!(chat.first_text_deadline_ms, 2500);
+    }
+
+    #[test]
+    fn chat_remote_poll_interval_defaults_slower_than_poll_interval() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_14\nswebot:\n  enabled: true\n  \
+             chat:\n    enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.swebot.chat.poll_interval_ms, 5_000);
+        assert_eq!(cfg.swebot.chat.remote_poll_interval_ms, 30_000);
     }
 
     #[test]
@@ -1396,10 +1423,12 @@ mod tests {
         let cfg_yaml = parse_yaml(
             "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
              token: $SYMPHONY_TEST_SWEBOT_TOKEN_13\nswebot:\n  enabled: true\n  \
-             chat:\n    enabled: true\n    poll_interval_ms: 0\n    max_concurrent_replies: 0\n",
+             chat:\n    enabled: true\n    poll_interval_ms: 0\n    remote_poll_interval_ms: 0\n    \
+             max_concurrent_replies: 0\n",
         );
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert_eq!(cfg.swebot.chat.poll_interval_ms, 100);
+        assert_eq!(cfg.swebot.chat.remote_poll_interval_ms, 100);
         assert_eq!(cfg.swebot.chat.max_concurrent_replies, 1);
     }
 

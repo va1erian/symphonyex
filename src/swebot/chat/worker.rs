@@ -1,5 +1,9 @@
 //! Chat worker: the single authority that turns pending user messages into SweBot
-//! replies. One task per project, polled on `swebot.chat.poll_interval_ms`.
+//! replies. One task per project, polled on `swebot.chat.poll_interval_ms` -- kept
+//! fast since answering is purely local. Each remote connector's own `ingest`/
+//! `deliver` (e.g. GitHub Discussions) run on the separate, slower
+//! `swebot.chat.remote_poll_interval_ms` instead, so answering quickly never forces
+//! polling a rate-limited API just as often.
 //!
 //! Turn flow per message:
 //!
@@ -55,18 +59,25 @@ pub async fn run_loop(
         tracing::warn!(error = %e, "chat: stale-claim requeue failed");
     }
 
-    // Delivery runs on its *own* loop, concurrently with processing: a non-web
-    // connector (GitHub) must be able to post a slow turn's "still working" notice
-    // *while* the turn is still running, which is impossible if deliver only ever
-    // runs after the worker returns. The two loops only touch disjoint rows (the
-    // worker writes streaming/sent statuses; delivery marks `remote_message_id`),
-    // so WAL SQLite handles the concurrency.
+    // Delivery and ingest each run on their *own* loop, on `remote_poll_interval_ms`
+    // -- separate from `poll_interval_ms` (the fast, purely-local "answer whatever's
+    // pending" cadence below) so a connector with a real rate-limited API (GitHub's
+    // Discussions GraphQL) doesn't have to be polled as often as the worker answers
+    // messages. `web`'s `ingest`/`deliver` are no-ops, so this only matters once a
+    // remote connector is active. Delivery specifically also needs its own loop
+    // (independent of ingest, not just of answering) so a non-web connector can post
+    // a slow turn's "still working" notice *while* the turn is still running --
+    // impossible if deliver only ever ran after the worker returned. All three loops
+    // only ever touch disjoint rows (ingest writes new `pending` rows; the worker
+    // writes streaming/sent statuses; delivery marks `remote_message_id`), so WAL
+    // SQLite handles the concurrency between them.
     let connectors = Arc::new(connectors);
+    let remote_interval_ms = cfg.swebot.chat.remote_poll_interval_ms.max(100);
+
     let deliver_connectors = connectors.clone();
     let deliver_store = store.clone();
     tokio::spawn(async move {
-        let deliver_interval_ms = cfg.swebot.chat.poll_interval_ms.max(100);
-        let mut interval = tokio::time::interval(Duration::from_millis(deliver_interval_ms));
+        let mut interval = tokio::time::interval(Duration::from_millis(remote_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -78,16 +89,26 @@ pub async fn run_loop(
         }
     });
 
+    let ingest_connectors = connectors.clone();
+    let ingest_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(remote_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            for connector in ingest_connectors.iter() {
+                if let Err(e) = connector.ingest(&ingest_store).await {
+                    tracing::warn!(connector = connector.name(), error = %e, "chat: connector ingest failed");
+                }
+            }
+        }
+    });
+
     let interval_ms = cfg.swebot.chat.poll_interval_ms.max(100);
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        for connector in connectors.iter() {
-            if let Err(e) = connector.ingest(&store).await {
-                tracing::warn!(connector = connector.name(), error = %e, "chat: connector ingest failed");
-            }
-        }
         if let Err(e) = process_cycle(&cfg, backend.as_ref(), tracker.as_ref(), &store).await {
             tracing::warn!(error = %e, "chat: processing cycle failed");
         }
