@@ -143,8 +143,9 @@ pub const STYLE: &str = r#"
 /// each need to wire up their own listeners: click-to-expand on truncated `.msg`/
 /// `.msg-cell` content, client-side sort on `th[data-sort]` (reorders the rows already
 /// on the page -- server-side pagination is unaffected, sorting only the current
-/// page), and a `confirm()` gate on any `<form data-confirm="...">` before it submits
-/// (used for destructive actions like removing a registered repo).
+/// page), a `confirm()` gate on any `<form data-confirm="...">` before it submits
+/// (used for destructive actions like removing a registered repo), and a live
+/// character counter under any `[maxlength]` field (board.rs's compose/reply forms).
 pub const SCRIPT: &str = r#"
 document.addEventListener('click', function (e) {
   var msg = e.target.closest('.msg, .msg-cell');
@@ -155,6 +156,15 @@ document.addEventListener('click', function (e) {
 document.addEventListener('submit', function (e) {
   var msg = e.target.getAttribute('data-confirm');
   if (msg && !window.confirm(msg)) { e.preventDefault(); }
+});
+document.querySelectorAll('[maxlength]').forEach(function (el) {
+  var max = el.getAttribute('maxlength');
+  var counter = document.createElement('div');
+  counter.className = 'char-count';
+  el.insertAdjacentElement('afterend', counter);
+  var update = function () { counter.textContent = el.value.length + ' / ' + max; };
+  el.addEventListener('input', update);
+  update();
 });
 function sortTableByColumn(th) {
   var table = th.closest('table');

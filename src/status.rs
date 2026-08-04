@@ -197,7 +197,7 @@ setInterval(refreshFragment, 2000);
     );
     let body = format!(
         r#"<div class="meta">generated {generated} &middot; live-updates every 2s, in place (no page reload)</div>
-<div id="symphony-fragment">{fragment}</div>"#,
+<div id="symphony-fragment" aria-live="polite" role="status">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
         fragment = render_fragment(&snapshot),
     );

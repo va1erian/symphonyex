@@ -533,7 +533,7 @@ fn new_thread_form_response(
   <label for="nt-title">Title</label>
   <input type="text" id="nt-title" name="title" required maxlength="200" value="{title}">
   <label for="nt-body">Body (markdown supported)</label>
-  <textarea id="nt-body" name="body" required>{body_text}</textarea>
+  <textarea id="nt-body" name="body" required maxlength="10000">{body_text}</textarea>
   <button type="submit">Post</button>
 </form>"#,
         base = base,
@@ -667,7 +667,7 @@ async fn render_thread_page(
   <label for="r-author">Your name</label>
   <input type="text" id="r-author" name="author" placeholder="anonymous" maxlength="80" value="{reply_author}">
   <label for="r-body">Reply (markdown supported)</label>
-  <textarea id="r-body" name="body" required>{reply_body}</textarea>
+  <textarea id="r-body" name="body" required maxlength="10000">{reply_body}</textarea>
   <button type="submit">Reply</button>
 </form>"#,
             base = base,
