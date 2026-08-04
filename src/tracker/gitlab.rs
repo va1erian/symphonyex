@@ -1,36 +1,41 @@
-//! GitHub Issues tracker adapter (`tracker.kind: github`).
+//! GitLab Issues tracker adapter (`tracker.kind: gitlab`).
 //!
-//! State model: an **open** issue plus a managed `state:*` label is an active state; a
-//! **closed** issue is the one supported terminal state (`closed_state` names it, e.g.
-//! `done`). GitHub Issues have no native custom-state field, so this adapter owns a
-//! small label vocabulary instead of writing arbitrary state strings the way
-//! `local.rs` does. Only one terminal state is modeled for v1 (matches most
-//! workflows' `todo -> in progress -> done` shape); a project needing a distinct
-//! `cancelled` etc. would need this extended, not configured around.
+//! State model: mirrors `tracker::github`'s exactly -- an **open** issue plus a
+//! managed `state:*` label is an active state; a **closed** issue is the one
+//! supported terminal state (`closed_state` names it, e.g. `done`). Only one
+//! terminal state is modeled for v1, same rationale as `tracker::github`.
 //!
 //! `tracker.provider`:
-//! - `repo` (string, REQUIRED): `owner/name`.
-//! - `token` (string, REQUIRED): a GitHub token with `repo`/`issues` scope. Normally
-//!   `$VAR`-indirected (`envsub::resolve_var`) rather than written in plain text.
-//! - `closed_state` (string, REQUIRED): the `tracker.terminal_states` value that means
-//!   "this issue is closed" (e.g. `done`).
-//! - `active_state_labels` (map of state name -> label, REQUIRED): every non-terminal
-//!   `tracker.active_states` value must have an entry here.
-//! - `base_url` (string, OPTIONAL): defaults to `https://api.github.com`; override for
-//!   GitHub Enterprise, or by tests, to point at a mock server.
+//! - `project` (string, REQUIRED): `group/subgroup/name` path (GitLab supports
+//!   nested subgroups; percent-encoded automatically for the `:id` path segment the
+//!   REST API expects).
+//! - `token` (string, REQUIRED): a GitLab token (personal/project/group access
+//!   token) with `api` scope. Normally `$VAR`-indirected (`envsub::resolve_var`)
+//!   rather than written in plain text.
+//! - `closed_state` (string, REQUIRED): the `tracker.terminal_states` value that
+//!   means "this issue is closed" (e.g. `done`).
+//! - `active_state_labels` (map of state name -> label, REQUIRED): every
+//!   non-terminal `tracker.active_states` value must have an entry here.
+//! - `base_url` (string, OPTIONAL): defaults to `https://gitlab.com/api/v4`;
+//!   override for a self-managed instance, or by tests, to point at a mock server.
 //!
-//! `depends_on`: GitHub issues have no native blocking-dependency field reachable via
-//! plain REST, so it's parsed from a line in the issue body matching (case
-//! insensitively) `Depends-On: #12, #45`. Cross-issue resolution reuses
-//! `super::depends_on::resolve_dependencies` -- the same two-pass "AND dispatchable
-//! with every dependency being done, populate blocked_by" logic `local.rs` uses,
-//! rather than a second implementation that could quietly diverge.
+//! `depends_on`: same `Depends-On: #12, #45` body-text convention as GitHub (GitLab
+//! issues have no native blocking-dependency field reachable via plain REST either),
+//! parsed via the shared `super::depends_on::parse_depends_on`/`resolve_dependencies`.
 //!
-//! `Issue::id`/`identifier` are both the issue number as a string (GitHub issues have
-//! no separate stable identifier distinct from their number). `branch_name` defaults
-//! to `issue-<number>` so a project's repo hooks (see README.md "Git repo as
-//! first-class input") have a natural per-ticket branch name to work with without
-//! extra configuration.
+//! `Issue::id`/`identifier` are both the issue `iid` (project-scoped) as a string --
+//! **not** GitLab's global `id`, which is unique across the whole instance but not
+//! the number a human or the project's own UI ever sees; `iid` is what
+//! `WORKFLOW.md`/issue URLs/`#N` references all mean. `branch_name` defaults to
+//! `issue-<iid>`, same convention as `tracker::github`.
+//!
+//! Wire-format divergences from `tracker::github` worth flagging: the issue
+//! identifier is `iid` not `number`; the body field is `description` not `body`;
+//! labels come back as plain strings (`["x"]`) not `{name: "x"}` objects; Issues and
+//! Merge Requests are fully separate resources (no `pull_request` filter needed the
+//! way GitHub's mixed issues-list endpoint requires); closing/reopening is the verb
+//! `state_event: "close"|"reopen"`, not the noun `state: "open"|"closed"`; and auth
+//! is a bare `PRIVATE-TOKEN` header, not `Authorization: Bearer`.
 
 use super::depends_on::{RawIssue, parse_depends_on, resolve_dependencies};
 use super::{ToolResult, ToolSpec, TrackerAdapter, TrackerError};
@@ -43,14 +48,15 @@ use serde_json::json;
 use serde_yaml::Value;
 use std::collections::HashMap;
 
-const DEFAULT_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_BASE_URL: &str = "https://gitlab.com/api/v4";
 const PER_PAGE: u32 = 100;
 const MAX_PAGES: u32 = 20; // safety cap, not expected to matter at realistic ticket counts
 
-pub struct GithubTrackerAdapter {
+pub struct GitlabTrackerAdapter {
     client: reqwest::Client,
     base_url: String,
-    repo: String,
+    /// Percent-encoded project path, ready to interpolate as the `:id` path segment.
+    project: String,
     token: String,
     closed_state: String,
     /// normalized (trim + lowercase) state name -> label
@@ -58,34 +64,36 @@ pub struct GithubTrackerAdapter {
 }
 
 #[derive(Debug, Deserialize)]
-struct GhIssue {
-    number: u64,
+struct GlIssue {
+    iid: u64,
     title: String,
     #[serde(default)]
-    body: Option<String>,
-    state: String, // "open" | "closed"
+    description: Option<String>,
+    state: String, // "opened" | "closed"
     #[serde(default)]
-    labels: Vec<GhLabel>,
+    labels: Vec<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    html_url: String,
-    #[serde(default)]
-    pull_request: Option<serde_json::Value>,
+    web_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GhLabel {
-    name: String,
+/// GitLab's REST API expects the project path (`group/subgroup/name`) percent-encoded
+/// as a single `:id` path segment -- no `percent-encoding` dependency for just this
+/// one character, mirroring `tracker::depends_on::parse_depends_on`'s own "manual
+/// scan rather than a new dependency" style.
+fn encode_project_path(project: &str) -> String {
+    project.replace('/', "%2F")
 }
 
-impl GithubTrackerAdapter {
+impl GitlabTrackerAdapter {
     pub fn new(provider: &Value) -> Result<Self, TrackerError> {
-        let repo = provider
-            .get("repo")
+        let project = provider
+            .get("project")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 TrackerError::InvalidTrackerConfig(
-                    "tracker.provider.repo is required for tracker.kind=github (owner/name)"
+                    "tracker.provider.project is required for tracker.kind=gitlab \
+                     (group/subgroup/name)"
                         .to_string(),
                 )
             })?
@@ -96,7 +104,7 @@ impl GithubTrackerAdapter {
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 TrackerError::InvalidTrackerConfig(
-                    "tracker.provider.token is required for tracker.kind=github".to_string(),
+                    "tracker.provider.token is required for tracker.kind=gitlab".to_string(),
                 )
             })?;
         let token = envsub::resolve_var(token_raw).ok_or_else(|| {
@@ -108,7 +116,7 @@ impl GithubTrackerAdapter {
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 TrackerError::InvalidTrackerConfig(
-                    "tracker.provider.closed_state is required for tracker.kind=github".to_string(),
+                    "tracker.provider.closed_state is required for tracker.kind=gitlab".to_string(),
                 )
             })?
             .trim()
@@ -129,7 +137,7 @@ impl GithubTrackerAdapter {
             .unwrap_or_default();
         if active_state_labels.is_empty() {
             return Err(TrackerError::InvalidTrackerConfig(
-                "tracker.provider.active_state_labels must have at least one entry for tracker.kind=github"
+                "tracker.provider.active_state_labels must have at least one entry for tracker.kind=gitlab"
                     .to_string(),
             ));
         }
@@ -149,7 +157,7 @@ impl GithubTrackerAdapter {
         Ok(Self {
             client,
             base_url,
-            repo,
+            project: encode_project_path(&project),
             token,
             closed_state,
             active_state_labels,
@@ -157,26 +165,33 @@ impl GithubTrackerAdapter {
     }
 
     fn auth_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.bearer_auth(&self.token)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+        req.header("PRIVATE-TOKEN", &self.token)
     }
 
-    /// List open issues carrying `label`, paginated, skipping pull requests (GitHub's
-    /// issues-list endpoint includes them unless filtered out client-side).
-    async fn list_open_issues(&self, label: &str) -> Result<Vec<GhIssue>, TrackerError> {
+    /// List issues in `state` (`"opened"`/`"closed"`), optionally filtered to
+    /// `label`, paginated. Unlike GitHub's mixed issues-list endpoint, GitLab Issues
+    /// and Merge Requests are fully separate resources, so no client-side filtering
+    /// is needed here.
+    async fn list_issues(
+        &self,
+        state: &str,
+        label: Option<&str>,
+    ) -> Result<Vec<GlIssue>, TrackerError> {
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
-            let url = format!("{}/repos/{}/issues", self.base_url, self.repo);
-            let req = self.client.get(&url).query(&[
-                ("state", "open"),
-                ("labels", label),
-                ("per_page", &PER_PAGE.to_string()),
-                ("page", &page.to_string()),
-            ]);
-            let batch: Vec<GhIssue> = self.send_json(self.auth_headers(req)).await?;
+            let url = format!("{}/projects/{}/issues", self.base_url, self.project);
+            let mut query = vec![
+                ("state", state.to_string()),
+                ("per_page", PER_PAGE.to_string()),
+                ("page", page.to_string()),
+            ];
+            if let Some(l) = label {
+                query.push(("labels", l.to_string()));
+            }
+            let req = self.client.get(&url).query(&query);
+            let batch: Vec<GlIssue> = self.send_json(self.auth_headers(req)).await?;
             let got = batch.len();
-            out.extend(batch.into_iter().filter(|i| i.pull_request.is_none()));
+            out.extend(batch);
             if got < PER_PAGE as usize {
                 break;
             }
@@ -184,27 +199,8 @@ impl GithubTrackerAdapter {
         Ok(out)
     }
 
-    async fn list_closed_issues(&self) -> Result<Vec<GhIssue>, TrackerError> {
-        let mut out = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let url = format!("{}/repos/{}/issues", self.base_url, self.repo);
-            let req = self.client.get(&url).query(&[
-                ("state", "closed"),
-                ("per_page", &PER_PAGE.to_string()),
-                ("page", &page.to_string()),
-            ]);
-            let batch: Vec<GhIssue> = self.send_json(self.auth_headers(req)).await?;
-            let got = batch.len();
-            out.extend(batch.into_iter().filter(|i| i.pull_request.is_none()));
-            if got < PER_PAGE as usize {
-                break;
-            }
-        }
-        Ok(out)
-    }
-
-    async fn get_issue(&self, number: u64) -> Result<Option<GhIssue>, TrackerError> {
-        let url = format!("{}/repos/{}/issues/{}", self.base_url, self.repo, number);
+    async fn get_issue(&self, iid: u64) -> Result<Option<GlIssue>, TrackerError> {
+        let url = format!("{}/projects/{}/issues/{}", self.base_url, self.project, iid);
         let resp = self
             .auth_headers(self.client.get(&url))
             .send()
@@ -219,7 +215,7 @@ impl GithubTrackerAdapter {
                 resp.status()
             )));
         }
-        resp.json::<GhIssue>()
+        resp.json::<GlIssue>()
             .await
             .map(Some)
             .map_err(|e| TrackerError::Response(e.to_string()))
@@ -252,56 +248,53 @@ impl GithubTrackerAdapter {
             .collect()
     }
 
-    fn to_domain(&self, gh: GhIssue) -> Issue {
-        let normalized_state = self.normalize_state(&gh);
-        let number_str = gh.number.to_string();
-        let labels: Vec<String> = gh
-            .labels
-            .iter()
-            .map(|l| l.name.trim().to_lowercase())
-            .collect();
+    fn to_domain(&self, gl: GlIssue) -> Issue {
+        let normalized_state = self.normalize_state(&gl);
+        let iid_str = gl.iid.to_string();
+        let labels: Vec<String> = gl.labels.iter().map(|l| l.trim().to_lowercase()).collect();
 
         Issue {
-            id: number_str.clone(),
+            id: iid_str.clone(),
             native_ref: None,
-            identifier: number_str.clone(),
-            title: gh.title,
-            description: gh.body.clone().filter(|b| !b.trim().is_empty()),
+            identifier: iid_str.clone(),
+            title: gl.title,
+            description: gl.description.clone().filter(|b| !b.trim().is_empty()),
             priority: None,
             state: normalized_state,
-            branch_name: Some(format!("issue-{number_str}")),
-            url: Some(gh.html_url),
+            branch_name: Some(format!("issue-{iid_str}")),
+            url: Some(gl.web_url),
             assignee_id: None,
             labels,
             blocked_by: Vec::new(),
             dispatchable: true,
-            created_at: Some(gh.created_at),
-            updated_at: Some(gh.updated_at),
+            created_at: Some(gl.created_at),
+            updated_at: Some(gl.updated_at),
         }
     }
 
-    /// `to_domain` plus the `depends_on` pass extracts (from the body, before it's
-    /// consumed) -- kept as a separate step since `RawIssue` needs both.
-    fn raw(&self, gh: GhIssue) -> RawIssue {
-        let depends_on = parse_depends_on(gh.body.as_deref().unwrap_or(""));
+    /// `to_domain` plus the `depends_on` pass extracts (from `description`, before
+    /// it's consumed) -- kept as a separate step since `RawIssue` needs both.
+    fn raw(&self, gl: GlIssue) -> RawIssue {
+        let depends_on = parse_depends_on(gl.description.as_deref().unwrap_or(""));
         RawIssue {
-            issue: self.to_domain(gh),
+            issue: self.to_domain(gl),
             depends_on,
         }
     }
 
-    /// `open + managed label` -> that label's state name; `closed` -> `closed_state`;
-    /// `open` with none of this adapter's managed labels present is left as `"open"`
-    /// verbatim (won't match any configured `active_states`/`terminal_states` value,
-    /// so it's simply never dispatchable -- a safe default for an issue nobody has
-    /// triaged into the workflow yet, rather than guessing).
-    fn normalize_state(&self, gh: &GhIssue) -> String {
-        if gh.state == "closed" {
+    /// `opened + managed label` -> that label's state name; `closed` -> `closed_state`;
+    /// `opened` with none of this adapter's managed labels present is left as
+    /// `"opened"` verbatim (GitLab's own wire value for an open issue -- won't match
+    /// any configured `active_states`/`terminal_states` value, so it's simply never
+    /// dispatchable, a safe default for an issue nobody has triaged into the
+    /// workflow yet, same posture as `tracker::github`'s own fallback).
+    fn normalize_state(&self, gl: &GlIssue) -> String {
+        if gl.state == "closed" {
             return self.closed_state.clone();
         }
         let managed = self.managed_labels();
-        for label in &gh.labels {
-            let name = label.name.trim().to_lowercase();
+        for label in &gl.labels {
+            let name = label.trim().to_lowercase();
             if managed.contains(name.as_str())
                 && let Some((state_name, _)) = self
                     .active_state_labels
@@ -311,12 +304,12 @@ impl GithubTrackerAdapter {
                 return state_name.clone();
             }
         }
-        "open".to_string()
+        "opened".to_string()
     }
 }
 
 #[async_trait]
-impl TrackerAdapter for GithubTrackerAdapter {
+impl TrackerAdapter for GitlabTrackerAdapter {
     async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
         if states.is_empty() {
             return Ok(Vec::new());
@@ -326,17 +319,17 @@ impl TrackerAdapter for GithubTrackerAdapter {
         let mut raw: Vec<(String, Result<RawIssue, String>)> = Vec::new();
 
         if wanted.contains(&self.closed_state) {
-            for gh in self.list_closed_issues().await? {
-                let key = gh.number.to_string();
-                raw.push((key, Ok(self.raw(gh))));
+            for gl in self.list_issues("closed", None).await? {
+                let key = gl.iid.to_string();
+                raw.push((key, Ok(self.raw(gl))));
             }
         }
         for (state_name, label) in &self.active_state_labels {
             if !wanted.contains(state_name) {
                 continue;
             }
-            for gh in self.list_open_issues(label).await? {
-                let key = gh.number.to_string();
+            for gl in self.list_issues("opened", Some(label)).await? {
+                let key = gl.iid.to_string();
                 // An issue can carry more than one managed label at once (mislabeling,
                 // or a snapshot mid a partially-applied update_issue_state) -- without
                 // this it would come back once per matched label and appear twice in
@@ -344,7 +337,7 @@ impl TrackerAdapter for GithubTrackerAdapter {
                 if raw.iter().any(|(k, _)| k == &key) {
                     continue;
                 }
-                raw.push((key, Ok(self.raw(gh))));
+                raw.push((key, Ok(self.raw(gl))));
             }
         }
 
@@ -365,14 +358,14 @@ impl TrackerAdapter for GithubTrackerAdapter {
                  can only create an issue directly into an active state, never closed_state)"
             ))
         })?;
-        let url = format!("{}/repos/{}/issues", self.base_url, self.repo);
+        let url = format!("{}/projects/{}/issues", self.base_url, self.project);
         let req = self.auth_headers(self.client.post(&url).json(&json!({
             "title": title,
-            "body": body,
-            "labels": [label],
+            "description": body,
+            "labels": label,
         })));
-        let gh: GhIssue = self.send_json(req).await?;
-        Ok(self.to_domain(gh))
+        let gl: GlIssue = self.send_json(req).await?;
+        Ok(self.to_domain(gl))
     }
 
     async fn fetch_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
@@ -380,20 +373,20 @@ impl TrackerAdapter for GithubTrackerAdapter {
             return Ok(Vec::new());
         }
         // Fetch every open+closed issue once so depends_on resolution has the full
-        // picture (mirrors local.rs reading the whole directory), then filter to the
+        // picture (mirrors tracker::github's own approach), then filter to the
         // requested ids -- simpler and more correct than N independent single-issue
         // fetches that couldn't see each other's state for dependency resolution.
         let mut raw: Vec<(String, Result<RawIssue, String>)> = Vec::new();
-        for gh in self.list_closed_issues().await? {
-            raw.push((gh.number.to_string(), Ok(self.raw(gh))));
+        for gl in self.list_issues("closed", None).await? {
+            raw.push((gl.iid.to_string(), Ok(self.raw(gl))));
         }
         for label in self.active_state_labels.values() {
-            for gh in self.list_open_issues(label).await? {
-                let key = gh.number.to_string();
+            for gl in self.list_issues("opened", Some(label)).await? {
+                let key = gl.iid.to_string();
                 if raw.iter().any(|(k, _)| k == &key) {
                     continue; // an issue can carry more than one managed label transiently
                 }
-                raw.push((key, Ok(self.raw(gh))));
+                raw.push((key, Ok(self.raw(gl))));
             }
         }
 
@@ -412,12 +405,12 @@ impl TrackerAdapter for GithubTrackerAdapter {
                 out.push(issue.clone());
                 continue;
             }
-            let Ok(number) = id.parse::<u64>() else {
+            let Ok(iid) = id.parse::<u64>() else {
                 return Err(TrackerError::Response(format!("invalid issue id '{id}'")));
             };
             // no longer visible -> omitted per the trait contract
-            if let Some(gh) = self.get_issue(number).await? {
-                out.push(self.to_domain(gh));
+            if let Some(gl) = self.get_issue(iid).await? {
+                out.push(self.to_domain(gl));
             }
         }
         Ok(out)
@@ -428,7 +421,7 @@ impl TrackerAdapter for GithubTrackerAdapter {
             name: "update_issue_state".to_string(),
             description: "Update this issue's tracker state (for example to 'done' once \
                 the issue is fully resolved). This is the supported way to advance the \
-                issue; GitHub Issues are not directly accessible."
+                issue; GitLab Issues are not directly accessible."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -455,48 +448,48 @@ impl TrackerAdapter for GithubTrackerAdapter {
         let Some(new_state) = arguments.get("state").and_then(|v| v.as_str()) else {
             return ToolResult::error("missing required argument 'state'");
         };
-        let Ok(number) = issue_id.parse::<u64>() else {
+        let Ok(iid) = issue_id.parse::<u64>() else {
             return ToolResult::error(format!("invalid issue id '{issue_id}'"));
         };
         let normalized = new_state.trim().to_lowercase();
 
-        let fetched = match self.get_issue(number).await {
+        let fetched = match self.get_issue(iid).await {
             Ok(v) => v,
             Err(e) => return ToolResult::error(e.to_string()),
         };
         let Some(current) = fetched else {
-            return ToolResult::error(format!("issue #{number} not found"));
+            return ToolResult::error(format!("issue !{iid} not found"));
         };
 
         let managed = self.managed_labels();
         let mut labels: Vec<String> = current
             .labels
             .iter()
-            .map(|l| l.name.clone())
             .filter(|name| !managed.contains(name.trim().to_lowercase().as_str()))
+            .cloned()
             .collect();
 
         let mut body = serde_json::Map::new();
         if normalized == self.closed_state {
-            body.insert("state".to_string(), json!("closed"));
+            body.insert("state_event".to_string(), json!("close"));
         } else if let Some(label) = self.active_state_labels.get(&normalized) {
             labels.push(label.clone());
-            body.insert("state".to_string(), json!("open"));
+            body.insert("state_event".to_string(), json!("reopen"));
         } else {
             return ToolResult::error(format!(
                 "unrecognized state '{new_state}' (not this tracker's closed_state and not \
                  in active_state_labels)"
             ));
         }
-        body.insert("labels".to_string(), json!(labels));
+        body.insert("labels".to_string(), json!(labels.join(",")));
 
-        let url = format!("{}/repos/{}/issues/{}", self.base_url, self.repo, number);
-        let req = self.auth_headers(self.client.patch(&url).json(&body));
+        let url = format!("{}/projects/{}/issues/{}", self.base_url, self.project, iid);
+        let req = self.auth_headers(self.client.put(&url).json(&body));
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                ToolResult::ok(format!("Updated issue #{number} state to '{new_state}'."))
+                ToolResult::ok(format!("Updated issue !{iid} state to '{new_state}'."))
             }
-            Ok(resp) => ToolResult::error(format!("PATCH {url} -> {}", resp.status())),
+            Ok(resp) => ToolResult::error(format!("PUT {url} -> {}", resp.status())),
             Err(e) => ToolResult::error(e.to_string()),
         }
     }
@@ -510,36 +503,36 @@ mod tests {
 
     fn provider_yaml(base_url: &str) -> Value {
         serde_yaml::from_str(&format!(
-            "repo: owner/name\ntoken: test-token\nclosed_state: done\nbase_url: {base_url}\n\
+            "project: group/name\ntoken: test-token\nclosed_state: done\nbase_url: {base_url}\n\
              active_state_labels:\n  todo: \"state:todo\"\n  \"in progress\": \"state:in-progress\"\n"
         ))
         .unwrap()
     }
 
-    fn gh_issue_json(
-        number: u64,
+    fn gl_issue_json(
+        iid: u64,
         title: &str,
         state: &str,
         labels: &[&str],
-        body: &str,
+        description: &str,
     ) -> serde_json::Value {
         json!({
-            "number": number,
+            "iid": iid,
             "title": title,
-            "body": body,
+            "description": description,
             "state": state,
-            "labels": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+            "labels": labels,
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-02T00:00:00Z",
-            "html_url": format!("https://github.com/owner/name/issues/{number}"),
+            "web_url": format!("https://gitlab.com/group/name/-/issues/{iid}"),
         })
     }
 
     #[test]
-    fn missing_repo_errors() {
+    fn missing_project_errors() {
         let provider: Value = serde_yaml::from_str("token: t\nclosed_state: done\n").unwrap();
         assert!(matches!(
-            GithubTrackerAdapter::new(&provider),
+            GitlabTrackerAdapter::new(&provider),
             Err(TrackerError::InvalidTrackerConfig(_))
         ));
     }
@@ -547,39 +540,47 @@ mod tests {
     #[test]
     fn missing_token_var_is_missing_secret() {
         unsafe {
-            std::env::remove_var("SYMPHONY_TEST_GH_TOKEN_MISSING");
+            std::env::remove_var("SYMPHONY_TEST_GL_TOKEN_MISSING");
         }
         let provider: Value = serde_yaml::from_str(
-            "repo: owner/name\ntoken: $SYMPHONY_TEST_GH_TOKEN_MISSING\nclosed_state: done\n\
+            "project: group/name\ntoken: $SYMPHONY_TEST_GL_TOKEN_MISSING\nclosed_state: done\n\
              active_state_labels:\n  todo: \"state:todo\"\n",
         )
         .unwrap();
         assert!(matches!(
-            GithubTrackerAdapter::new(&provider),
+            GitlabTrackerAdapter::new(&provider),
             Err(TrackerError::MissingTrackerSecret(_))
         ));
+    }
+
+    #[test]
+    fn encodes_nested_subgroup_project_paths() {
+        assert_eq!(
+            encode_project_path("group/subgroup/name"),
+            "group%2Fsubgroup%2Fname"
+        );
     }
 
     #[tokio::test]
     async fn fetch_by_states_maps_labels_and_closed_to_normalized_state() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
-            .and(query_param("state", "open"))
+            .and(path("/projects/group%2Fname/issues"))
+            .and(query_param("state", "opened"))
             .and(query_param("labels", "state:todo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh_issue_json(
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gl_issue_json(
                 1,
                 "Todo issue",
-                "open",
+                "opened",
                 &["state:todo"],
                 "",
             )]))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
+            .and(path("/projects/group%2Fname/issues"))
             .and(query_param("state", "closed"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh_issue_json(
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gl_issue_json(
                 2,
                 "Done issue",
                 "closed",
@@ -589,7 +590,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let mut issues = adapter
             .fetch_issues_by_states(&["todo".to_string(), "done".to_string()])
             .await
@@ -603,40 +604,32 @@ mod tests {
         assert_eq!(issues[1].state, "done");
     }
 
-    /// Regression test: `fetch_issues_by_states` queries once per matched active-state
-    /// label, separately. An issue mislabeled with *two* managed state labels at once
-    /// (a labeling mistake, or a snapshot mid a partially-applied `update_issue_state`)
-    /// would previously come back from both queries and appear **twice** in the
-    /// result with the same identifier -- risking double-dispatch, the exact failure
-    /// class this session already hit for real via duplicate orchestrators racing the
-    /// same ticket. `fetch_issues_by_ids` already guards against this; this proves
-    /// `fetch_issues_by_states` does too.
     #[tokio::test]
     async fn fetch_by_states_dedupes_an_issue_carrying_two_managed_labels() {
         let server = MockServer::start().await;
-        let mislabeled = gh_issue_json(
+        let mislabeled = gl_issue_json(
             7,
             "Mislabeled issue",
-            "open",
+            "opened",
             &["state:todo", "state:in-progress"],
             "",
         );
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
-            .and(query_param("state", "open"))
+            .and(path("/projects/group%2Fname/issues"))
+            .and(query_param("state", "opened"))
             .and(query_param("labels", "state:todo"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vec![mislabeled.clone()]))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
-            .and(query_param("state", "open"))
+            .and(path("/projects/group%2Fname/issues"))
+            .and(query_param("state", "opened"))
             .and(query_param("labels", "state:in-progress"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vec![mislabeled]))
             .mount(&server)
             .await;
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let issues = adapter
             .fetch_issues_by_states(&["todo".to_string(), "in progress".to_string()])
             .await
@@ -645,7 +638,7 @@ mod tests {
         assert_eq!(
             issues.len(),
             1,
-            "issue #7 should appear exactly once, not once per matched label: {issues:?}"
+            "issue !7 should appear exactly once, not once per matched label: {issues:?}"
         );
     }
 
@@ -653,26 +646,26 @@ mod tests {
     async fn depends_on_blocks_dispatch_until_dependency_closed() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
-            .and(query_param("state", "open"))
+            .and(path("/projects/group%2Fname/issues"))
+            .and(query_param("state", "opened"))
             .and(query_param("labels", "state:todo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh_issue_json(
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gl_issue_json(
                 2,
                 "Downstream",
-                "open",
+                "opened",
                 &["state:todo"],
                 "Depends-On: #1",
             )]))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues"))
+            .and(path("/projects/group%2Fname/issues"))
             .and(query_param("state", "closed"))
             .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
             .mount(&server)
             .await;
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let issues = adapter
             .fetch_issues_by_states(&["todo".to_string()])
             .await
@@ -683,21 +676,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_issue_posts_title_body_and_the_states_managed_label() {
+    async fn create_issue_posts_title_description_and_the_states_managed_label() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/repos/owner/name/issues"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(gh_issue_json(
+            .and(path("/projects/group%2Fname/issues"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(gl_issue_json(
                 11,
                 "Export galleries as a zip",
-                "open",
+                "opened",
                 &["state:todo"],
                 "media only, per-account",
             )))
             .mount(&server)
             .await;
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let issue = adapter
             .create_issue(
                 "Export galleries as a zip",
@@ -715,7 +708,7 @@ mod tests {
         let server = MockServer::start().await;
         // No POST mock registered -- if the adapter tried to create anyway, the
         // request would have nothing to match.
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let err = adapter
             .create_issue("t", "b", "nonexistent-state")
             .await
@@ -727,8 +720,8 @@ mod tests {
     async fn update_issue_state_to_active_adds_label_and_reopens() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues/5"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            .and(path("/projects/group%2Fname/issues/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gl_issue_json(
                 5,
                 "An issue",
                 "closed",
@@ -737,19 +730,19 @@ mod tests {
             )))
             .mount(&server)
             .await;
-        Mock::given(method("PATCH"))
-            .and(path("/repos/owner/name/issues/5"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+        Mock::given(method("PUT"))
+            .and(path("/projects/group%2Fname/issues/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gl_issue_json(
                 5,
                 "An issue",
-                "open",
+                "opened",
                 &["state:in-progress", "keep-me"],
                 "",
             )))
             .mount(&server)
             .await;
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let result = adapter
             .execute_agent_tool("update_issue_state", json!({"state": "in progress"}), "5")
             .await;
@@ -757,24 +750,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_issue_state_unrecognized_state_errors_without_calling_patch() {
+    async fn update_issue_state_unrecognized_state_errors_without_calling_put() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/repos/owner/name/issues/5"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(gh_issue_json(
+            .and(path("/projects/group%2Fname/issues/5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(gl_issue_json(
                 5,
                 "An issue",
-                "open",
+                "opened",
                 &["state:todo"],
                 "",
             )))
             .mount(&server)
             .await;
-        // No PATCH mock registered at all -- if the adapter tried to PATCH anyway,
+        // No PUT mock registered at all -- if the adapter tried to PUT anyway,
         // wiremock would 404/panic on the unexpected request depending on strictness;
         // asserting failure here is the primary check.
 
-        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let adapter = GitlabTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
         let result = adapter
             .execute_agent_tool("update_issue_state", json!({"state": "nonexistent"}), "5")
             .await;

@@ -14,7 +14,7 @@
 //! stdout is reserved for protocol messages only — all logging in this process must go
 //! to stderr (enforced in `main.rs`).
 
-use crate::repo_host::GithubRepoHost;
+use crate::repo_host::RepoHost;
 use crate::tracker::{ToolResult, TrackerAdapter};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -29,7 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// the tracker's own "unsupported tool" error text, which would be fragile).
 async fn route_call(
     adapter: &dyn TrackerAdapter,
-    repo_host: Option<&GithubRepoHost>,
+    repo_host: Option<&dyn RepoHost>,
     tracker_names: &HashSet<&str>,
     name: &str,
     arguments: Value,
@@ -46,7 +46,7 @@ async fn route_call(
 
 pub async fn run_stdio_server(
     adapter: Box<dyn TrackerAdapter>,
-    repo_host: Option<GithubRepoHost>,
+    repo_host: Option<Box<dyn RepoHost>>,
     issue_id: &str,
 ) -> anyhow::Result<()> {
     let tracker_specs = adapter.agent_tool_specs();
@@ -109,7 +109,7 @@ pub async fn run_stdio_server(
                     .unwrap_or(json!({}));
                 let result = route_call(
                     adapter.as_ref(),
-                    repo_host.as_ref(),
+                    repo_host.as_deref(),
                     &tracker_names,
                     name,
                     arguments,
@@ -180,6 +180,7 @@ mod tests {
     use super::*;
     use crate::config::RepoConfig;
     use crate::domain::Issue;
+    use crate::repo_host::github::GithubRepoHost;
     use crate::tracker::{ToolResult, ToolSpec, TrackerError};
     use async_trait::async_trait;
     use wiremock::matchers::method;
@@ -227,6 +228,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_MCP_TOKEN".to_string()),
             pull_request: true,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri())

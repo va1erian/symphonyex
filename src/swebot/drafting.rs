@@ -1,16 +1,23 @@
 //! Ticket-drafting capability: turns a rough idea posted in the repo's `Ideas`-
 //! category GitHub Discussions (`swebot.drafting.discussion_category`, default
-//! `"Ideas"`) into a properly scoped issue through a clarifying dialogue.
+//! `"Ideas"`), an issue label on GitLab (`swebot.drafting.label`, default
+//! `"swebot::idea"`), or a board on `crate::board`'s local bulletin board when
+//! `swebot.board.enabled`, into a properly scoped issue through a clarifying
+//! dialogue. `selector` below is whichever of those `swebot::mod::run` resolved for
+//! the current `host`; this module itself stays agnostic to which one it got.
 //!
 //! Ends by creating a **new** issue via `TrackerAdapter::create_issue` rather than
-//! rewriting the discussion into one -- Discussions stays the messy conversational
-//! space, Issues stays the clean actionable backlog Symphony's own dispatch loop
-//! watches, and a half-drafted idea is never sitting in the tracker looking
-//! dispatchable when it isn't.
+//! rewriting the source thread into one -- the source stays the messy conversational
+//! space, the tracker's Issues stays the clean actionable backlog Symphony's own
+//! dispatch loop watches, and a half-drafted idea is never sitting in the tracker
+//! looking dispatchable when it isn't. On GitLab (where the source thread is itself
+//! a tracker Issue) and on the local bulletin board, the source thread is closed
+//! once promoted (`DiscussionHost::close_thread`) to keep that separation from
+//! collapsing back into one undifferentiated list.
 //!
 //! Each poll cycle starts a *fresh* `claude` session rather than resuming a previous
 //! one (a human's next reply may come hours later, well past a SweBot restart) --
-//! the full discussion transcript, reconstructed from GitHub's own stored comments
+//! the full discussion transcript, reconstructed from the host's own stored comments
 //! and sent as the prompt every time, carries the conversation's state instead. No
 //! `--resume` needed, and nothing to persist beyond the same `swebot:answered`
 //! marker `qa.rs` already uses.
@@ -21,20 +28,19 @@ use super::{
 };
 use crate::agent::AgentBackend;
 use crate::config::EffectiveConfig;
-use crate::repo_host::GithubRepoHost;
+use crate::repo_host::DiscussionHost;
 use crate::tracker::TrackerAdapter;
 use std::path::Path;
 
 pub async fn poll_once(
     cfg: &EffectiveConfig,
-    host: &GithubRepoHost,
+    host: &dyn DiscussionHost,
+    selector: &str,
     backend: &dyn AgentBackend,
     shared_clone_dir: &Path,
     tracker: &dyn TrackerAdapter,
 ) -> Result<(), String> {
-    let threads = host
-        .list_discussions_in_category(&cfg.swebot.drafting_discussion_category)
-        .await?;
+    let threads = host.list_swebot_threads(selector).await?;
 
     for thread in threads {
         let Some(marker_id) = next_to_answer(&thread) else {
@@ -43,7 +49,7 @@ pub async fn poll_once(
         let transcript = transcript_up_to(&thread, marker_id);
 
         let prompt = format!(
-            "{PERSONA}\n\nHelp turn this GitHub Discussion idea (\"{}\") into a properly \
+            "{PERSONA}\n\nHelp turn this idea (\"{}\") into a properly \
              scoped ticket. Ask only the clarifying questions that actually change scope \
              -- acceptance criteria, edge cases, what's explicitly out of scope -- not a \
              generic checklist. You have read access to the repo, checked out at {}, so \
@@ -148,6 +154,203 @@ pub async fn poll_once(
         if let Err(e) = host.mark_discussion_comment_as_answer(&comment_id).await {
             tracing::debug!(discussion = thread.number, error = %e, "swebot: could not mark comment as answer (ignored)");
         }
+        // Best-effort, same tolerance as mark_discussion_comment_as_answer above: a
+        // no-op on GitHub (Discussions were never closed by this flow), but on GitLab
+        // this keeps the label-filtered polling query (list_swebot_threads) from
+        // accumulating stale, already-drafted idea issues forever -- the link to the
+        // new ticket is already in the comment just posted above.
+        if let Err(e) = host.close_thread(&thread.id).await {
+            tracing::debug!(discussion = thread.number, error = %e, "swebot: could not close source thread (ignored)");
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{self, RepoConfig, RepoProvider};
+    use crate::repo_host::github::GithubRepoHost;
+    use crate::repo_host::gitlab::GitlabRepoHost;
+    use crate::swebot::test_support::FakeBackend;
+    use crate::tracker::local::LocalTrackerAdapter;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_cfg() -> config::EffectiveConfig {
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_DRAFTING_TOKEN", "t");
+        }
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [\"todo\"]\nrepo:\n  \
+             url: https://github.com/owner/name.git\n  token: $SYMPHONY_TEST_DRAFTING_TOKEN\n\
+             swebot:\n  enabled: true\n",
+        )
+        .unwrap();
+        config::resolve(&yaml, std::path::Path::new(".")).unwrap()
+    }
+
+    fn test_host(server: &MockServer) -> GithubRepoHost {
+        GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_DRAFTING_TOKEN".to_string()),
+            pull_request: false,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri())
+    }
+
+    #[tokio::test]
+    async fn drafts_and_creates_an_issue_when_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains("discussions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "repository": {
+                        "discussions": {
+                            "nodes": [{
+                                "id": "D_1", "number": 1, "title": "archive download feature",
+                                "body": "export pictures as a zip",
+                                "url": "https://github.com/owner/name/discussions/1",
+                                "category": {"name": "Ideas"},
+                                "comments": {"nodes": []}
+                            }]
+                        }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains(
+                "addDiscussionComment",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"addDiscussionComment": {"comment": {"id": "C_1"}}}
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg();
+        let host = test_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"ready\": true, \"title\": \"Export as zip\", \
+             \"body\": \"acceptance criteria here\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        poll_once(
+            &cfg,
+            &host,
+            &cfg.swebot.drafting_discussion_category,
+            &backend,
+            dir.path(),
+            &tracker,
+        )
+        .await
+        .unwrap();
+
+        let created = tracker
+            .fetch_issues_by_states(&["todo".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].title, "Export as zip");
+    }
+
+    fn test_gitlab_host(server: &MockServer) -> GitlabRepoHost {
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_DRAFTING_GITLAB_TOKEN", "t");
+        }
+        GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/owner/name.git".to_string(),
+            provider: RepoProvider::Gitlab,
+            api_base_url: Some(server.uri()),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_DRAFTING_GITLAB_TOKEN".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// GitLab-specific: once an idea is promoted to a real tracker issue, the source
+    /// labeled issue must be closed (`RepoHost::close_thread`) -- a no-op on GitHub,
+    /// but on GitLab this is what keeps `list_swebot_threads`'s label-filtered query
+    /// from re-processing the same already-drafted idea forever.
+    #[tokio::test]
+    async fn gitlab_closes_the_source_issue_after_drafting_and_creating_a_ticket() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/owner%2Fname/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+                "iid": 3, "title": "archive download feature",
+                "description": "export pictures as a zip",
+                "web_url": "https://gitlab.com/owner/name/-/issues/3"
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/owner%2Fname/issues/3/notes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/projects/owner%2Fname/issues/3/notes"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 50})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/projects/owner%2Fname/issues/3"))
+            .and(wiremock::matchers::body_string_contains("close"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [\"todo\"]\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.com/owner/name.git\n  token: $SYMPHONY_TEST_DRAFTING_GITLAB_TOKEN\n\
+             swebot:\n  enabled: true\n",
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_DRAFTING_GITLAB_TOKEN", "t");
+        }
+        let cfg = config::resolve(&yaml, std::path::Path::new(".")).unwrap();
+
+        let host = test_gitlab_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"ready\": true, \"title\": \"Export as zip\", \
+             \"body\": \"acceptance criteria here\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        poll_once(
+            &cfg,
+            &host,
+            &cfg.swebot.drafting_label,
+            &backend,
+            dir.path(),
+            &tracker,
+        )
+        .await
+        .unwrap();
+    }
 }

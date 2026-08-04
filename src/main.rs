@@ -1,4 +1,5 @@
 mod agent;
+mod board;
 mod config;
 mod container;
 mod daemon;
@@ -243,7 +244,7 @@ async fn run_mcp_tool_server(
     let repo_host = match repo_pr_json {
         Some(json) => match serde_json::from_str::<config::RepoConfig>(json)
             .map_err(|e| e.to_string())
-            .and_then(|cfg| repo_host::GithubRepoHost::new(&cfg))
+            .and_then(|cfg| repo_host::build(&cfg))
         {
             Ok(host) => Some(host),
             Err(e) => {

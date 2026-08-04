@@ -38,12 +38,26 @@ pub enum ConfigError {
         "invalid_config: repo.pull_request requires repo.url to be a github.com URL (owner/name) -- open_pull_request only supports GitHub"
     )]
     PullRequestRequiresGithubRepo,
+    #[error(
+        "invalid_config: repo.pull_request with repo.provider: gitlab requires repo.url to be a \
+         parseable GitLab repo URL (group/subgroup/name, HTTPS or SSH)"
+    )]
+    PullRequestRequiresGitlabRepo,
     #[error("invalid_config: repo.pull_request requires repo.token to be set")]
     PullRequestRequiresRepoToken,
     #[error(
-        "invalid_config: swebot.enabled requires repo.url to be a github.com URL (owner/name) -- SweBot's Q&A/drafting/review capabilities are GitHub-specific"
+        "invalid_config: swebot.enabled with repo.provider: github (the default) requires repo.url to be a github.com URL (owner/name)"
     )]
     SwebotRequiresGithubRepo,
+    #[error(
+        "invalid_config: swebot.enabled with repo.provider: gitlab requires repo.url to be a \
+         parseable GitLab repo URL (group/subgroup/name, HTTPS or SSH)"
+    )]
+    SwebotRequiresGitlabRepo,
+    #[error(
+        "invalid_config: repo.provider '{0}' is not a supported code host (expected 'github' or 'gitlab')"
+    )]
+    UnsupportedRepoProvider(String),
     #[error("invalid_config: swebot.enabled requires repo.token or swebot.token to be set")]
     SwebotRequiresRepoToken,
     #[error(
@@ -183,9 +197,22 @@ pub struct DockerConfig {
 /// `agent::claude::McpToolWiring::repo_pr_json`, mirroring how `tracker_provider_json`
 /// already crosses that same boundary) -- the token *name*, never its resolved value,
 /// so nothing secret crosses in the argv.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RepoConfig {
     pub url: String,
+    /// Which code host `url` points at. Defaults to `Github` (`#[serde(default)]`) so
+    /// every existing `repo:` block with no `provider:` key resolves exactly as it did
+    /// before this field existed -- the crux of backward compatibility here.
+    #[serde(default)]
+    pub provider: RepoProvider,
+    /// Explicit override for a self-managed GitLab instance's REST API root (must
+    /// already include the `/api/v4` suffix -- nothing is appended onto an explicit
+    /// value). Only meaningful when `provider: gitlab`; ignored for `Github`. When
+    /// unset and `provider: gitlab`, `repo_host::gitlab` derives it from `url`'s own
+    /// scheme+host, covering the common self-managed case (API reachable at the same
+    /// host as the git remote) with zero extra config.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
     pub default_branch: String,
     /// Name of an env var holding the git credential (no leading `$`), e.g.
     /// `GITHUB_TOKEN`. Deliberately *not* resolved to its value here: the synthesized
@@ -194,7 +221,7 @@ pub struct RepoConfig {
     /// own process environment (which it already inherits from Symphony's), never as
     /// a value Symphony itself holds or embeds in a URL/script body.
     pub token_env: Option<String>,
-    /// Opt-in: expose the `open_pull_request` agent tool (`src/repo_host.rs`) instead
+    /// Opt-in: expose the `open_pull_request` agent tool (`src/repo_host/mod.rs`) instead
     /// of leaving each ticket's pushed branch for a human to notice on their own. Off
     /// by default -- this changes what the agent does at the end of a turn (opens a
     /// real PR on the real repo) and how issues close (on merge, not immediately), so
@@ -203,22 +230,65 @@ pub struct RepoConfig {
     pub pull_request: bool,
 }
 
-/// Extension: SweBot (README.md "SweBot") -- answers questions and drafts tickets in
-/// GitHub Discussions, and reviews the pull requests Symphony's coding agents open.
-/// GitHub-specific for v1 (Discussions has no REST equivalent Symphony's other
-/// adapters could target), keyed off `repo:` -- the same "which GitHub repo" source
-/// of truth `repo.pull_request` already uses -- rather than `tracker.provider.repo`,
-/// so it works the same way regardless of `tracker.kind`. Off by default, same
-/// deliberate-opt-in posture as `repo.pull_request` and
-/// `workspace.docker.mount_claude_credentials`: this posts real comments and reviews
-/// on a real GitHub repo.
+/// Which code host `repo.url` points at (`repo.provider`, e.g. `provider: gitlab`).
+/// `Default` -> `Github` is what makes an existing `repo:` block with no `provider:`
+/// key resolve exactly as it did before this enum existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoProvider {
+    #[default]
+    Github,
+    Gitlab,
+}
+
+impl RepoProvider {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "github" => Some(Self::Github),
+            "gitlab" => Some(Self::Gitlab),
+            _ => None,
+        }
+    }
+}
+
+/// Extension: SweBot (README.md "SweBot") -- answers questions and drafts tickets,
+/// and reviews the pull/merge requests Symphony's coding agents open. Keyed off
+/// `repo:` -- the same "which code host repo" source of truth `repo.pull_request`
+/// already uses -- rather than `tracker.provider.repo`, so it works the same way
+/// regardless of `tracker.kind`. Off by default, same deliberate-opt-in posture as
+/// `repo.pull_request` and `workspace.docker.mount_claude_credentials`: this posts
+/// real comments and reviews on a real repo.
+///
+/// The Q&A/drafting conversational surface is provider-specific: on GitHub it's a
+/// Discussions category (`qa_discussion_category`/`drafting_discussion_category`),
+/// since Discussions has no REST equivalent Symphony's other adapters could target.
+/// GitLab has no Discussions object at all, so there SweBot instead polls Issues
+/// carrying a specific label (`qa_label`/`drafting_label`) -- see
+/// `repo_host::gitlab::GitlabRepoHost::list_swebot_threads`. Both pairs of fields
+/// always coexist; `swebot::mod`'s `ConversationHost` picks the right one for the
+/// configured `repo.provider` (or, when `board_enabled`, ignores both and uses the
+/// local bulletin board's own fixed two boards instead -- see `board_enabled`'s own
+/// doc comment).
 #[derive(Debug, Clone)]
 pub struct SwebotConfig {
     pub enabled: bool,
-    /// Discussion category name SweBot treats as incoming questions.
+    /// GitHub: Discussion category name SweBot treats as incoming questions.
     pub qa_discussion_category: String,
-    /// Discussion category name SweBot treats as ticket ideas to draft.
+    /// GitHub: Discussion category name SweBot treats as ticket ideas to draft.
     pub drafting_discussion_category: String,
+    /// GitLab: issue label SweBot treats as incoming questions.
+    pub qa_label: String,
+    /// GitLab: issue label SweBot treats as ticket ideas to draft.
+    pub drafting_label: String,
+    /// Use the local bulletin board (`crate::board`) instead of `repo.provider`'s own
+    /// Discussions/labels as SweBot's Q&A/drafting conversational surface -- an
+    /// alternative for a project that doesn't want that traffic mixed into GitLab's
+    /// real Issues list (see `board`'s own module doc comment for the full
+    /// rationale). Only affects Q&A/drafting: `review_enabled` (PR/MR review) always
+    /// goes through the real `repo.provider` host regardless of this flag, since a
+    /// merge request is inherently a property of the actual code host. Off by
+    /// default, same opt-in posture as the rest of `swebot:`.
+    pub board_enabled: bool,
     /// Whether SweBot reviews the pull requests Symphony's own coding agents open
     /// (branch name matching `issue-<identifier>`, the same convention
     /// `synthesize_repo_hooks` produces). Independent toggle from `enabled` at large
@@ -398,6 +468,11 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let repo_cfg = get(config, "repo")
         .map(|r| -> Result<RepoConfig, ConfigError> {
             let url = get_str(r, "url").ok_or(ConfigError::MissingRepoUrl)?;
+            let provider = get_str(r, "provider")
+                .map(|p| RepoProvider::parse(&p).ok_or(ConfigError::UnsupportedRepoProvider(p)))
+                .transpose()?
+                .unwrap_or_default();
+            let api_base_url = get_str(r, "api_base_url");
             let default_branch = get_str(r, "default_branch").unwrap_or_else(|| "main".to_string());
             let token_env = get_str(r, "token")
                 .map(|t| {
@@ -410,8 +485,17 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             if pull_request {
-                if crate::repo_host::parse_github_owner_repo(&url).is_none() {
-                    return Err(ConfigError::PullRequestRequiresGithubRepo);
+                match provider {
+                    RepoProvider::Github => {
+                        if crate::repo_host::github::parse_github_owner_repo(&url).is_none() {
+                            return Err(ConfigError::PullRequestRequiresGithubRepo);
+                        }
+                    }
+                    RepoProvider::Gitlab => {
+                        if crate::repo_host::gitlab::parse_gitlab_project_path(&url).is_none() {
+                            return Err(ConfigError::PullRequestRequiresGitlabRepo);
+                        }
+                    }
                 }
                 if token_env.is_none() {
                     return Err(ConfigError::PullRequestRequiresRepoToken);
@@ -419,6 +503,8 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             }
             Ok(RepoConfig {
                 url,
+                provider,
+                api_base_url,
                 default_branch,
                 token_env,
                 pull_request,
@@ -433,6 +519,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let swebot_qa = get(swebot_raw, "qa").unwrap_or(&empty);
     let swebot_drafting = get(swebot_raw, "drafting").unwrap_or(&empty);
     let swebot_review = get(swebot_raw, "review").unwrap_or(&empty);
+    let swebot_board = get(swebot_raw, "board").unwrap_or(&empty);
     let swebot_token_env = get_str(swebot_raw, "token")
         .map(|t| {
             envsub::var_name_of(&t)
@@ -446,6 +533,12 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .unwrap_or_else(|| "Q&A".to_string()),
         drafting_discussion_category: get_str(swebot_drafting, "discussion_category")
             .unwrap_or_else(|| "Ideas".to_string()),
+        qa_label: get_str(swebot_qa, "label").unwrap_or_else(|| "swebot::question".to_string()),
+        drafting_label: get_str(swebot_drafting, "label")
+            .unwrap_or_else(|| "swebot::idea".to_string()),
+        board_enabled: get(swebot_board, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         review_enabled: get(swebot_review, "enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(swebot_enabled),
@@ -455,8 +548,17 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         let repo = repo_cfg
             .as_ref()
             .ok_or(ConfigError::SwebotRequiresGithubRepo)?;
-        if crate::repo_host::parse_github_owner_repo(&repo.url).is_none() {
-            return Err(ConfigError::SwebotRequiresGithubRepo);
+        match repo.provider {
+            RepoProvider::Github => {
+                if crate::repo_host::github::parse_github_owner_repo(&repo.url).is_none() {
+                    return Err(ConfigError::SwebotRequiresGithubRepo);
+                }
+            }
+            RepoProvider::Gitlab => {
+                if crate::repo_host::gitlab::parse_gitlab_project_path(&repo.url).is_none() {
+                    return Err(ConfigError::SwebotRequiresGitlabRepo);
+                }
+            }
         }
         if repo.token_env.is_none() && swebot_cfg.token_env.is_none() {
             return Err(ConfigError::SwebotRequiresRepoToken);
@@ -608,6 +710,18 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
 fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
     let branch = &repo.default_branch;
     let url = &repo.url;
+    // The credential-helper placeholder username a bearer token is exchanged against
+    // over HTTPS git operations: GitHub's documented convention is `x-access-token`,
+    // GitLab's is `oauth2` -- both accept *any* username when the password is a valid
+    // token, but each host's own tooling/docs expect its specific one, so this
+    // matches convention rather than relying on that leniency. Deploy tokens (which
+    // require their *own* configured username, not `oauth2`) aren't supported by this
+    // synthesized default -- same "extend, don't configure around" posture as
+    // `repo_host::github::parse_github_owner_repo`'s GitHub-Enterprise note.
+    let credential_username = match repo.provider {
+        RepoProvider::Github => "x-access-token",
+        RepoProvider::Gitlab => "oauth2",
+    };
 
     // Repo-local (not --global) identity for the automatic after_run commit -- without
     // this, `git commit` fails outright with "Author identity unknown". That failure
@@ -631,7 +745,7 @@ fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
         Some(var) => format!(
             "name=\"$(basename \"$PWD\")\"\n\
              {trust_dir}\
-             cred_helper='!f() {{ echo username=x-access-token; echo \"password=${var}\"; }}; f'\n\
+             cred_helper='!f() {{ echo username={credential_username}; echo \"password=${var}\"; }}; f'\n\
              git -c credential.helper=\"$cred_helper\" clone \"{url}\" .\n\
              git config credential.helper \"$cred_helper\"\n\
              {identity}\
@@ -808,6 +922,19 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_repo_synthesizes_hooks_with_the_oauth2_credential_username() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.example.com/o/r.git\n  \
+             default_branch: main\n  token: $GITLAB_TOKEN\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let create = cfg.hook_after_create.unwrap();
+        assert!(create.contains("username=oauth2"));
+        assert!(!create.contains("username=x-access-token"));
+    }
+
+    #[test]
     fn repo_without_token_synthesizes_hooks_with_no_credential_helper() {
         let cfg_yaml =
             parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://example.com/r.git\n");
@@ -877,6 +1004,50 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_true_with_valid_gitlab_repo_and_token_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.example.com/group/subgroup/r.git\n  \
+             token: $SYMPHONY_TEST_PR_GITLAB_TOKEN\n  pull_request: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let repo = cfg.repo.unwrap();
+        assert!(repo.pull_request);
+        assert_eq!(repo.provider, RepoProvider::Gitlab);
+    }
+
+    #[test]
+    fn pull_request_requires_a_gitlab_repo_url_when_provider_is_gitlab() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  url: not-a-url\n  \
+             token: $SYMPHONY_TEST_PR_GITLAB_TOKEN_2\n  pull_request: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::PullRequestRequiresGitlabRepo)
+        ));
+    }
+
+    #[test]
+    fn unsupported_repo_provider_errors() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: bitbucket\n  url: https://example.com/r.git\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::UnsupportedRepoProvider(p)) if p == "bitbucket"
+        ));
+    }
+
+    #[test]
+    fn repo_provider_defaults_to_github() {
+        let cfg_yaml =
+            parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.repo.unwrap().provider, RepoProvider::Github);
+    }
+
+    #[test]
     fn pull_request_defaults_to_false() {
         let cfg_yaml =
             parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n");
@@ -903,6 +1074,69 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::SwebotRequiresGithubRepo)
         ));
+    }
+
+    #[test]
+    fn swebot_enabled_requires_a_gitlab_repo_url_when_provider_is_gitlab() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  url: not-a-url\n  \
+             token: $SYMPHONY_TEST_SWEBOT_GITLAB_TOKEN\nswebot:\n  enabled: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::SwebotRequiresGitlabRepo)
+        ));
+    }
+
+    #[test]
+    fn swebot_enabled_with_a_valid_gitlab_repo_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.example.com/group/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_GITLAB_TOKEN_2\nswebot:\n  enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.swebot.enabled);
+    }
+
+    #[test]
+    fn swebot_qa_and_drafting_labels_default_and_can_be_overridden() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.example.com/group/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_GITLAB_TOKEN_3\nswebot:\n  enabled: true\n  \
+             qa:\n    label: \"question\"\n  drafting:\n    label: \"idea\"\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.swebot.qa_label, "question");
+        assert_eq!(cfg.swebot.drafting_label, "idea");
+
+        let cfg_yaml_defaults = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  provider: gitlab\n  \
+             url: https://gitlab.example.com/group/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_GITLAB_TOKEN_4\nswebot:\n  enabled: true\n",
+        );
+        let cfg_defaults = resolve(&cfg_yaml_defaults, Path::new(".")).unwrap();
+        assert_eq!(cfg_defaults.swebot.qa_label, "swebot::question");
+        assert_eq!(cfg_defaults.swebot.drafting_label, "swebot::idea");
+    }
+
+    #[test]
+    fn swebot_board_enabled_defaults_to_false_and_can_be_turned_on() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_BOARD_TOKEN\nswebot:\n  enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.swebot.board_enabled);
+
+        let cfg_yaml_board = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_BOARD_TOKEN_2\nswebot:\n  enabled: true\n  \
+             board:\n    enabled: true\n",
+        );
+        let cfg_board = resolve(&cfg_yaml_board, Path::new(".")).unwrap();
+        assert!(cfg_board.swebot.board_enabled);
     }
 
     #[test]

@@ -13,6 +13,12 @@
 //! *outside* those two containers ever moves. `/fragment` reuses the exact same
 //! `running_card`/`retry_row` render functions `/` itself uses -- no HTML templating
 //! duplicated into JS, everything server-rendered as before.
+//!
+//! Also nests `crate::board`'s bulletin-board UI at `/board`, unconditionally --
+//! harmless when a project isn't using `swebot.board.enabled` (an empty board, same
+//! posture as `/events`/`/usage` showing "nothing recorded yet" until something
+//! populates them), and avoids threading a project's `swebot.board.enabled` value
+//! through this constructor just to decide whether to mount one more route.
 
 use crate::eventlog;
 use axum::Router;
@@ -53,7 +59,13 @@ pub struct RetryRow {
 #[derive(Clone)]
 struct AppState {
     status_rx: watch::Receiver<StatusSnapshot>,
-    db_path: PathBuf,
+    /// A project's `EffectiveConfig::workflow_dir` -- where `symphony.db`
+    /// (`eventlog::DB_FILENAME`) and `board.db` (`board::DB_FILENAME`) both live,
+    /// same directory `symphony-report.html` already defaults to. Stored as the
+    /// directory (not a pre-joined file path) so this one field can feed both
+    /// `eventlog`'s functions (which want the full `.../symphony.db` path) and
+    /// `board::router` (which wants the directory and joins its own filename).
+    workflow_dir: PathBuf,
     /// URL path this router is mounted under -- `""` when served at the root (the
     /// single-project CLI path, `serve` below), or `/projects/<id>` when nested into
     /// the multi-project service's own router (`src/service.rs`'s `project_proxy`).
@@ -62,6 +74,12 @@ struct AppState {
     /// still lands within the same mount point -- without it, a nested dashboard's
     /// own links would silently escape to the service's top-level routes instead.
     base_path: String,
+}
+
+impl AppState {
+    fn eventlog_db_path(&self) -> PathBuf {
+        self.workflow_dir.join(eventlog::DB_FILENAME)
+    }
 }
 
 /// Bind and serve the dashboard until the process exits. Loopback-only
@@ -84,12 +102,13 @@ struct AppState {
 /// duplicating any of this module's HTML/handler code.
 pub fn router(
     status_rx: watch::Receiver<StatusSnapshot>,
-    db_path: PathBuf,
+    workflow_dir: PathBuf,
     base_path: &str,
 ) -> Router {
+    let board_router = crate::board::router(workflow_dir.clone(), &format!("{base_path}/board"));
     let state = AppState {
         status_rx,
-        db_path,
+        workflow_dir,
         base_path: base_path.to_string(),
     };
     Router::new()
@@ -98,15 +117,16 @@ pub fn router(
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
         .with_state(state)
+        .nest("/board", board_router)
 }
 
 pub async fn serve(
     port: u16,
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
-    db_path: PathBuf,
+    workflow_dir: PathBuf,
 ) -> anyhow::Result<()> {
-    let app = router(status_rx, db_path, "");
+    let app = router(status_rx, workflow_dir, "");
     let bind_addr = if bind_all_interfaces {
         "0.0.0.0"
     } else {
@@ -161,10 +181,11 @@ fn nav(active: &str, base: &str) -> String {
         }
     };
     format!(
-        "<nav>{}{}{}</nav>",
+        "<nav>{}{}{}{}</nav>",
         link("/", "Status"),
         link("/events", "Events"),
         link("/usage", "Usage"),
+        link("/board", "Board"),
     )
 }
 
@@ -314,7 +335,8 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
         include_low_importance,
     };
 
-    let rows = eventlog::recent_events(&state.db_path, &filter, limit, offset).unwrap_or_default();
+    let rows = eventlog::recent_events(&state.eventlog_db_path(), &filter, limit, offset)
+        .unwrap_or_default();
     let base = state.base_path.as_str();
 
     let table_rows: String = if rows.is_empty() {
@@ -441,8 +463,8 @@ fn event_row(r: &eventlog::EventRow, base: &str) -> String {
 // --------------------------------------------------------------------------------
 
 async fn usage_page(State(state): State<AppState>) -> Html<String> {
-    let summary = eventlog::usage_summary(&state.db_path).unwrap_or_default();
-    let by_issue = eventlog::usage_by_issue(&state.db_path).unwrap_or_default();
+    let summary = eventlog::usage_summary(&state.eventlog_db_path()).unwrap_or_default();
+    let by_issue = eventlog::usage_by_issue(&state.eventlog_db_path()).unwrap_or_default();
 
     let base = state.base_path.as_str();
     let issue_rows: String = if by_issue.is_empty() {

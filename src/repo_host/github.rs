@@ -1,12 +1,6 @@
 //! GitHub repo-host operations: pull-request automation (`repo.pull_request: true`)
 //! and, for SweBot (README.md "SweBot"), Discussions (Q&A/drafting) and PR review.
 //!
-//! Deliberately independent of `tracker::TrackerAdapter`: these are properties of
-//! `repo:` (the code host), not `tracker:` (the issue board). They usually point at
-//! the same GitHub repo in practice, but nothing requires that -- `repo.token` is
-//! already kept separate from the tracker's own token for the same reason (see
-//! `config::RepoConfig::token_env`'s doc comment).
-//!
 //! Mirrors `tracker::github`'s reqwest/bearer-auth/error-handling shape but isn't
 //! shared code with it: the two adapt genuinely different resources (issues vs.
 //! pull requests/discussions) and staying independent keeps each one simple to read
@@ -17,9 +11,14 @@
 //! for that; everything else (pull requests, reviews) stays plain REST like the rest
 //! of this codebase's GitHub calls.
 
-use crate::config::RepoConfig;
+use super::{
+    DiscussionComment, DiscussionHost, DiscussionThread, RepoHost, ReviewOutcome, ReviewVerdict,
+    SymphonyPullRequest,
+};
+use crate::config::{RepoConfig, RepoProvider};
 use crate::tracker::{ToolResult, ToolSpec};
 use crate::workspace;
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -130,60 +129,6 @@ impl GithubRepoHost {
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
 
-    pub fn agent_tool_specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
-            name: "open_pull_request".to_string(),
-            description: "Open (or update, if one already exists) a pull request for this \
-                ticket's branch, with a title and a body describing the work and the \
-                rationale behind it. This is the way to submit work for review -- call it \
-                once your branch has been pushed and you're satisfied with the change. \
-                Include 'Closes #<issue-number>' in the body so the tracker issue closes \
-                automatically when this PR is merged; do not call update_issue_state with a \
-                terminal/'done' state yourself in this workflow -- closing is a side effect \
-                of merge, not something to do before anyone has reviewed the code. After \
-                this succeeds, if the project's tracker config offers a non-terminal state \
-                for this (e.g. 'in review'), call update_issue_state with that -- otherwise \
-                the tracker keeps treating this ticket as active work still in progress and \
-                you'll keep being redispatched to it with nothing new to do."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string", "description": "Pull request title"},
-                    "body": {
-                        "type": "string",
-                        "description": "Pull request body: what changed, why, and 'Closes #N'"
-                    }
-                },
-                "required": ["title", "body"]
-            }),
-        }]
-    }
-
-    pub async fn execute_agent_tool(
-        &self,
-        name: &str,
-        arguments: serde_json::Value,
-        issue_id: &str,
-    ) -> ToolResult {
-        if name != "open_pull_request" {
-            return ToolResult::error(format!("unsupported tool '{name}'"));
-        }
-        let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'title'");
-        };
-        let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'body'");
-        };
-        let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
-
-        match self.find_open_pr(&head).await {
-            Ok(Some(number)) => self.update_pr(number, title, body).await,
-            Ok(None) => self.create_pr(&head, title, body).await,
-            Err(e) => ToolResult::error(e),
-        }
-    }
-
     async fn find_open_pr(&self, head: &str) -> Result<Option<u64>, String> {
         let url = format!("{}/repos/{}/{}/pulls", self.base_url, self.owner, self.repo);
         let head_param = format!("{}:{head}", self.owner);
@@ -265,68 +210,9 @@ impl GithubRepoHost {
         format!("<!-- swebot:reviewed:{head_sha} -->")
     }
 
-    /// Open pull requests whose head branch matches Symphony's own per-ticket
-    /// convention (`issue-<identifier>`, produced by `synthesize_repo_hooks` /
-    /// `open_pull_request`'s `head` computation) -- i.e. PRs Symphony's *own* coding
-    /// agents opened, not every PR a human might have opened by hand on this repo.
-    pub async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String> {
-        let url = format!("{}/repos/{}/{}/pulls", self.base_url, self.owner, self.repo);
-        let req = self
-            .client
-            .get(&url)
-            .query(&[("state", "open"), ("per_page", "100")]);
-        let resp = self
-            .auth_headers(req)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("GET {url} -> {status}: {text}"));
-        }
-        let all: Vec<GhPullRequestFull> = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(all
-            .into_iter()
-            .filter(|pr| pr.head.r#ref.starts_with("issue-"))
-            .map(|pr| SymphonyPullRequest {
-                number: pr.number,
-                html_url: pr.html_url,
-                head_ref: pr.head.r#ref,
-                head_sha: pr.head.sha,
-                body: pr.body.unwrap_or_default(),
-            })
-            .collect())
-    }
-
-    /// Whether a SweBot review already exists for this exact head commit (see
-    /// `review_marker`) -- callers should skip re-reviewing when this is `true`, and
-    /// only re-review once the branch has actually moved.
-    pub async fn has_reviewed_sha(&self, pr_number: u64, head_sha: &str) -> Result<bool, String> {
-        let marker = Self::review_marker(head_sha);
-        let url = format!(
-            "{}/repos/{}/{}/pulls/{pr_number}/reviews",
-            self.base_url, self.owner, self.repo
-        );
-        let resp = self
-            .auth_headers(self.client.get(&url))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(format!("GET {url} -> {status}: {text}"));
-        }
-        let reviews: Vec<GhReviewBody> = resp.json().await.map_err(|e| e.to_string())?;
-        Ok(reviews
-            .iter()
-            .any(|r| r.body.as_deref().unwrap_or_default().contains(&marker)))
-    }
-
     /// Post a PR review. `event` must be one of GitHub's own review-event values:
     /// `"APPROVE"`, `"REQUEST_CHANGES"`, or `"COMMENT"`.
-    pub async fn post_pr_review(
+    async fn post_review_raw(
         &self,
         pr_number: u64,
         head_sha: &str,
@@ -385,19 +271,181 @@ impl GithubRepoHost {
             .data
             .ok_or_else(|| "GraphQL response had no data".to_string())
     }
+}
 
-    /// Discussions in `category_name` (e.g. `"Q&A"`, `"Ideas"`), newest-updated first,
-    /// each with up to its first 50 comments. Filtering by category happens
-    /// client-side against the category's `name` rather than resolving a
-    /// `categoryId` first -- one GraphQL round trip instead of two, and simpler to
-    /// read; acceptable at the discussion volumes this is meant for (mirrors
-    /// `tracker/github.rs`'s own `MAX_PAGES` "not expected to matter at realistic
-    /// counts" pragmatism). Only the first 25 discussions are considered, same
-    /// reasoning.
-    pub async fn list_discussions_in_category(
+#[async_trait]
+impl RepoHost for GithubRepoHost {
+    fn provider_kind(&self) -> RepoProvider {
+        RepoProvider::Github
+    }
+
+    fn agent_tool_specs(&self) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "open_pull_request".to_string(),
+            description: "Open (or update, if one already exists) a pull request for this \
+                ticket's branch, with a title and a body describing the work and the \
+                rationale behind it. This is the way to submit work for review -- call it \
+                once your branch has been pushed and you're satisfied with the change. \
+                Include 'Closes #<issue-number>' in the body so the tracker issue closes \
+                automatically when this PR is merged; do not call update_issue_state with a \
+                terminal/'done' state yourself in this workflow -- closing is a side effect \
+                of merge, not something to do before anyone has reviewed the code. After \
+                this succeeds, if the project's tracker config offers a non-terminal state \
+                for this (e.g. 'in review'), call update_issue_state with that -- otherwise \
+                the tracker keeps treating this ticket as active work still in progress and \
+                you'll keep being redispatched to it with nothing new to do."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Pull request title"},
+                    "body": {
+                        "type": "string",
+                        "description": "Pull request body: what changed, why, and 'Closes #N'"
+                    }
+                },
+                "required": ["title", "body"]
+            }),
+        }]
+    }
+
+    async fn execute_agent_tool(
         &self,
-        category_name: &str,
-    ) -> Result<Vec<DiscussionThread>, String> {
+        name: &str,
+        arguments: serde_json::Value,
+        issue_id: &str,
+    ) -> ToolResult {
+        if name != "open_pull_request" {
+            return ToolResult::error(format!("unsupported tool '{name}'"));
+        }
+        let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
+            return ToolResult::error("missing required argument 'title'");
+        };
+        let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
+            return ToolResult::error("missing required argument 'body'");
+        };
+        let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
+
+        match self.find_open_pr(&head).await {
+            Ok(Some(number)) => self.update_pr(number, title, body).await,
+            Ok(None) => self.create_pr(&head, title, body).await,
+            Err(e) => ToolResult::error(e),
+        }
+    }
+
+    async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String> {
+        let url = format!("{}/repos/{}/{}/pulls", self.base_url, self.owner, self.repo);
+        let req = self
+            .client
+            .get(&url)
+            .query(&[("state", "open"), ("per_page", "100")]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let all: Vec<GhPullRequestFull> = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(all
+            .into_iter()
+            .filter(|pr| pr.head.r#ref.starts_with("issue-"))
+            .map(|pr| SymphonyPullRequest {
+                number: pr.number,
+                html_url: pr.html_url,
+                head_ref: pr.head.r#ref,
+                head_sha: pr.head.sha,
+                body: pr.body.unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn has_reviewed_sha(&self, pr_number: u64, head_sha: &str) -> Result<bool, String> {
+        let marker = Self::review_marker(head_sha);
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{pr_number}/reviews",
+            self.base_url, self.owner, self.repo
+        );
+        let resp = self
+            .auth_headers(self.client.get(&url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let reviews: Vec<GhReviewBody> = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(reviews
+            .iter()
+            .any(|r| r.body.as_deref().unwrap_or_default().contains(&marker)))
+    }
+
+    /// Posts the requested verdict, mapped to GitHub's own review-event vocabulary
+    /// (`APPROVE`/`REQUEST_CHANGES`/`COMMENT`). GitHub refuses to let an account
+    /// approve its own pull request (422 "Can not approve your own pull request") --
+    /// when the same token authenticates both the coding agent (PR author) and
+    /// SweBot (reviewer, the default when `swebot.token` isn't set -- see
+    /// `config::EffectiveConfig::swebot_repo_config`), an `Approve` verdict always
+    /// hits this. Falling back to a plain comment with the same reasoning means the
+    /// review still gets posted and recorded (`has_reviewed_sha` becomes true) rather
+    /// than retrying and 422ing again on every single poll forever -- a real failure
+    /// mode hit running this live: it silently burned a full review turn on every
+    /// cycle with nothing ever actually landing. Setting `swebot.token` to a second
+    /// GitHub identity avoids hitting this fallback at all.
+    async fn post_pr_review(
+        &self,
+        pr_number: u64,
+        head_sha: &str,
+        verdict: ReviewVerdict,
+        summary: &str,
+    ) -> Result<ReviewOutcome, String> {
+        let event = match verdict {
+            ReviewVerdict::Approve => "APPROVE",
+            ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+            ReviewVerdict::Comment => "COMMENT",
+        };
+        match self
+            .post_review_raw(pr_number, head_sha, event, summary)
+            .await
+        {
+            Ok(()) => Ok(ReviewOutcome { posted_as: verdict }),
+            Err(e)
+                if verdict == ReviewVerdict::Approve
+                    && e.contains("Can not approve your own pull request") =>
+            {
+                let note = format!(
+                    "(SweBot would approve this, but GitHub doesn't allow approving your own \
+                     pull request -- the coding agent and SweBot are using the same token \
+                     here. Posting as a comment instead. Set `swebot.token` to a separate \
+                     GitHub identity to avoid this.)\n\n{summary}"
+                );
+                self.post_review_raw(pr_number, head_sha, "COMMENT", &note)
+                    .await?;
+                Ok(ReviewOutcome {
+                    posted_as: ReviewVerdict::Comment,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait]
+impl DiscussionHost for GithubRepoHost {
+    /// Discussions in `selector` (a category name, e.g. `"Q&A"`, `"Ideas"`),
+    /// newest-updated first, each with up to its first 50 comments. Filtering by
+    /// category happens client-side against the category's `name` rather than
+    /// resolving a `categoryId` first -- one GraphQL round trip instead of two, and
+    /// simpler to read; acceptable at the discussion volumes this is meant for
+    /// (mirrors `tracker/github.rs`'s own `MAX_PAGES` "not expected to matter at
+    /// realistic counts" pragmatism). Only the first 25 discussions are considered,
+    /// same reasoning.
+    async fn list_swebot_threads(&self, selector: &str) -> Result<Vec<DiscussionThread>, String> {
         // Fetches each top-level comment's `replies` too, not just `comments` --
         // GitHub's own "Reply" button on a specific comment creates a *threaded*
         // reply, not a new top-level comment, and that's the natural way a human
@@ -431,7 +479,7 @@ impl GithubRepoHost {
             .discussions
             .nodes
             .into_iter()
-            .filter(|d| d.category.name == category_name)
+            .filter(|d| d.category.name == selector)
             .map(|d| DiscussionThread {
                 id: d.id,
                 number: d.number,
@@ -462,28 +510,21 @@ impl GithubRepoHost {
     }
 
     /// Reply to a discussion. Returns the new comment's GraphQL node id.
-    pub async fn post_discussion_comment(
-        &self,
-        discussion_id: &str,
-        body: &str,
-    ) -> Result<String, String> {
+    async fn post_discussion_comment(&self, thread_id: &str, body: &str) -> Result<String, String> {
         const MUTATION: &str = "mutation($discussionId: ID!, $body: String!) { \
             addDiscussionComment(input: {discussionId: $discussionId, body: $body}) { \
               comment { id } \
             } \
           }";
         let data: AddCommentData = self
-            .graphql(
-                MUTATION,
-                json!({"discussionId": discussion_id, "body": body}),
-            )
+            .graphql(MUTATION, json!({"discussionId": thread_id, "body": body}))
             .await?;
         Ok(data.add_discussion_comment.comment.id)
     }
 
     /// Mark a Q&A-category discussion as answered by `comment_id` (a GraphQL node id,
     /// as returned by `post_discussion_comment`, not the numeric `databaseId`).
-    pub async fn mark_discussion_comment_as_answer(&self, comment_id: &str) -> Result<(), String> {
+    async fn mark_discussion_comment_as_answer(&self, comment_id: &str) -> Result<(), String> {
         const MUTATION: &str = "mutation($id: ID!) { \
             markDiscussionCommentAsAnswer(input: {id: $id}) { clientMutationId } \
           }";
@@ -491,64 +532,6 @@ impl GithubRepoHost {
             .await?;
         Ok(())
     }
-}
-
-/// Case-insensitive scan for GitHub's own issue-closing keywords (`close(s|d)`,
-/// `fix(es|ed)`, `resolve(s|d)`) followed by `#<number>`, the same convention
-/// `open_pull_request`'s tool description asks the agent to use. Used by SweBot's
-/// review driver to find the ticket a PR is meant to resolve, so a review can be
-/// judged against the *original* acceptance criteria. Manual scan rather than a new
-/// `regex` dependency -- mirrors `tracker::github::parse_depends_on`'s own style for
-/// the same reason.
-pub fn extract_closes_issue_number(body: &str) -> Option<u64> {
-    const KEYWORDS: &[&str] = &[
-        "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
-    ];
-    let lower = body.to_lowercase();
-    for keyword in KEYWORDS {
-        let mut search_from = 0;
-        while let Some(pos) = lower[search_from..].find(keyword) {
-            let start = search_from + pos;
-            let after = &body[start + keyword.len()..];
-            let after = after.trim_start();
-            if let Some(rest) = after.strip_prefix('#') {
-                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if !digits.is_empty()
-                    && let Ok(n) = digits.parse::<u64>()
-                {
-                    return Some(n);
-                }
-            }
-            search_from = start + keyword.len();
-        }
-    }
-    None
-}
-
-#[derive(Debug, Clone)]
-pub struct SymphonyPullRequest {
-    pub number: u64,
-    pub html_url: String,
-    pub head_ref: String,
-    pub head_sha: String,
-    pub body: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiscussionThread {
-    pub id: String,
-    pub number: u64,
-    pub title: String,
-    pub body: String,
-    pub url: String,
-    pub comments: Vec<DiscussionComment>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiscussionComment {
-    pub database_id: u64,
-    pub body: String,
-    pub author_login: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,14 +656,6 @@ impl GithubRepoHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn set_token(name: &str, value: &str) {
-        unsafe {
-            std::env::set_var(name, value);
-        }
-    }
 
     #[test]
     fn parses_https_and_ssh_github_urls() {
@@ -726,6 +701,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REPO_HOST_TOKEN_1".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri());
@@ -770,6 +746,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REPO_HOST_TOKEN_2".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri());
@@ -809,6 +786,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REPO_HOST_TOKEN_3".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri());
@@ -832,6 +810,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REPO_HOST_TOKEN_4".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.contains("github.com"));
@@ -847,21 +826,16 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some("SYMPHONY_TEST_REPO_HOST_TOKEN_MISSING".to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap_err();
         assert!(err.contains("SYMPHONY_TEST_REPO_HOST_TOKEN_MISSING"));
     }
 
-    #[test]
-    fn extracts_closes_issue_number_case_insensitively_and_across_keywords() {
-        assert_eq!(extract_closes_issue_number("Closes #42"), Some(42));
-        assert_eq!(
-            extract_closes_issue_number("fixes #7 and more text"),
-            Some(7)
-        );
-        assert_eq!(extract_closes_issue_number("RESOLVED #100"), Some(100));
-        assert_eq!(extract_closes_issue_number("no keyword here, #9"), None);
-        assert_eq!(extract_closes_issue_number("closes issue 9, no hash"), None);
+    fn set_token(name: &str, value: &str) {
+        unsafe {
+            std::env::set_var(name, value);
+        }
     }
 
     fn host(server: &MockServer, token_var: &str) -> GithubRepoHost {
@@ -871,6 +845,7 @@ mod tests {
             default_branch: "main".to_string(),
             token_env: Some(token_var.to_string()),
             pull_request: false,
+            ..Default::default()
         })
         .unwrap()
         .with_base_url_for_test(&server.uri())
@@ -929,9 +904,41 @@ mod tests {
             .await;
 
         let result = host(&server, "SYMPHONY_TEST_RH_POST_REVIEW")
-            .post_pr_review(5, "abc123", "APPROVE", "Looks correct and well-tested.")
+            .post_pr_review(
+                5,
+                "abc123",
+                ReviewVerdict::Approve,
+                "Looks correct and well-tested.",
+            )
             .await;
         assert!(result.is_ok(), "{:?}", result);
+        assert_eq!(result.unwrap().posted_as, ReviewVerdict::Approve);
+    }
+
+    #[tokio::test]
+    async fn post_pr_review_falls_back_to_a_comment_on_self_approval_rejection() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/5/reviews"))
+            .and(body_string_contains("APPROVE"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "Unprocessable Entity",
+                "errors": ["Review Can not approve your own pull request"]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/5/reviews"))
+            .and(body_string_contains("COMMENT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let result = host(&server, "SYMPHONY_TEST_RH_SELF_APPROVE")
+            .post_pr_review(5, "abc123", ReviewVerdict::Approve, "Looks correct.")
+            .await
+            .unwrap();
+        assert_eq!(result.posted_as, ReviewVerdict::Comment);
     }
 
     #[tokio::test]
@@ -970,11 +977,11 @@ mod tests {
             .await;
 
         let h = host(&server, "SYMPHONY_TEST_RH_DISCUSSIONS");
-        let qa = h.list_discussions_in_category("Q&A").await.unwrap();
+        let qa = h.list_swebot_threads("Q&A").await.unwrap();
         assert_eq!(qa.len(), 1);
         assert_eq!(qa[0].number, 1);
 
-        let ideas = h.list_discussions_in_category("Ideas").await.unwrap();
+        let ideas = h.list_swebot_threads("Ideas").await.unwrap();
         assert_eq!(ideas.len(), 1);
         assert_eq!(ideas[0].comments.len(), 1);
         assert_eq!(ideas[0].comments[0].database_id, 111);
@@ -1018,7 +1025,7 @@ mod tests {
             .await;
 
         let h = host(&server, "SYMPHONY_TEST_RH_THREADED_REPLIES");
-        let ideas = h.list_discussions_in_category("Ideas").await.unwrap();
+        let ideas = h.list_swebot_threads("Ideas").await.unwrap();
         assert_eq!(ideas.len(), 1);
         assert_eq!(
             ideas[0].comments.len(),
@@ -1044,7 +1051,7 @@ mod tests {
             .await;
 
         let err = host(&server, "SYMPHONY_TEST_RH_GRAPHQL_ERR")
-            .list_discussions_in_category("Q&A")
+            .list_swebot_threads("Q&A")
             .await
             .unwrap_err();
         assert!(err.contains("Could not resolve to a Repository"));
@@ -1067,4 +1074,7 @@ mod tests {
             .unwrap();
         assert_eq!(id, "C_99");
     }
+
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 }

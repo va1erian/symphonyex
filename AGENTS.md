@@ -280,21 +280,46 @@ from *its own* invoking process's environment, so the secret never appears in th
 daemonized Symphony's own container too (see below), since the orchestrator process
 running inside it needs these just as much as a per-ticket container does.
 
-**Pull requests instead of a silently pushed branch**: by default the synthesized
-`after_run` hook pushes each ticket's branch and leaves it there for a human to
-notice on their own. Set `repo.pull_request: true` (requires `repo.url` to be a
-`github.com` URL and `repo.token` to be set) to expose a second agent tool,
-`open_pull_request(title, body)`, alongside whatever the tracker itself exposes (see
-"Provider-native tracker tool" below) — the agent calls it once it's pushed and happy
-with the change, supplying its own title and rationale. Calling it again (a retry, or
-more work landing on the same branch) updates the existing PR in place rather than
-creating a duplicate.
+**Pull/merge requests instead of a silently pushed branch**: by default the
+synthesized `after_run` hook pushes each ticket's branch and leaves it there for a
+human to notice on their own. Set `repo.pull_request: true` (requires `repo.url` to
+parse for the configured `repo.provider` and `repo.token` to be set) to expose a
+second agent tool, `open_pull_request(title, body)`, alongside whatever the tracker
+itself exposes (see "Provider-native tracker tool" below) — the agent calls it once
+it's pushed and happy with the change, supplying its own title and rationale. Calling
+it again (a retry, or more work landing on the same branch) updates the existing
+PR/MR in place rather than creating a duplicate.
 
-This changes how issues close: put `Closes #<issue-number>` in the PR body and GitHub
-closes the tracker issue automatically **when a human merges the PR**, not when the
-agent decides it's done. The existing GitHub tracker adapter already treats a closed
+This changes how issues close: put `Closes #<issue-number>` in the PR/MR body and the
+code host closes the tracker issue automatically **when a human merges it**, not when
+the agent decides it's done. The existing tracker adapters already treat a closed
 issue as done regardless of how it got closed, so nothing else needs to change for
 the polling loop to pick this up.
+
+**GitLab support**: set `repo.provider: gitlab` (default is `github`, so every
+existing `repo:` block with no `provider:` key is unaffected). `repo.url` can be any
+GitLab host, including self-managed instances — unlike GitHub detection, which only
+recognizes `github.com`, GitLab detection accepts any host once `provider: gitlab` is
+explicit. The GitLab REST API root is derived from `repo.url`'s own scheme+host plus
+`/api/v4` (covering the common self-managed case with zero extra config); override it
+explicitly with `repo.api_base_url` when the API is reachable somewhere else (already
+including the `/api/v4` suffix — nothing is appended onto an explicit value):
+
+```yaml
+repo:
+  provider: gitlab
+  url: https://gitlab.example.com/group/subgroup/name.git
+  api_base_url: https://gitlab.example.com/api/v4   # optional, derived from url otherwise
+  default_branch: main
+  token: $GITLAB_TOKEN
+  pull_request: true
+```
+
+The synthesized clone hooks also pick GitLab's documented HTTPS credential-helper
+username (`oauth2`) instead of GitHub's (`x-access-token`) when `provider: gitlab` —
+deploy tokens, which need their own configured username, aren't supported by this
+synthesized default, same "extend, don't configure around" posture as GitHub
+Enterprise not being supported by URL-sniffed detection.
 
 **Important operational detail, found running this live**: the agent must *not* call
 `update_issue_state` with `"done"` in this mode (that decision belongs to whoever
@@ -317,48 +342,62 @@ deliberately, same posture as `workspace.docker.mount_claude_credentials`.
 
 ## SweBot
 
-A software-engineering assistant with three capabilities, all GitHub-native (no new
-chat UI, no webhook receiver — just another poll loop, like everything else here):
+A software-engineering assistant with three capabilities, working against either
+GitHub or GitLab (`repo.provider`), no webhook receiver — just another poll loop,
+like everything else here:
 
-1. **Q&A**: answers questions asked in the repo's `Q&A`-category GitHub Discussions.
+1. **Q&A**: answers questions asked in the repo's `Q&A`-category GitHub Discussions,
+   or, on GitLab (which has no Discussions object), Issues carrying the
+   `swebot.qa.label` label (default `"swebot::question"`).
 2. **Ticket drafting**: turns a rough idea posted in the `Ideas`-category Discussions
-   into a properly scoped issue through a clarifying dialogue, then creates a **new**
-   issue via the tracker (Discussions stays the messy conversational space; Issues
-   stays the clean, actionable backlog Symphony's own dispatch loop watches).
-3. **PR review**: reviews the pull requests Symphony's own coding agents open
-   (branch name matching `issue-<identifier>`, not every PR a human might open by
-   hand) and posts an approve/request-changes/comment verdict. **Never merges** — a
-   human always does that.
+   (GitHub) or carrying the `swebot.drafting.label` label (GitLab, default
+   `"swebot::idea"`) into a properly scoped issue through a clarifying dialogue, then
+   creates a **new** issue via the tracker (the source thread stays the messy
+   conversational space; the tracker's Issues stays the clean, actionable backlog
+   Symphony's own dispatch loop watches — on GitLab, where the source thread is
+   itself a tracker Issue, the source issue is closed once promoted to keep that
+   separation from collapsing).
+3. **PR/MR review**: reviews the pull/merge requests Symphony's own coding agents
+   open (branch name matching `issue-<identifier>`, not every PR/MR a human might
+   open by hand) and posts an approve/request-changes/comment verdict. **Never
+   merges** — a human always does that.
 
 ```yaml
 swebot:
   enabled: true
   token: $SWEBOT_GITHUB_TOKEN         # optional; see "Two identities" below
   qa:
-    discussion_category: "Q&A"        # default
+    discussion_category: "Q&A"        # default, GitHub
+    label: "swebot::question"         # default, GitLab
   drafting:
-    discussion_category: "Ideas"      # default
+    discussion_category: "Ideas"      # default, GitHub
+    label: "swebot::idea"             # default, GitLab
   review:
     enabled: true                     # defaults to `swebot.enabled`'s own value
 ```
 
 Off by default, same posture as `repo.pull_request`: this posts real comments and
-reviews on a real GitHub repo. Requires `repo.url` to be a `github.com` URL and
-either `repo.token` or `swebot.token` to be set — SweBot keys off `repo:` (the same
-source of truth `repo.pull_request` uses) rather than `tracker.provider.repo`, so it
-works the same regardless of `tracker.kind`.
+reviews on a real repo. Requires `repo.url` to parse for the configured
+`repo.provider` and either `repo.token` or `swebot.token` to be set — SweBot keys off
+`repo:` (the same source of truth `repo.pull_request` uses) rather than
+`tracker.provider.repo`, so it works the same regardless of `tracker.kind`.
 
 **Two identities — why `swebot.token` exists**: by default SweBot authenticates with
-the same `repo.token` the coding agent uses to push branches and open PRs. That's fine
-for Q&A and drafting, but it breaks PR review specifically: GitHub's API rejects an
-`APPROVE`/`REQUEST_CHANGES` review from the same account that authored the pull
-request (422 "Can not approve your own pull request"), and since Symphony's coding
-agent is always the PR's author, single-identity SweBot can *never* actually approve
-one — `swebot/review.rs` falls back to posting a plain comment instead so a poll cycle
-doesn't 422-loop forever, but a genuine approval never lands. Set `swebot.token` to a
-second GitHub credential (a separate bot account/App installation, e.g. "codebot" for
-the coding agent's own `repo.token` and "swebot" for this one) to give SweBot a
-distinct identity from the PR author, and approvals go through for real. `swebot.token`
+the same `repo.token` the coding agent uses to push branches and open PRs/MRs.
+That's fine for Q&A and drafting, but it breaks approving specifically: GitHub's API
+rejects an `APPROVE`/`REQUEST_CHANGES` review from the same account that authored the
+pull request (422 "Can not approve your own pull request") — a blanket restriction —
+and since Symphony's coding agent is always the PR's author, single-identity SweBot
+can *never* actually approve one. GitLab's equivalent ("prevent approval by author")
+is narrower: it only blocks the `/approve` endpoint, not plain discussion notes, so
+single-identity SweBot on GitLab can genuinely post a request-changes or comment
+verdict even without a second identity — only *approving* needs one. Either way,
+`swebot/review.rs`'s driver falls back to posting a plain comment instead so a poll
+cycle doesn't loop forever retrying a rejected approval, but a genuine approval never
+lands until a second identity is configured. Set `swebot.token` to a second
+credential (a separate bot account/App installation, e.g. "codebot" for the coding
+agent's own `repo.token` and "swebot" for this one) to give SweBot a distinct
+identity from the PR/MR author, and approvals go through for real. `swebot.token`
 follows the same `$VAR_NAME`-env-var-reference convention as `repo.token` (see
 `config::RepoConfig::token_env`'s doc comment) — the value itself is never embedded in
 config, only the env var's name.
@@ -369,21 +408,29 @@ config, only the env var's name.
 matching the project's own conventions) rather than a rubber stamp. `request_changes`
 means something genuinely fails one of those; `approve` means "I'd merge this."
 
-**Why GitHub Discussions, not issue comments**: Discussions' built-in `Q&A`/`Ideas`
-categories are a much closer semantic fit for open-ended conversation than Issues,
-which are meant to be scoped, actionable work items. The trade-off: Discussions has no
-REST API, only GraphQL (`GithubRepoHost::graphql`, alongside the plain-REST calls
-everything else here uses) — see `src/repo_host.rs`'s own module doc comment.
+**Why GitHub Discussions, not issue comments — and what GitLab uses instead**:
+Discussions' built-in `Q&A`/`Ideas` categories are a much closer semantic fit for
+open-ended conversation than Issues, which are meant to be scoped, actionable work
+items. The trade-off: Discussions has no REST API, only GraphQL
+(`repo_host::github::GithubRepoHost`'s own `graphql` helper, alongside the plain-REST
+calls everything else here uses) — see `src/repo_host/github.rs`'s own module doc
+comment. GitLab has no Discussions object at all, so its Q&A/Ideas conversational
+surface is instead a plain label on regular Issues — a real trade-off (the
+conversational and the actionable share one Issues list, distinguished only by
+label), but GitLab's Issue Notes API already supports threaded comments, so the
+thread+comment shape SweBot's marker-scanning logic consumes barely changes between
+the two hosts (see `src/repo_host/gitlab.rs`'s own module doc comment for the
+provider-specific wire-format details, all handled entirely inside that module).
 
-**No local persistence**: which comments SweBot has already answered, and which PR
-commits it has already reviewed, are both derived from hidden HTML-comment markers
-embedded in SweBot's own past replies/reviews (`<!-- swebot:answered:<id> -->`,
-`<!-- swebot:reviewed:<sha> -->`), scanned out of GitHub's own stored data on every
-poll. Nothing to lose on a restart, and no separate database. Ticket drafting doesn't
-use `claude`'s own `--resume` across poll cycles either (a human's next reply may come
-hours later, well past a restart) — each poll reconstructs the full transcript from
-the Discussion's own comment history and sends it fresh, which the model already needs
-context for anyway.
+**No local persistence**: which comments SweBot has already answered, and which
+PR/MR commits it has already reviewed, are both derived from hidden HTML-comment
+markers embedded in SweBot's own past replies/reviews (`<!-- swebot:answered:<id>
+-->`, `<!-- swebot:reviewed:<sha> -->`), scanned out of the host's own stored data on
+every poll. Nothing to lose on a restart, and no separate database. Ticket drafting
+doesn't use `claude`'s own `--resume` across poll cycles either (a human's next reply
+may come hours later, well past a restart) — each poll reconstructs the full
+transcript from the thread's own comment history and sends it fresh, which the model
+already needs context for anyway.
 
 **Isolation from the coding agent's own trust boundary**: SweBot's sessions run with
 `Edit`/`Write`/`NotebookEdit` explicitly disallowed (`--disallowedTools`, on top of
@@ -391,6 +438,35 @@ the same `bypassPermissions` mode ticket dispatch uses so Bash/read tools still 
 freely for exploring code and running tests during review). It answers, drafts, and
 reviews — it never edits the repo directly. That stays the coding agent's job, gated
 by the normal ticket-dispatch flow this whole document is otherwise about.
+
+**Alternative: a local bulletin board instead of GitLab's label-filtered Issues**
+(`src/board.rs`). Some projects would rather not mix SweBot's Q&A/Ideas traffic into
+their real GitLab Issues list at all, even distinguished only by label. Set
+`swebot.board.enabled: true` to swap SweBot's Q&A/drafting conversational surface for
+a small, self-hosted bulletin board instead — two fixed boards (`Q&A`, `Ideas`),
+server-rendered HTML/CSS with no JS, markdown support (sanitized server-side: raw
+HTML and non-`http(s)/mailto`-scheme links are neutralized, since posts are
+unauthenticated), mounted at `/board` alongside the status dashboard
+(`status::router`, so it needs `--port` or `symphony serve` the same way `/events`/
+`/usage` do):
+
+```yaml
+swebot:
+  enabled: true
+  board:
+    enabled: true   # use the local bulletin board instead of repo.provider's own Q&A/drafting surface
+```
+
+Only affects Q&A/drafting: `swebot.review.enabled` (PR/MR review) always goes through
+the real `repo.provider` host regardless, since a merge request is inherently a
+property of the actual code host, not something a bulletin board has any notion of.
+Works with either provider, not just GitLab — a GitHub project could use it too, to
+avoid Discussions rather than avoid Issues. `swebot::mod`'s `ConversationHost` is what
+picks between the local board (`board::BulletinBoardHost`, implementing just the
+`repo_host::DiscussionHost` half of the `RepoHost` trait — see that trait's own doc
+comment for why the split exists) and the real host per poll cycle; `qa.rs`/
+`drafting.rs` themselves stay agnostic to which one they got. Storage is `rusqlite`,
+connection-per-call, same "keep it basic" posture as `registry.rs`/`eventlog.rs`.
 
 ## Daemonizing Symphony (single project)
 
@@ -563,15 +639,16 @@ redispatching it forever (continuation retries) once the agent thinks it's done.
 (Section 10.5) would need separate plumbing in the (already best-effort) Codex client.
 
 **A second, independent tool source**: when `repo.pull_request: true` (see "Git repo
-as first-class input" above), `open_pull_request({title, body})` from
-`src/repo_host.rs` is exposed the same way, *alongside* whatever the tracker itself
-exposes — `run_stdio_server` merges both tool lists and routes each `tools/call` by
-name to whichever side owns it. This is deliberately not a `TrackerAdapter` tool: a
-pull request is a property of `repo:` (the code host), not `tracker:` (the issue
-board), so it's kept as its own capability rather than folded into the tracker's own
-tool set. `repo.pull_request` also works with `tracker.kind: local` — the MCP
-subprocess gets spawned whenever *either* side has a tool to offer, not just when the
-tracker does.
+as first-class input" above), `open_pull_request({title, body})` from the configured
+`RepoHost` (`src/repo_host/{github,gitlab}.rs`, behind the `RepoHost` trait in
+`src/repo_host/mod.rs`) is exposed the same way, *alongside* whatever the tracker
+itself exposes — `run_stdio_server` merges both tool lists and routes each
+`tools/call` by name to whichever side owns it. This is deliberately not a
+`TrackerAdapter` tool: a pull/merge request is a property of `repo:` (the code host),
+not `tracker:` (the issue board), so it's kept as its own capability rather than
+folded into the tracker's own tool set. `repo.pull_request` also works with
+`tracker.kind: local` — the MCP subprocess gets spawned whenever *either* side has a
+tool to offer, not just when the tracker does.
 
 ## What's implemented (Section 18.1 core conformance)
 

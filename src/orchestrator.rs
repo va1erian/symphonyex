@@ -313,7 +313,9 @@ async fn startup_terminal_cleanup(shared: &Shared) {
 /// branch below feeds directly into `status::serve`.
 pub struct ProjectHandles {
     pub status_rx: tokio::sync::watch::Receiver<status::StatusSnapshot>,
-    pub db_path: PathBuf,
+    /// `EffectiveConfig::workflow_dir` -- `status::router` derives both the
+    /// eventlog and bulletin-board db paths from this itself.
+    pub workflow_dir: PathBuf,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -396,10 +398,7 @@ async fn run_inner(
     let mut state = OrchestratorState::default();
 
     let (status_tx, status_rx) = tokio::sync::watch::channel(status::StatusSnapshot::default());
-    let db_path = shared
-        .config
-        .workflow_dir
-        .join(crate::eventlog::DB_FILENAME);
+    let workflow_dir = shared.config.workflow_dir.clone();
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
@@ -407,13 +406,13 @@ async fn run_inner(
         let bind_all_interfaces =
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         let status_rx_for_serve = status_rx.clone();
-        let db_path_for_serve = db_path.clone();
+        let workflow_dir_for_serve = workflow_dir.clone();
         tokio::spawn(async move {
             if let Err(e) = status::serve(
                 port,
                 bind_all_interfaces,
                 status_rx_for_serve,
-                db_path_for_serve,
+                workflow_dir_for_serve,
             )
             .await
             {
@@ -424,7 +423,7 @@ async fn run_inner(
     if let Some(handles_tx) = handles_tx {
         let _ = handles_tx.send(ProjectHandles {
             status_rx: status_rx.clone(),
-            db_path: db_path.clone(),
+            workflow_dir: workflow_dir.clone(),
         });
     }
 

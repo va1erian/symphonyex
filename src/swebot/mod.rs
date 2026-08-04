@@ -1,7 +1,8 @@
-//! SweBot: answers questions and drafts tickets in GitHub Discussions, and reviews
-//! the pull requests Symphony's coding agents open. GitHub-specific for v1 (see
-//! `config::SwebotConfig`'s doc comment for why), keyed off `repo:` rather than the
-//! tracker so it works the same regardless of `tracker.kind`.
+//! SweBot: answers questions and drafts tickets, and reviews the pull/merge requests
+//! Symphony's coding agents open. Works against either GitHub or GitLab (see
+//! `config::SwebotConfig`'s doc comment for how the Q&A/drafting conversational
+//! surface differs per provider), keyed off `repo:` rather than the tracker so it
+//! works the same regardless of `tracker.kind`.
 //!
 //! Runs as an additional task inside the *same* orchestrator process (spawned from
 //! `orchestrator::run` when `cfg.swebot.enabled`), sharing its polling cadence and the
@@ -20,12 +21,56 @@ pub mod review;
 
 use crate::agent::claude::ClaudeBackend;
 use crate::agent::{AgentEvent, AgentSession, TurnOutcome};
-use crate::config::EffectiveConfig;
-use crate::repo_host::{DiscussionThread, GithubRepoHost};
+use crate::config::{EffectiveConfig, RepoProvider};
+use crate::repo_host::{self, DiscussionHost, DiscussionThread, RepoHost};
 use crate::tracker::TrackerAdapter;
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+/// Which conversational surface a given run talks to for Q&A/drafting: either the
+/// real code host's own Discussions/labels, or (when `swebot.board.enabled`)
+/// `crate::board`'s local bulletin board instead -- see
+/// `config::SwebotConfig::board_enabled`'s doc comment for why a project would pick
+/// the latter. PR/MR review always goes through the real `RepoHost` regardless (see
+/// `run` below) -- a merge request is inherently a property of the actual code host,
+/// not something the board has any notion of.
+enum ConversationHost {
+    Board(crate::board::BulletinBoardHost),
+    Repo(Arc<dyn RepoHost>),
+}
+
+#[async_trait]
+impl DiscussionHost for ConversationHost {
+    async fn list_swebot_threads(&self, selector: &str) -> Result<Vec<DiscussionThread>, String> {
+        match self {
+            ConversationHost::Board(b) => b.list_swebot_threads(selector).await,
+            ConversationHost::Repo(r) => r.list_swebot_threads(selector).await,
+        }
+    }
+
+    async fn post_discussion_comment(&self, thread_id: &str, body: &str) -> Result<String, String> {
+        match self {
+            ConversationHost::Board(b) => b.post_discussion_comment(thread_id, body).await,
+            ConversationHost::Repo(r) => r.post_discussion_comment(thread_id, body).await,
+        }
+    }
+
+    async fn mark_discussion_comment_as_answer(&self, comment_id: &str) -> Result<(), String> {
+        match self {
+            ConversationHost::Board(b) => b.mark_discussion_comment_as_answer(comment_id).await,
+            ConversationHost::Repo(r) => r.mark_discussion_comment_as_answer(comment_id).await,
+        }
+    }
+
+    async fn close_thread(&self, thread_id: &str) -> Result<(), String> {
+        match self {
+            ConversationHost::Board(b) => b.close_thread(thread_id).await,
+            ConversationHost::Repo(r) => r.close_thread(thread_id).await,
+        }
+    }
+}
 
 /// `<!-- swebot:answered:<id> -->`, embedded in every SweBot reply. `id` is a real
 /// comment `database_id` in the normal case, or the reserved sentinel `0` when
@@ -125,7 +170,7 @@ const DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
 /// A `ClaudeBackend` configured the same way ticket dispatch's is (same command,
 /// model, timeout) but with file-mutating tools explicitly disallowed and no MCP
 /// tool wiring -- SweBot's drivers parse each turn's text/JSON response themselves
-/// and act via `GithubRepoHost`/`TrackerAdapter` directly, rather than routing
+/// and act via `RepoHost`/`TrackerAdapter` directly, rather than routing
 /// through an agent-invoked tool call the way ticket dispatch's `update_issue_state`
 /// does (that plumbing exists for a long tool-using coding session; SweBot's turns
 /// are single-shot conversational exchanges, so parsing the final response is enough).
@@ -215,12 +260,40 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
         );
         return;
     };
-    let host = match GithubRepoHost::new(&swebot_repo) {
-        Ok(h) => h,
+    let host: Arc<dyn RepoHost> = match repo_host::build(&swebot_repo) {
+        Ok(h) => Arc::from(h),
         Err(e) => {
-            tracing::error!(error = %e, "swebot: failed to build GithubRepoHost, not starting");
+            tracing::error!(error = %e, "swebot: failed to build repo host, not starting");
             return;
         }
+    };
+    // Q&A/drafting poll a `ConversationHost` -- the real host's own Discussions/
+    // labels, or `crate::board`'s local bulletin board when `swebot.board.enabled`
+    // (see `config::SwebotConfig::board_enabled`'s doc comment). PR/MR review always
+    // uses `host` directly below, regardless of this choice.
+    let (conversation_host, qa_selector, drafting_selector) = if cfg.swebot.board_enabled {
+        // Must point at the same directory `status::router` mounts `crate::board`'s
+        // own web UI against (`workflow_dir`, not `workspace_root`) -- both read and
+        // write the same `board.db`, so a human replying via the UI and SweBot
+        // replying via this poll loop see each other's posts.
+        let board_host = crate::board::BulletinBoardHost::new(cfg.workflow_dir.clone(), "/board");
+        (
+            ConversationHost::Board(board_host),
+            cfg.swebot.qa_discussion_category.clone(),
+            cfg.swebot.drafting_discussion_category.clone(),
+        )
+    } else {
+        let (qa, drafting) = match host.provider_kind() {
+            RepoProvider::Github => (
+                cfg.swebot.qa_discussion_category.clone(),
+                cfg.swebot.drafting_discussion_category.clone(),
+            ),
+            RepoProvider::Gitlab => (
+                cfg.swebot.qa_label.clone(),
+                cfg.swebot.drafting_label.clone(),
+            ),
+        };
+        (ConversationHost::Repo(host.clone()), qa, drafting)
     };
     let backend = restricted_backend(&cfg);
     let shared_clone_dir = cfg.workspace_root.join(".swebot-shared-clone");
@@ -231,18 +304,31 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
         if let Err(e) = git::ensure_shared_clone(&swebot_repo, &shared_clone_dir).await {
             tracing::warn!(error = %e, "swebot: failed to refresh shared clone; Q&A/drafting will retry next cycle");
         } else {
-            if let Err(e) = qa::poll_once(&cfg, &host, &backend, &shared_clone_dir).await {
+            if let Err(e) = qa::poll_once(
+                &conversation_host,
+                &qa_selector,
+                &backend,
+                &shared_clone_dir,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, "swebot: Q&A poll failed");
             }
-            if let Err(e) =
-                drafting::poll_once(&cfg, &host, &backend, &shared_clone_dir, tracker.as_ref())
-                    .await
+            if let Err(e) = drafting::poll_once(
+                &cfg,
+                &conversation_host,
+                &drafting_selector,
+                &backend,
+                &shared_clone_dir,
+                tracker.as_ref(),
+            )
+            .await
             {
                 tracing::warn!(error = %e, "swebot: drafting poll failed");
             }
         }
         if cfg.swebot.review_enabled
-            && let Err(e) = review::poll_once(&cfg, &host, &backend, tracker.as_ref()).await
+            && let Err(e) = review::poll_once(&cfg, host.as_ref(), &backend, tracker.as_ref()).await
         {
             tracing::warn!(error = %e, "swebot: review poll failed");
         }

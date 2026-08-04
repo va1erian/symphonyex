@@ -37,12 +37,18 @@ fn credential(repo: &RepoConfig) -> Option<(String, String)> {
 
 async fn clone_into(repo: &RepoConfig, dest: &Path, branch: Option<&str>) -> Result<(), String> {
     let cred = credential(repo);
-    // Same credential-helper trick `synthesize_repo_hooks` uses: the token never
-    // appears in argv or the remote URL, only referenced by env var *name* in a
-    // helper script -- the actual value only ever lives in this child process's env.
+    // Same credential-helper trick `synthesize_repo_hooks` uses (see that function's
+    // own comment on `credential_username` for why this differs per provider): the
+    // token never appears in argv or the remote URL, only referenced by env var
+    // *name* in a helper script -- the actual value only ever lives in this child
+    // process's env.
+    let credential_username = match repo.provider {
+        crate::config::RepoProvider::Github => "x-access-token",
+        crate::config::RepoProvider::Gitlab => "oauth2",
+    };
     let helper_arg = cred.as_ref().map(|(var, _)| {
         format!(
-            "credential.helper=!f() {{ echo username=x-access-token; echo password=${var}; }}; f"
+            "credential.helper=!f() {{ echo username={credential_username}; echo password=${var}; }}; f"
         )
     });
 
