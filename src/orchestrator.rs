@@ -315,8 +315,8 @@ async fn startup_terminal_cleanup(shared: &Shared) {
 /// branch below feeds directly into `status::serve`.
 pub struct ProjectHandles {
     pub status_rx: tokio::sync::watch::Receiver<status::StatusSnapshot>,
-    /// `EffectiveConfig::workflow_dir` -- `status::router` derives both the
-    /// eventlog and bulletin-board db paths from this itself.
+    /// `EffectiveConfig::workflow_dir` -- `status::router` derives the eventlog db
+    /// path from this itself.
     pub workflow_dir: PathBuf,
     /// Present when `swebot.chat.enabled` -- chat mode's store+worker. The
     /// multi-project service nests the web chat UI under `/projects/<id>/chat` only
@@ -419,9 +419,8 @@ async fn run_inner(
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         let status_rx_for_serve = status_rx.clone();
         let workflow_dir_for_serve = workflow_dir.clone();
-        // Composite dashboard: the status router at the root (which itself mounts the
-        // board under /board), chat's UI nested under /chat -- only when the web
-        // connector is enabled.
+        // Composite dashboard: the status router at the root, chat's UI nested under
+        // /chat -- only when the web connector is enabled.
         let chat_router = chat
             .as_ref()
             .filter(|handles| handles.web_enabled)
@@ -493,8 +492,9 @@ fn build_status_snapshot(state: &OrchestratorState) -> status::StatusSnapshot {
     let now = Instant::now();
     let running = state
         .running
-        .values()
-        .map(|e| status::RunningRow {
+        .iter()
+        .map(|(issue_id, e)| status::RunningRow {
+            issue_id: issue_id.clone(),
             identifier: e.issue.identifier.clone(),
             title: e.issue.title.clone(),
             session_id: e.session_id.clone(),

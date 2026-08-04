@@ -1,10 +1,9 @@
 //! Q&A capability: answers questions asked in the repo's `Q&A`-category GitHub
-//! Discussions (`swebot.qa.discussion_category`, default `"Q&A"`), an issue label on
-//! GitLab (`swebot.qa.label`, default `"swebot::question"`), or a board on
-//! `crate::board`'s local bulletin board when `swebot.board.enabled` -- see
+//! Discussions (`swebot.qa.discussion_category`, default `"Q&A"`) or an issue label
+//! on GitLab (`swebot.qa.label`, default `"swebot::question"`) -- see
 //! `config::SwebotConfig`'s doc comment for why the conversational surface varies.
-//! `selector` below is whichever of those `swebot::mod::run` resolved for the
-//! current `host`; this module itself stays agnostic to which one it got.
+//! `selector` below is whichever of those `swebot::run` resolved for the current
+//! `host`; this module itself stays agnostic to which one it got.
 //!
 //! No local persistence: "which comments has SweBot already answered" is derived
 //! entirely from `<!-- swebot:answered:<comment-id> -->` markers embedded in SweBot's
