@@ -19,14 +19,16 @@
 //! Delivery is eventual, keyed off the store: as soon as a reply is `sent`, the next
 //! `deliver` poll posts it (with the marker of the human comment it answers, so the
 //! thread advances correctly). An in-flight turn's "still working" system notice is
-//! also delivered, as a plain marker-less comment, so the must-notify rule holds on
-//! GitHub too (marker-less so it never advances the marker before the real reply).
+//! also delivered, carrying `NOTICE_MARKER` instead of an `answered_marker` -- distinct
+//! from a real reply's marker so it never advances the thread's answered-marker before
+//! the real reply lands, but still recognizable as SweBot's own post so the next
+//! `ingest` poll doesn't mistake it for a fresh human comment and answer it.
 
 use super::connector::ChatConnector;
 use super::store::{ChatStore, STATUS_NOTICE_DONE};
 use crate::repo_host::DiscussionHost;
 use crate::repo_host::github::GithubRepoHost;
-use crate::swebot::{answered_marker, is_swebot_reply, last_answered_marker};
+use crate::swebot::{NOTICE_MARKER, answered_marker, is_swebot_reply, last_answered_marker};
 
 /// Connector name + conversations server-wide key for discussions.
 pub const CONNECTOR_NAME: &str = "github";
@@ -109,9 +111,17 @@ async fn deliver_notices(connector: &GitHubChatConnector, store: &ChatStore) -> 
         let Some(thread_id) = conv.remote_id else {
             continue;
         };
+        // NOTICE_MARKER (not `answered_marker`) so this never advances the thread's
+        // answered-marker before the real reply lands, but still marks the comment as
+        // SweBot's own -- otherwise the very next `ingest_category` poll finds this
+        // "still working" text with no author identity to check and no marker to
+        // recognize, treats it as a fresh human comment, and answers it: an
+        // infinite loop of SweBot replying to its own notices (see NOTICE_MARKER's
+        // doc comment -- this is exactly the bug it was added to fix).
+        let comment = format!("{NOTICE_MARKER}\n{}", notice.body);
         let comment_id = connector
             .host
-            .post_discussion_comment(&thread_id, &notice.body)
+            .post_discussion_comment(&thread_id, &comment)
             .await?;
         store.mark_delivered(notice.id, &comment_id)?;
         // It's on GitHub now; drop the local "active" flag so nothing else tries to
@@ -385,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_posts_system_notices_as_markerless_comments() {
+    async fn deliver_posts_system_notices_with_the_notice_marker_not_an_answered_marker() {
         let server = MockServer::start().await;
         mock_post_comment(&server, "C_77").await;
 
@@ -400,8 +410,7 @@ mod tests {
 
         let notice = store.message(notice_id).unwrap().unwrap();
         assert_eq!(notice.remote_message_id.as_deref(), Some("C_77"));
-        // Notices must not advance the answered marker: the posted body contains no
-        // `swebot:answered:` marker.
+        // Notices must not advance the answered marker...
         let jobs = server.received_requests().await.unwrap();
         let body = jobs
             .iter()
@@ -413,5 +422,45 @@ mod tests {
             .unwrap();
         assert!(body.contains("still working"));
         assert!(!body.contains("swebot:answered:"));
+        // ...but must carry NOTICE_MARKER, so ingest recognizes it as SweBot's own post
+        // rather than a fresh human comment (see the regression test below).
+        assert!(body.contains(NOTICE_MARKER));
+    }
+
+    /// Regression test for a real bug found running this live: a delivered "still
+    /// working" notice carried no marker at all, so the very next `ingest` poll found
+    /// it in `thread.comments` with nothing to distinguish it from a human comment,
+    /// enqueued it as a fresh question, and answered it -- an infinite loop of SweBot
+    /// replying to its own notices, visible as alternating "Still working..." /
+    /// substantive-reply comments forever in a real GitHub Discussion.
+    #[tokio::test]
+    async fn ingest_never_re_enqueues_a_delivered_notice_as_a_question() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("discussions"))
+            .respond_with(response_thread(
+                "how does auth work?",
+                json!([
+                    comment(
+                        10,
+                        &format!("{NOTICE_MARKER}\nStill working on that — checking the code."),
+                        "swebot"
+                    ),
+                    comment(11, &format!("{}\nAuth uses OAuth.", answered_marker(0)), "swebot"),
+                ]),
+            ))
+            .mount(&server)
+            .await;
+
+        let connector = test_connector(&server);
+        let (store, _d) = store();
+        connector.ingest(&store).await.unwrap();
+
+        // Nothing left to answer: the opening body was answered (marker 0), and the
+        // notice at comment 10 must never have been enqueued as a question.
+        let conv = store.list_conversations().unwrap()[0].id;
+        let msgs = store.messages_of_conversation(conv, 0).unwrap();
+        assert!(msgs.is_empty(), "expected no enqueued messages, got {msgs:?}");
     }
 }
