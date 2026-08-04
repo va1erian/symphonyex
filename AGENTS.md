@@ -60,11 +60,15 @@ normative schema, they're all spec extensions.
 starting when `--port` is passed:
 
 - **`/`** — currently-running agents as cards (identifier, session id, elapsed time,
-  turn count, last event) and the retry queue. Live-updates every 2s via a small
-  inline `fetch()` + `innerHTML` swap against `/fragment` — not a `<meta>` full-page
-  refresh (the original mechanism, and genuinely janky: every tick was a real browser
-  navigation, resetting scroll position and any open selection). The new mechanism has
-  none of that; nothing outside the two data containers ever reloads.
+  turn count, last event) and the retry queue. Live-updates in place via a small
+  inline `EventSource` subscribed to `/fragment-stream` (Server-Sent Events, pushed
+  directly off the same `watch::Receiver` the dashboard reads, so an update lands as
+  soon as something changes rather than on a fixed poll interval) — not a `<meta>`
+  full-page refresh (the original mechanism, and genuinely janky: every tick was a
+  real browser navigation, resetting scroll position and any open selection). The new
+  mechanism has none of that; nothing outside the one data container ever reloads.
+  `/fragment` (a single non-streaming render of the same fragment) stays mounted
+  alongside it for a one-shot fetch instead of a stream.
 - **`/events`** — filterable, paginated browse of every dispatch/turn/tool-call/exit
   event ever recorded, backed by a persistent SQLite log (`<workflow_dir>/symphony.db`,
   `src/eventlog.rs`) that survives a restart — unlike `/`, which is live state and
