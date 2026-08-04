@@ -206,6 +206,13 @@ pub fn escape(s: &str) -> String {
 /// are plain ASCII (issue numbers, snake_case event names, board titles), so covering
 /// the handful of characters actually meaningful in a query string (space, &, =, #, %,
 /// +) is enough -- not a general-purpose encoder.
+///
+/// Also encodes `"`, `'`, `<`, `>` even though they're not URL-reserved: every call
+/// site embeds the result straight into an `href="{}"` attribute built from
+/// user-supplied query parameters (`status.rs`'s `/events` filters -- issue/type come
+/// straight from the request's own query string), so a literal `"` or `>` here would
+/// close the attribute/tag early and let the rest of the value execute as markup --
+/// e.g. `?issue=42"><script>alert(1)</script>` reflected straight back into the page.
 pub fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -215,6 +222,10 @@ pub fn urlencode(s: &str) -> String {
             '#' => "%23".to_string(),
             '%' => "%25".to_string(),
             '+' => "%2B".to_string(),
+            '"' => "%22".to_string(),
+            '\'' => "%27".to_string(),
+            '<' => "%3C".to_string(),
+            '>' => "%3E".to_string(),
             c => c.to_string(),
         })
         .collect()
@@ -248,6 +259,14 @@ pub fn nav(links: &[NavLink], active: &str, base: &str) -> String {
 /// is pre-rendered (via `nav()`, or `""` for pages that don't want one) rather than
 /// built here, since board.rs's tabs and status.rs's top nav differ enough in shape
 /// that forcing one nav-building function to cover both isn't worth it.
+///
+/// `app_title`/`page_title` are escaped here, unconditionally -- `board.rs` passes a
+/// board thread's own (anonymously user-submitted, persisted) title straight through
+/// as `page_title`, and `<title>` content is parsed as RCDATA: an unescaped `</title>`
+/// in that title would close the element early and let whatever follows (e.g.
+/// `<script>...`) execute as real markup, a stored XSS from an unauthenticated post.
+/// `body` is deliberately NOT escaped here -- every caller already builds it out of a
+/// mix of literal markup and its own already-escaped dynamic pieces.
 pub fn page_shell(
     app_title: &str,
     page_title: &str,
@@ -255,6 +274,8 @@ pub fn page_shell(
     body: &str,
     extra_head: &str,
 ) -> String {
+    let app_title = escape(app_title);
+    let page_title = escape(page_title);
     format!(
         r#"<!doctype html>
 <html>
@@ -301,6 +322,17 @@ mod tests {
         assert_eq!(urlencode("plain"), "plain");
     }
 
+    /// Regression test: every caller embeds `urlencode`'s output straight into an
+    /// `href="{}"` attribute built from user-supplied input (`status.rs`'s `/events`
+    /// filters). A raw `"` or `>` here would break out of the attribute/tag.
+    #[test]
+    fn urlencode_neutralizes_html_attribute_breakout_characters() {
+        let encoded = urlencode(r#"42"><script>alert(1)</script>"#);
+        assert!(!encoded.contains('"'));
+        assert!(!encoded.contains('<'));
+        assert!(!encoded.contains('>'));
+    }
+
     #[test]
     fn nav_marks_active_link() {
         let links = [
@@ -324,5 +356,21 @@ mod tests {
         assert!(html.contains("Symphony &mdash; events"));
         assert!(html.contains("<nav>NAV</nav>"));
         assert!(html.contains("<p>BODY</p>"));
+    }
+
+    /// Regression test: `board.rs` passes an anonymously user-submitted, persisted
+    /// thread title straight through as `page_title` -- an unescaped `</title>` would
+    /// close the element early and let whatever follows execute as real markup.
+    #[test]
+    fn page_shell_escapes_page_title_against_title_tag_breakout() {
+        let html = page_shell(
+            "Symphony Board",
+            "</title><script>alert(1)</script>",
+            "",
+            "",
+            "",
+        );
+        assert!(!html.contains("</title><script>"));
+        assert!(html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }
