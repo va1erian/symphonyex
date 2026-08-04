@@ -418,9 +418,19 @@ async function poll() {
   const out = document.getElementById("messages");
   const typing = document.getElementById("typing");
 
-  for (const m of (data.recent || [])) { updateNode(m); }
-
   const readIds = [];
+  // A message already appended while still `streaming` (the common case for any
+  // turn slower than one poll tick) has scrolled past the `since` cursor by the
+  // time it actually finishes -- it only ever shows up in `recent` again, not
+  // `messages`, so read-marking has to happen here too, not just in the append
+  // loop below, or a finished reply never gets marked read at all.
+  for (const m of (data.recent || [])) {
+    updateNode(m);
+    if (m.role === "assistant" && m.status === "sent") {
+      readIds.push(m.id);
+    }
+  }
+
   for (const m of (data.messages || [])) {
     if (m.id > lastId) {
       lastId = m.id;
@@ -428,7 +438,12 @@ async function poll() {
       // client poll) -- never render it at all, same end state as removing it.
       if (isDoneNotice(m)) continue;
       out.insertAdjacentHTML("beforeend", render(m));
-      if (m.role === "assistant" && (m.status === "sent" || m.status === "streaming")) {
+      // Only a *finished* reply is meaningfully "read" -- marking a still-streaming
+      // (in-progress, possibly still-empty) message as read flips its status away
+      // from "streaming" before any text has arrived, which breaks the "…" typing
+      // placeholder render() shows only while status stays "streaming": the bubble
+      // then renders as genuinely empty instead of showing that it's still working.
+      if (m.role === "assistant" && m.status === "sent") {
         readIds.push(m.id);
       }
     }
