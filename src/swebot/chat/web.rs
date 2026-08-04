@@ -231,80 +231,80 @@ const PAGE_TEMPLATE: &str = r#"<!doctype html>
 let NAVBASE = "{navbase}";
 let lastId = 0;
 
-function esc(s) {{
+function esc(s) {
   return (s == null ? "" : String(s))
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
-}}
+}
 
-function statusLine(m) {{
-  if (m.role === "user") {{
+function statusLine(m) {
+  if (m.role === "user") {
     if (m.status === "pending") return "sending&hellip;";
     if (m.status === "processing") return "processing&hellip;";
     if (m.status === "processed") return "&check;";
     if (m.status === "failed") return "failed";
     return "";
-  }}
-  if (m.role === "assistant") {{
+  }
+  if (m.role === "assistant") {
     if (m.status === "streaming") return "&hellip;";
     if (m.status === "read") return '<span class="read">read &check;&check;</span>';
     return "";
-  }}
+  }
   return "";
-}}
+}
 
-function render(m) {{
+function render(m) {
   const body = esc(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
   return '<div class="msg ' + m.role + '" id="msg-' + m.id + '">' +
     '<div class="bubble">' + body + '</div>' +
     '<div class="status">' + statusLine(m) + '</div>' +
     '</div>';
-}}
+}
 
-function updateNode(m) {{
+function updateNode(m) {
   const node = document.getElementById("msg-" + m.id);
   if (node) node.outerHTML = render(m);
-}}
+}
 
-async function poll() {{
+async function poll() {
   let res;
-  try {{
+  try {
     res = await fetch(BASE + "/messages?since=" + lastId + "&recent=6");
-  }} catch (e) {{
+  } catch (e) {
     return;
-  }}
+  }
   const data = await res.json();
   const out = document.getElementById("messages");
   const typing = document.getElementById("typing");
 
-  for (const m of (data.recent || [])) {{ updateNode(m); }}
+  for (const m of (data.recent || [])) { updateNode(m); }
 
   const readIds = [];
-  for (const m of (data.messages || [])) {{
-    if (m.id > lastId) {{
+  for (const m of (data.messages || [])) {
+    if (m.id > lastId) {
       out.insertAdjacentHTML("beforeend", render(m));
       lastId = m.id;
-      if (m.role === "assistant" && (m.status === "sent" || m.status === "streaming")) {{
+      if (m.role === "assistant" && (m.status === "sent" || m.status === "streaming")) {
         readIds.push(m.id);
-      }}
-    }}
-  }}
-  if (data.messages && data.messages.length) {{
+      }
+    }
+  }
+  if (data.messages && data.messages.length) {
     const last = out.lastElementChild;
-    if (last) last.scrollIntoView({{behavior: "smooth", block: "nearest"}});
-  }}
+    if (last) last.scrollIntoView({behavior: "smooth", block: "nearest"});
+  }
   typing.style.display = data.active ? "block" : "none";
   typing.innerHTML = data.active ? "SweBot is working&hellip;" : "";
-  if (readIds.length) {{
-    fetch(BASE + "/read", {{
+  if (readIds.length) {
+    fetch(BASE + "/read", {
       method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{ids: readIds}})
-    }});
-  }}
-}}
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ids: readIds})
+    });
+  }
+}
 
-async function sendMessage(ev) {{
+async function sendMessage(ev) {
   ev.preventDefault();
   const input = document.getElementById("text");
   const text = input.value.trim();
@@ -312,32 +312,32 @@ async function sendMessage(ev) {{
   input.disabled = true;
   const btn = document.getElementById("sendBtn");
   btn.disabled = true;
-  try {{
-    const res = await fetch(BASE + "/send", {{
+  try {
+    const res = await fetch(BASE + "/send", {
       method: "POST",
-      headers: {{"Content-Type": "application/json"}},
-      body: JSON.stringify({{text: text}})
-    }});
-    if (res.ok) {{
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({text: text})
+    });
+    if (res.ok) {
       input.value = "";
       lastId = 0;
       const out = document.getElementById("messages");
       out.innerHTML = "";
       await poll();
-    }}
-  }} finally {{
+    }
+  } finally {
     input.disabled = false;
     btn.disabled = false;
     input.focus();
-  }}
-}}
+  }
+}
 
-window.addEventListener("DOMContentLoaded", () => {{
+window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("chat-form").addEventListener("submit", sendMessage);
   poll();
   setInterval(poll, 1500);
   document.getElementById("text").focus();
-}});
+});
 </script>
 </head>
 <body>
@@ -404,6 +404,11 @@ mod tests {
         assert!(html.contains("SweBot chat"));
         assert!(html.contains(r#"const BASE = "/chat";"#));
         assert!(html.contains("unified Q&amp;A"));
+        // PAGE_TEMPLATE is only ever run through plain `.replace()`, never `format!` --
+        // a stray `{{`/`}}` written as if this were format!-escaped (as it once was)
+        // ends up literally in the served <script>, which is invalid JS syntax.
+        assert!(!html.contains("{{"));
+        assert!(!html.contains("}}"));
     }
 
     #[tokio::test]
