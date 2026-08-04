@@ -3,6 +3,14 @@ name = "symphony"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Compile the MS Teams chat-connector skeleton (src/swebot/chat/teams.rs) -- a
+# compile-checked template for the ChatConnector trait, not a working connector yet.
+# Opting a connector in is: implement the real HTTP/Graph plumbing in that module,
+# add "teams" to config::KNOWN_CHAT_CONNECTORS, and construct it in chat::start.
+teams = []
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.91"

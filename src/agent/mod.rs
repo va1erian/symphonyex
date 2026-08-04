@@ -115,4 +115,14 @@ pub trait AgentBackend: Send + Sync {
         title: &str,
         container: Option<&ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError>;
+
+    /// Downcast hook, mainly so tests can inspect which concrete backend a factory
+    /// selected (e.g. `swebot::build_restricted_backend`'s dispatch). Defaults to
+    /// not-downcastable; concrete backends that warrant inspection override it.
+    /// `allow(dead_code)` because in non-test builds it's only ever called through
+    /// trait-object dispatch from `#[cfg(test)]` code.
+    #[allow(dead_code)]
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }

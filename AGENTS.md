@@ -362,6 +362,11 @@ like everything else here:
    open by hand) and posts an approve/request-changes/comment verdict. **Never
    merges** — a human always does that.
 
+Q&A and ticket drafting run through **chat mode's** GitHub connector
+(`src/swebot/chat/github.rs`) — the same store/worker pipeline that backs the chat UI
+(see "SweBot chat mode"); PR review is polled directly by `swebot::run`. Both read
+the same `repo:` block and share the one restricted backend.
+
 ```yaml
 swebot:
   enabled: true
@@ -422,22 +427,109 @@ thread+comment shape SweBot's marker-scanning logic consumes barely changes betw
 the two hosts (see `src/repo_host/gitlab.rs`'s own module doc comment for the
 provider-specific wire-format details, all handled entirely inside that module).
 
-**No local persistence**: which comments SweBot has already answered, and which
-PR/MR commits it has already reviewed, are both derived from hidden HTML-comment
-markers embedded in SweBot's own past replies/reviews (`<!-- swebot:answered:<id>
--->`, `<!-- swebot:reviewed:<sha> -->`), scanned out of the host's own stored data on
-every poll. Nothing to lose on a restart, and no separate database. Ticket drafting
-doesn't use `claude`'s own `--resume` across poll cycles either (a human's next reply
-may come hours later, well past a restart) — each poll reconstructs the full
-transcript from the thread's own comment history and sends it fresh, which the model
-already needs context for anyway.
+**No local persistence (until chat)**: which PR/MR commits SweBot has already reviewed
+is derived from a hidden HTML-comment marker (`<!-- swebot:reviewed:<sha> -->`) embedded
+in SweBot's own review text, scanned out of the host's own stored data on every poll;
+review never needs a database. The chat side (`swebot.chat.enabled`) does land in
+`symphony-chat.db` (which also keeps mid-flight turn state and read receipts), but its
+*dedupe* is still host-native: the `<!-- swebot:answered:<id> -->` markers in posted
+replies are what tell a poll (and a fresh chat ingest) that a message was already
+answered, so even a reset chat store picks back up exactly where the markers say.
+Ticket drafting doesn't use `--resume` across poll cycles either (a human's next reply
+may come hours later, well past a restart) -- each turn reconstructs the transcript
+from the thread's own comment history and sends it fresh, which the model already
+needs context for anyway.
 
 **Isolation from the coding agent's own trust boundary**: SweBot's sessions run with
-`Edit`/`Write`/`NotebookEdit` explicitly disallowed (`--disallowedTools`, on top of
-the same `bypassPermissions` mode ticket dispatch uses so Bash/read tools still work
-freely for exploring code and running tests during review). It answers, drafts, and
-reviews — it never edits the repo directly. That stays the coding agent's job, gated
-by the normal ticket-dispatch flow this whole document is otherwise about.
+file-mutating tools explicitly disallowed, on top of the same high-trust mode ticket
+dispatch uses (auto-approve Bash/read tools so SweBot can still explore the code and
+run tests during review). The restriction is backend-specific rather than a hardcoded
+CLI flag: for `claude` it's `--disallowedTools Edit,Write,NotebookEdit`; for `opencode`
+it's a `permission` config of `{"edit":"deny"}` (the umbrella rule covering
+`edit`/`write`/`patch`) passed as `OPENCODE_PERMISSION`, which enforces the deny even
+under `--auto`. The backend SweBot runs on is `swebot.backend` when set, else
+`agent.backend` (see "Coding-agent backends") — so SweBot can answer/draft/review on
+`opencode` (e.g. Fireworks) while tickets stay on `claude`. `codex` is not supported
+for SweBot yet; it refuses to start rather than silently running an unrestricted
+skeleton. SweBot answers, drafts, and reviews — it never edits the repo directly. That
+stays the coding agent's job, gated by the normal ticket-dispatch flow this whole
+document is otherwise about.
+
+## SweBot chat mode
+
+A unified, collaborative Q&A + ticket-drafting conversation surface. Active under
+`swebot.chat.enabled`; when it's on for a GitHub repo, chat's GitHub connector owns that
+repo's Discussions (`src/swebot/chat/github.rs`) and the standalone Q&A/drafting loop
+skips GitHub -- GitLab and the bulletin-board surface keep the standalone loop, and when
+chat is off the standalone loop handles GitHub too, exactly as before; the bundled
+browser chat UI is served alongside. Same
+restricted backend as Q&A/drafting/review, same `swebot.backend`-or-`agent.backend`
+rule, but turned toward interactivity:
+
+```yaml
+swebot:
+  enabled: true
+  backend: opencode
+  chat:
+    enabled: true
+    connectors: [web]          # interactive connectors: 'web' is the chat UI
+    poll_interval_ms: 5000     # how often the worker looks for new messages
+    max_concurrent_replies: 2  # answers per processing cycle (1-2 is plenty)
+    auto_create_issue: true    # file a finished draft immediately (default)
+    first_text_deadline_ms: 5000
+```
+
+**How it's structured** (`src/swebot/chat/`): a SQLite store (`symphony-chat.db` next to
+`symphony.db`, `store.rs`) holds conversations and messages; a connector-agnostic
+worker (`worker.rs`) claims `pending` user messages and answers them; connectors
+(`connector.rs`) bridge the store to each platform:
+
+- `github.rs` — when chat is on for a GitHub repo, the Discussions Q&A/drafting surface
+  (and the standalone loop skips GitHub). It ingests each human comment as a `pending`
+  user message and `deliver`s sent replies back as discussion comments carrying the
+  `swebot:answered` marker; a slow turn's "still working" notice is delivered as a
+  marker-less comment so the thread isn't marked answered by a placeholder.
+- `web.rs` (when `swebot.chat.enabled`) — the bundled browser chat UI (server-rendered
+  page + tiny JSON API: `/send`, `/messages`, `/read`), mounted at `/chat` under the
+  status dashboard, and per-project at `/projects/<id>/chat` under `symphony serve`.
+- `teams.rs` (`--features teams`) — a compile-checked MS Teams skeleton that shows
+  exactly what a new connector implements; see "Adding a chat connector" below.
+
+The chat pipeline runs once per project under `swebot.chat.enabled`; its `web`
+connector's UI is always part of that. The `github` connector is a GitHub-only
+surface -- GitLab and the bulletin-board Q&A/drafting stay on the standalone loop.
+
+**Adding a chat connector** (e.g. MS Teams): implement the two-method `ChatConnector`
+trait (`ingest` pulls platform messages in, `deliver` pushes replies out) — the store
+already gives you idempotent ingestion (`upsert_remote_user_message` keyed by
+`remote_message_id`), eventual delivery (`undelivered_*` + `mark_delivered`), and
+read-receipt state (`read`/`read_at`). Construct your connector in `chat::start`
+alongside the existing ones. That's the whole API; `teams.rs` compiles as the template.
+
+**Latency: streaming + the must-notify rule.** Chat answers stream: text chunks are
+flushed into the store as the turn produces them, so the UI shows the reply appearing
+in place (and the `read`/`processing` indicators move with it) rather than a blank
+window. If the first text hasn't arrived within `first_text_deadline_ms` the worker
+inserts a system notice ("still working — checking the code") *before* the slow turn
+finishes, instead of leaving the user staring at a spinner; the notice resolves once
+the reply lands. The prompt also asks the model to front-load a one-line commitment
+whenever a turn needs real research, but the deadline is the structural backstop, not
+a model-behavior hope.
+
+**Status vocabulary** (rendered by the web UI): user messages `pending → processing →
+processed | failed`; assistant messages `streaming → sent → read` (the `read` tick is
+a genuine read receipt — the browser POSTs `/read` once it has actually displayed
+them); system rows `notice-active → notice-done`. Everything survives restarts in the
+same SQLite file; a message a crashed run left mid-claim is requeued at startup.
+
+**Collaborative drafting**: when the model finishes a scoped draft, `auto_create_issue:
+true` creates it via the tracker immediately (the reply carries the issue link) — or,
+with `auto_create_issue: false`, SweBot stashes the draft and asks the user to reply
+"create it" to file it, so nothing lands in the tracker without a human's explicit go.
+Clarifying questions come back as ordinary messages; the conversation keeps going
+until either the ticket exists or the user drops it. Chat requires `swebot.enabled`
+(validation rejects `chat.enabled` otherwise) and shares SweBot's `repo:`/token
+requirements.
 
 **Alternative: a local bulletin board instead of GitLab's label-filtered Issues**
 (`src/board.rs`). Some projects would rather not mix SweBot's Q&A/Ideas traffic into

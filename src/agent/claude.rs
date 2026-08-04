@@ -96,6 +96,10 @@ impl AgentBackend for ClaudeBackend {
             session_id: None,
         }))
     }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// Write `<workspace>/.symphony-mcp.json` pointing back at `symphony __mcp_tool_server`

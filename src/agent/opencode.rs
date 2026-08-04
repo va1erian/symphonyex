@@ -73,6 +73,15 @@ pub struct OpenCodeBackend {
     pub extra_args: Vec<String>,
     pub auto_approve: bool,
     pub turn_timeout_ms: u64,
+    /// When set, restrict this backend's turns by passing an opencode `permission`
+    /// config JSON (see `opencode`'s own Permissions docs) as the
+    /// `OPENCODE_PERMISSION` env var on every spawned subprocess. `"deny"` rules are
+    /// enforced even under `--auto` (which only auto-approves what is *not* already
+    /// denied), so this is the mechanism for a read-only restricted session: e.g.
+    /// `{"edit":"deny"}` blocks edit/write/patch while leaving bash/read free.
+    /// `None` (the default) leaves permissions untouched -- SweBot's restricted
+    /// sessions set it, ticket dispatch does not.
+    pub permission_config: Option<String>,
     /// Needed to map a host workspace path to its in-container equivalent in Docker
     /// mode (see README.md "Docker mode"), same reason `ClaudeBackend` keeps this.
     pub workflow_dir: PathBuf,
@@ -102,11 +111,16 @@ impl AgentBackend for OpenCodeBackend {
             extra_args: self.extra_args.clone(),
             auto_approve: self.auto_approve,
             turn_timeout_ms: self.turn_timeout_ms,
+            permission_config: self.permission_config.clone(),
             workspace: workspace.to_path_buf(),
             container: container.cloned(),
             container_workspace_path,
             session_id: None,
         }))
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -116,6 +130,7 @@ struct OpenCodeSession {
     extra_args: Vec<String>,
     auto_approve: bool,
     turn_timeout_ms: u64,
+    permission_config: Option<String>,
     workspace: PathBuf,
     container: Option<ContainerHandle>,
     container_workspace_path: Option<PathBuf>,
@@ -133,27 +148,7 @@ impl AgentSession for OpenCodeSession {
         prompt: &str,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AgentError> {
-        let mut args: Vec<String> = vec![
-            "run".to_string(),
-            "--format".to_string(),
-            "json".to_string(),
-        ];
-        if let Some(model) = &self.model {
-            args.push("--model".to_string());
-            args.push(model.clone());
-        }
-        if self.auto_approve {
-            args.push("--auto".to_string());
-        }
-        if let Some(sid) = &self.session_id {
-            args.push("--session".to_string());
-            args.push(sid.clone());
-        }
-        args.extend(self.extra_args.clone());
-        // Prompt goes last, as its own argv element (not through a shell), matching
-        // `claude.rs`'s `-p <prompt>` handling -- no injection surface from prompt
-        // content containing shell metacharacters.
-        args.push(prompt.to_string());
+        let args = self.run_args(prompt);
 
         // Same container-vs-host branch as `claude.rs::ClaudeSession::run_turn`: in
         // Docker mode, `docker exec` into the per-ticket container instead of
@@ -168,6 +163,12 @@ impl AgentSession for OpenCodeSession {
                     .arg(&container.name)
                     .arg(&self.command)
                     .args(&args);
+                // A container doesn't inherit the `docker` client's process env the
+                // way a plain child does, so a restricted session's permission JSON
+                // has to be forwarded explicitly via `-e`.
+                if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
+                    c.arg("-e").arg(format!("{k}={v}"));
+                }
                 kill_guard = Some(ContainerKillGuard::armed(
                     container.name.clone(),
                     self.command.clone(),
@@ -177,6 +178,9 @@ impl AgentSession for OpenCodeSession {
             _ => {
                 let mut c = Command::new(&self.command);
                 c.args(&args).current_dir(&self.workspace);
+                if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
+                    c.env(k, v);
+                }
                 c
             }
         };
@@ -275,6 +279,34 @@ impl AgentSession for OpenCodeSession {
 }
 
 impl OpenCodeSession {
+    /// The argv (everything after the program, and after any `docker exec -w` prefix)
+    /// for one `opencode run --format json` turn. Extracted from `run_turn` so tests
+    /// can assert flag ordering/env composition without spawning a process.
+    fn run_args(&self, prompt: &str) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "run".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(model) = &self.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        if self.auto_approve {
+            args.push("--auto".to_string());
+        }
+        if let Some(sid) = &self.session_id {
+            args.push("--session".to_string());
+            args.push(sid.clone());
+        }
+        args.extend(self.extra_args.clone());
+        // Prompt goes last, as its own argv element (not through a shell), matching
+        // `claude.rs`'s `-p <prompt>` handling -- no injection surface from prompt
+        // content containing shell metacharacters.
+        args.push(prompt.to_string());
+        args
+    }
+
     /// Handle one parsed NDJSON line. Returns `Some(outcome)` only for a
     /// terminal (completed/failed) event. See the module doc's verification caveat:
     /// the field names matched here are a best-effort guess, not a confirmed schema.
@@ -402,6 +434,14 @@ fn shallow_find_str(v: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+/// The `OPENCODE_PERMISSION` env `(key, value)` pair for a permission config, if set
+/// -- how a restricted session's deny rules reach the spawned `opencode` subprocess
+/// (see `OpenCodeBackend::permission_config`). Kept as its own function so the Docker
+/// branch above can emit `-e KEY=VALUE` and the host branch can `.env(key, value)`.
+fn permission_env(config: Option<&str>) -> Option<(String, String)> {
+    config.map(|c| ("OPENCODE_PERMISSION".to_string(), c.to_string()))
+}
+
 /// Extract token usage leniently, searching arbitrarily deep (unlike
 /// `shallow_find_str`) since usage blocks are commonly nested a variable number of
 /// levels deep in practice -- same approach and same reasoning as
@@ -519,11 +559,61 @@ mod tests {
             extra_args: Vec::new(),
             auto_approve: true,
             turn_timeout_ms: 1_000,
+            permission_config: None,
             workspace: PathBuf::from("."),
             container: None,
             container_workspace_path: None,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn run_args_orders_flags_before_the_prompt() {
+        let mut session = new_session();
+        session.model = Some("fireworks/x".to_string());
+        session.auto_approve = true;
+        session.session_id = Some("ses_1".to_string());
+        session.extra_args = vec!["--verbose".to_string()];
+        let args = session.run_args("do the thing");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--model",
+                "fireworks/x",
+                "--auto",
+                "--session",
+                "ses_1",
+                "--verbose",
+                "do the thing",
+            ]
+        );
+    }
+
+    #[test]
+    fn run_args_without_optional_flags() {
+        let mut session = new_session();
+        session.auto_approve = false;
+        let args = session.run_args("just the prompt");
+        assert_eq!(args, vec!["run", "--format", "json", "just the prompt"]);
+    }
+
+    #[test]
+    fn permission_env_carries_the_config_as_open_code_permission_variable() {
+        assert_eq!(
+            permission_env(Some(r#"{"edit":"deny"}"#)).unwrap(),
+            (
+                "OPENCODE_PERMISSION".to_string(),
+                r#"{"edit":"deny"}"#.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn permission_env_is_none_without_a_config() {
+        assert_eq!(permission_env(None), None);
     }
 
     #[test]
