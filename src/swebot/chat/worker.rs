@@ -492,7 +492,17 @@ async fn run_turn_streaming(
         // by the first tool_call event or by the deadline firing, whichever is
         // first -- most real turns do *something* well before the deadline.
         let mut notice_id: Option<i64> = None;
-        let mut last_message: Option<String> = None;
+        // Accumulated, not just the latest chunk: a real opencode turn was observed
+        // splitting one logical answer across several `notification` events (one text
+        // fragment per internal agentic-loop step, not a full restatement each time --
+        // see `agent::opencode`'s module doc on `step_finish` firing per step). Keeping
+        // only the last chunk silently truncated the persisted reply down to whatever
+        // the final step happened to say, discarding everything earlier steps
+        // contributed. Concatenating is safe for Claude too, whose steps do tend to
+        // each restate a self-contained message -- worst case that just surfaces a
+        // little intermediate commentary alongside the final answer instead of only
+        // the final answer, never less text than before.
+        let mut reply = String::new();
         let mut last_flush = tokio::time::Instant::now() - Duration::from_secs(1);
         let mut last_notice_flush = tokio::time::Instant::now() - Duration::from_secs(1);
         loop {
@@ -527,11 +537,14 @@ async fn run_turn_streaming(
                         if let Some(text) = event.message
                             && !text.trim().is_empty()
                         {
-                            last_message = Some(text.clone());
+                            if !reply.is_empty() {
+                                reply.push_str("\n\n");
+                            }
+                            reply.push_str(text.trim());
                             let now = tokio::time::Instant::now();
                             if now.duration_since(last_flush) >= Duration::from_millis(150) {
                                 last_flush = now;
-                                let _ = store2.set_message_body(assistant_id, &text);
+                                let _ = store2.set_message_body(assistant_id, &reply);
                             }
                         }
                     }
@@ -561,12 +574,12 @@ async fn run_turn_streaming(
                 None => break,
             }
         }
-        if let Some(m) = &last_message {
-            let _ = store2.set_message_body(assistant_id, m);
+        if !reply.is_empty() {
+            let _ = store2.set_message_body(assistant_id, &reply);
         }
         let _ = store2.resolve_system_notices(conversation_id);
         let _ = store2.set_message_status(assistant_id, STATUS_SENT);
-        last_message
+        if reply.is_empty() { None } else { Some(reply) }
     });
 
     // Await the collector *before* inspecting the outcome: `run_turn` returning
@@ -955,6 +968,77 @@ mod tests {
         }
 
         async fn stop(self: Box<Self>) {}
+    }
+
+    /// A session that reports two separate `notification` events before completing,
+    /// with a real delay between them so the collector's per-event handling actually
+    /// runs on each one.
+    struct MultiChunkSession {
+        chunks: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl AgentSession for MultiChunkSession {
+        fn session_id(&self) -> &str {
+            "multi-chunk"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, AgentError> {
+            for chunk in &self.chunks {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ =
+                    events.send(AgentEvent::new("notification").with_message(chunk.to_string()));
+            }
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    /// Regression test for a real bug found running this live: `opencode` (unlike
+    /// Claude) was observed splitting one logical reply across several separate
+    /// `notification` events -- one text fragment per internal agentic-loop step, not
+    /// a full restatement each time (see `agent::opencode`'s module doc on
+    /// `step_finish` firing per step). Persisting only the *latest* chunk silently
+    /// truncated the saved reply down to whatever the final step happened to say,
+    /// discarding every earlier fragment -- exactly the "got a truncated message in
+    /// the chat" bug reported live. Chunks must be concatenated instead.
+    #[tokio::test]
+    async fn multiple_notification_chunks_are_concatenated_not_overwritten() {
+        let cfg = test_cfg("    first_text_deadline_ms: 100000\n");
+        let (store, _tmp) = seeded("deep question");
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        struct MultiChunkBackend;
+        #[async_trait]
+        impl AgentBackend for MultiChunkBackend {
+            async fn start_session(
+                &self,
+                _workspace: &Path,
+                _issue_id: &str,
+                _title: &str,
+                _container: Option<&ContainerHandle>,
+            ) -> Result<Box<dyn AgentSession>, AgentError> {
+                Ok(Box::new(MultiChunkSession {
+                    chunks: vec!["First, the circuit breaker.", "Then the concurrency cap."],
+                }))
+            }
+        }
+        let msg = one_pending(&store);
+        respond_to(&cfg, &MultiChunkBackend, tracker.as_ref(), &store, &msg)
+            .await
+            .unwrap();
+
+        let assistant = last_assistant(&store, msg.conversation_id);
+        assert_eq!(
+            assistant.body,
+            "First, the circuit breaker.\n\nThen the concurrency cap."
+        );
+        assert_eq!(assistant.status, STATUS_SENT);
     }
 
     /// Regression test for a real bug found running this live: tool-call activity
