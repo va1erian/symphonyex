@@ -285,7 +285,10 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
             cfg.swebot.qa_discussion_category.clone(),
             cfg.swebot.drafting_discussion_category.clone(),
         ),
-        RepoProvider::Gitlab => (cfg.swebot.qa_label.clone(), cfg.swebot.drafting_label.clone()),
+        RepoProvider::Gitlab => (
+            cfg.swebot.qa_label.clone(),
+            cfg.swebot.drafting_label.clone(),
+        ),
     };
     let Some(backend) = build_restricted_backend(&cfg) else {
         return;

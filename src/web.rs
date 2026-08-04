@@ -423,13 +423,7 @@ mod tests {
     /// early and let whatever follows execute as real markup.
     #[test]
     fn page_shell_escapes_page_title_against_title_tag_breakout() {
-        let html = page_shell(
-            "Symphony",
-            "</title><script>alert(1)</script>",
-            "",
-            "",
-            "",
-        );
+        let html = page_shell("Symphony", "</title><script>alert(1)</script>", "", "", "");
         assert!(!html.contains("</title><script>"));
         assert!(html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
     }

@@ -609,7 +609,10 @@ fn render_transcript(rows: &[eventlog::EventRow], base: &str) -> String {
     if rows.is_empty() {
         return r#"<p class="empty">No events recorded yet.</p>"#.to_string();
     }
-    rows.iter().rev().map(|r| transcript_bubble(r, base)).collect()
+    rows.iter()
+        .rev()
+        .map(|r| transcript_bubble(r, base))
+        .collect()
 }
 
 /// Which bubble variant an event type reads as: `other_message` (and anything else
