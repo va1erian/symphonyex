@@ -351,10 +351,13 @@ pub struct SwebotChatConfig {
     /// Bounds prompt size -- the whole transcript is re-sent every turn; chat does not
     /// use `--resume` continuity (same reasoning as `drafting.rs`).
     pub max_history_messages: usize,
-    /// Latency budget (ms) for the assistant's *first streaming text* to arrive before
-    /// the worker posts a "still working" notice to the conversation (see `worker.rs`).
-    /// The must-notify rule: a turn that will take longer than this must tell the user
-    /// so immediately rather than leaving them staring at a silent input box.
+    /// Latency budget (ms) for the assistant's *first streaming text or tool call* to
+    /// arrive before the worker posts a "still working" notice to the conversation
+    /// (see `worker.rs`). The must-notify rule: a turn that will take longer than
+    /// this must tell the user so immediately rather than leaving them staring at a
+    /// silent input box. In practice this is only a fallback for a turn that neither
+    /// calls a tool nor emits text right away -- the moment any tool call happens,
+    /// its name becomes a live-updating status line regardless of this deadline.
     pub first_text_deadline_ms: u64,
 }
 
@@ -601,7 +604,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         max_history_messages: get_u64(swebot_chat, "max_history_messages", 40).max(1) as usize,
-        first_text_deadline_ms: get_u64(swebot_chat, "first_text_deadline_ms", 5_000),
+        first_text_deadline_ms: get_u64(swebot_chat, "first_text_deadline_ms", 2_000),
     };
     let swebot_cfg = SwebotConfig {
         enabled: swebot_enabled,

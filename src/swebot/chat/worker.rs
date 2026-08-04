@@ -8,11 +8,14 @@
 //! 3. Insert an empty assistant message (`streaming`) and run the turn **streaming**
 //!    (`run_turn_streaming`): each `AgentEvent` text chunk is flushed into the store
 //!    (~150ms cadence), so the web UI shows the reply appearing rather than a blank
-//!    window. If the first text hasn't arrived within
-//!    `swebot.chat.first_text_deadline_ms` (default 5000) the worker inserts a system
-//!    notice ("still working…") so the user is *told* a slow turn is happening instead
-//!    of staring at a spinner -- the must-notify rule; the notice resolves to
-//!    `notice-done` once the reply lands.
+//!    window. A `tool_call` event live-updates a single "Using `<tool>`…" system
+//!    notice (throttled ~400ms) instead of the reply going silent while the model
+//!    reads files/runs commands; if nothing at all has arrived within
+//!    `swebot.chat.first_text_deadline_ms` (default 2000) that same notice is created
+//!    with a generic "still working" body -- the must-notify rule, now mostly a
+//!    fallback since real tool activity usually beats the deadline. The notice
+//!    resolves to `notice-done` (and the web UI removes its bubble) once the reply
+//!    lands.
 //! 4. Drafting: if the response's trailing ```json block says `ready`, either create
 //!    the issue immediately (`auto_create_issue`, default) or stash the draft in the
 //!    message `meta` and wait for a "create it" confirmation. A confirmation is
@@ -460,11 +463,19 @@ async fn run_turn_streaming(
     let store2 = store.clone();
     let collector = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(first_text_deadline_ms);
-        let mut notice_sent = false;
+        // The live-status notice, upserted (not re-inserted) as tool activity comes
+        // in -- one row per turn, its body replaced each time, so a turn that reads
+        // three files and runs a test shows "Using `read`…" -> "Using `bash`…" in
+        // place instead of a single static "still working" message the user gets to
+        // stare at for however long the turn actually takes. Lazily created either
+        // by the first tool_call event or by the deadline firing, whichever is
+        // first -- most real turns do *something* well before the deadline.
+        let mut notice_id: Option<i64> = None;
         let mut last_message: Option<String> = None;
         let mut last_flush = tokio::time::Instant::now() - Duration::from_secs(1);
+        let mut last_notice_flush = tokio::time::Instant::now() - Duration::from_secs(1);
         loop {
-            let until_deadline: Option<tokio::time::Sleep> = if notice_sent {
+            let until_deadline: Option<tokio::time::Sleep> = if notice_id.is_some() {
                 None
             } else {
                 Some(tokio::time::sleep(
@@ -475,8 +486,7 @@ async fn run_turn_streaming(
                 tokio::select! {
                     maybe = rx.recv() => maybe,
                     _ = sleep => {
-                        let _ = store2.insert_system_notice(conversation_id, NOTICE_BODY);
-                        notice_sent = true;
+                        notice_id = store2.insert_system_notice(conversation_id, NOTICE_BODY).ok();
                         continue;
                     }
                 }
@@ -484,7 +494,7 @@ async fn run_turn_streaming(
                 rx.recv().await
             };
             match received {
-                Some(event) => {
+                Some(event) => match event.event.as_str() {
                     // Only `notification` events carry the assistant's actual text
                     // (see `agent::claude`/`agent::opencode`'s own event mapping) --
                     // `tool_call` events also set `.message` to the tool's *name*
@@ -492,18 +502,41 @@ async fn run_turn_streaming(
                     // diagnostic text. Treating any of those as the growing reply
                     // would (and did, in production) clobber the real answer with
                     // whatever tool ran last, right up to the final persisted body.
-                    if event.event == "notification"
-                        && let Some(text) = event.message
-                        && !text.trim().is_empty()
-                    {
-                        last_message = Some(text.clone());
-                        let now = tokio::time::Instant::now();
-                        if now.duration_since(last_flush) >= Duration::from_millis(150) {
-                            last_flush = now;
-                            let _ = store2.set_message_body(assistant_id, &text);
+                    "notification" => {
+                        if let Some(text) = event.message
+                            && !text.trim().is_empty()
+                        {
+                            last_message = Some(text.clone());
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_flush) >= Duration::from_millis(150) {
+                                last_flush = now;
+                                let _ = store2.set_message_body(assistant_id, &text);
+                            }
                         }
                     }
-                }
+                    "tool_call" => {
+                        if let Some(tool) = event.message
+                            && !tool.trim().is_empty()
+                        {
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_notice_flush) >= Duration::from_millis(400) {
+                                last_notice_flush = now;
+                                let body = format!("Using `{tool}`…");
+                                match notice_id {
+                                    Some(id) => {
+                                        let _ = store2.set_message_body(id, &body);
+                                    }
+                                    None => {
+                                        notice_id = store2
+                                            .insert_system_notice(conversation_id, &body)
+                                            .ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 None => break,
             }
         }
@@ -861,6 +894,89 @@ mod tests {
         let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
         assert_eq!(assistant.body, "finally");
         assert_eq!(assistant.status, STATUS_SENT);
+    }
+
+    /// A session that reports using two tools (with a real delay between each, so the
+    /// collector's per-event handling actually runs on each one) before its final text.
+    struct ToolUsingSession {
+        tools: Vec<&'static str>,
+        body: String,
+    }
+
+    #[async_trait]
+    impl AgentSession for ToolUsingSession {
+        fn session_id(&self) -> &str {
+            "tools"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, AgentError> {
+            // Spaced further apart than the collector's 400ms notice-flush throttle
+            // (`last_notice_flush`), so both updates actually land instead of the
+            // second being dropped as "too soon after the last write".
+            for tool in &self.tools {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                let _ = events.send(AgentEvent::new("tool_call").with_message(tool.to_string()));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = events.send(AgentEvent::new("notification").with_message(self.body.clone()));
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    /// Regression test for a real bug found running this live: tool-call activity
+    /// during a slow turn showed only one static "still working" message for however
+    /// long the turn took, then the final answer appeared with no feedback in
+    /// between. Each `tool_call` event should now live-update a single status notice
+    /// (not insert a new row per tool) so the user sees what's actually happening.
+    #[tokio::test]
+    async fn tool_calls_live_update_a_single_status_notice() {
+        let cfg = test_cfg("    first_text_deadline_ms: 100000\n");
+        let (store, _tmp) = seeded("deep question");
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        struct ToolBackend;
+        #[async_trait]
+        impl AgentBackend for ToolBackend {
+            async fn start_session(
+                &self,
+                _workspace: &Path,
+                _issue_id: &str,
+                _title: &str,
+                _container: Option<&ContainerHandle>,
+            ) -> Result<Box<dyn AgentSession>, AgentError> {
+                Ok(Box::new(ToolUsingSession {
+                    tools: vec!["read", "bash"],
+                    body: "here's the answer".to_string(),
+                }))
+            }
+        }
+        let msg = one_pending(&store);
+        respond_to(&cfg, &ToolBackend, tracker.as_ref(), &store, &msg)
+            .await
+            .unwrap();
+
+        let msgs = store
+            .messages_of_conversation(msg.conversation_id, 0)
+            .unwrap();
+        let notices: Vec<_> = msgs.iter().filter(|m| m.role == ROLE_SYSTEM).collect();
+        // One row for the whole turn, not one per tool_call event.
+        assert_eq!(
+            notices.len(),
+            1,
+            "expected exactly one notice row, got {notices:?}"
+        );
+        // Its body ends up reflecting the *last* tool used before the deadline never
+        // even had to fire (first_text_deadline_ms is enormous above).
+        assert_eq!(notices[0].body, "Using `bash`…");
+        assert_eq!(notices[0].status, super::super::store::STATUS_NOTICE_DONE);
+        let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
+        assert_eq!(assistant.body, "here's the answer");
     }
 
     /// Regression test: two different conversations each with a pending message must

@@ -365,6 +365,13 @@ function statusLine(m) {
   return "";
 }
 
+// A resolved "still working"/live-status notice has nothing left to say once the
+// real reply has landed -- once its status flips to notice-done, its bubble should
+// disappear rather than sit in the transcript forever repeating stale progress text.
+function isDoneNotice(m) {
+  return m.role === "system" && m.status === "notice-done";
+}
+
 function render(m) {
   const body = md(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
   return '<div class="msg ' + m.role + '" id="msg-' + m.id + '">' +
@@ -375,7 +382,12 @@ function render(m) {
 
 function updateNode(m) {
   const node = document.getElementById("msg-" + m.id);
-  if (node) node.outerHTML = render(m);
+  if (!node) return;
+  if (isDoneNotice(m)) {
+    node.remove();
+    return;
+  }
+  node.outerHTML = render(m);
 }
 
 async function poll() {
@@ -396,8 +408,11 @@ async function poll() {
   const readIds = [];
   for (const m of (data.messages || [])) {
     if (m.id > lastId) {
-      out.insertAdjacentHTML("beforeend", render(m));
       lastId = m.id;
+      // Already resolved by the time we first see it (a fast turn, or a slow
+      // client poll) -- never render it at all, same end state as removing it.
+      if (isDoneNotice(m)) continue;
+      out.insertAdjacentHTML("beforeend", render(m));
       if (m.role === "assistant" && (m.status === "sent" || m.status === "streaming")) {
         readIds.push(m.id);
       }
