@@ -270,6 +270,30 @@ hand-written WORKFLOW.md can), a loud failure on push (not swallowed), and an
 `is-inside-work-tree` guard so a silently-failed `after_create` fails loudly on the
 next hook instead of quietly no-op'ing forever.
 
+**Keeping a long-running ticket rebased on `default_branch`**: every `before_run` (so
+every turn, not just the first) fetches `default_branch` and rebases the ticket
+branch onto it. Real drift over a multi-turn ticket is exactly what this catches --
+without it, a ticket that runs for a while while other work merges to main only
+discovers the conflict at PR-open time, as a merge conflict a human then has to sort
+out by hand. Two outcomes:
+- **Clean rebase**: silent, nothing for the agent to do differently this turn.
+- **Real conflict**: the hook does *not* fail -- resolving a conflict needs the
+  agent's own understanding of the code, not a script, so it leaves the workspace
+  genuinely mid-rebase (`.git/rebase-merge`/`.git/rebase-apply` present, files with
+  `<<<<<<<` markers) and prints a clear `MERGE CONFLICT:` line to stderr instead. A
+  project's own prompt needs to tell the agent what to do when it finds itself in
+  that state (see bsky-archiver's `WORKFLOW.md` for a template instruction) --
+  Symphony can detect and surface the conflict, but resolving it is inherently a
+  content decision only the coding agent (or a human) can make.
+  `after_run` refuses to commit/push while still mid-rebase (a partial/conflicted
+  tree must never reach the shared repo), and once a rebase *did* happen, pushes with
+  `--force-with-lease` instead of a plain push -- a rebase rewrites the ticket
+  branch's own commit history, so a plain push would be rejected as non-fast-forward
+  against whatever was pushed there before.
+- A rebase failing for a reason *other* than a conflict (network, corrupt state,
+  etc.) gets `git rebase --abort`ed automatically, leaving the branch exactly as it
+  was; a `WARNING:` line notes it, and the next turn's `before_run` just tries again.
+
 **Credentials**: `repo.token` names an env var (not a literal value) holding a git
 credential; the synthesized hooks reference it by name in a generated `git config
 credential.helper`, so the secret's actual value never gets embedded in the hook
@@ -476,12 +500,20 @@ swebot:
   backend: opencode
   chat:
     enabled: true
-    connectors: [web]          # interactive connectors: 'web' is the chat UI
-    poll_interval_ms: 5000     # how often the worker looks for new messages
-    max_concurrent_replies: 2  # answers per processing cycle (1-2 is plenty)
-    auto_create_issue: true    # file a finished draft immediately (default)
-    first_text_deadline_ms: 5000
+    connectors: [web]              # interactive connectors: 'web' is the chat UI
+    poll_interval_ms: 5000         # how often the worker answers pending messages (local only)
+    remote_poll_interval_ms: 30000 # how often each remote connector (github) polls its own API
+    max_concurrent_replies: 2      # answers per processing cycle (1-2 is plenty)
+    auto_create_issue: true        # file a finished draft immediately (default)
+    first_text_deadline_ms: 2000
 ```
+
+`poll_interval_ms` and `remote_poll_interval_ms` are deliberately separate: answering a
+pending message is a local SQLite read plus a model turn, so polling for it often costs
+nothing external -- but a remote connector's `ingest`/`deliver` (GitHub Discussions'
+GraphQL API today) burns real rate-limit budget every tick, so it defaults to a much
+slower cadence. `web` has no remote platform to poll (`ingest`/`deliver` are no-ops
+there), so `remote_poll_interval_ms` only matters once a remote connector is active.
 
 **How it's structured** (`src/swebot/chat/`): a SQLite store (`symphony-chat.db` next to
 `symphony.db`, `store.rs`) holds conversations and messages; a connector-agnostic
@@ -713,23 +745,40 @@ back, an issue never leaves its active state, so the orchestrator just keeps
 redispatching it forever (continuation retries) once the agent thinks it's done.
 
 `LocalTrackerAdapter` fixes this by exposing one provider-native tool,
-`update_issue_state({state})`. The wiring (`claude`-backend only):
+`update_issue_state({state})`. The wiring (`claude` and `opencode` backends):
 
 1. `TrackerAdapter` has two default (opt-in) methods, `agent_tool_specs()` and
    `execute_agent_tool()` — an adapter with nothing to expose just doesn't override
    them (Section 10.5's `agent_tool_specs()` / `execute_agent_tool()` hooks).
-2. If the active adapter returns any specs, `ClaudeSession::start_session` writes a
-   `--mcp-config` file into the workspace pointing back at **this same `symphony`
-   binary**, run as `symphony __mcp_tool_server --tracker-kind ... --issue-id ...` (a
-   hidden subcommand; see `src/mcp.rs`). `claude` spawns that as its own MCP server
-   subprocess whenever the model calls the tool.
+2. If the active adapter returns any specs, `start_session` wires an MCP server
+   pointing back at **this same `symphony` binary**, run as
+   `symphony __mcp_tool_server --tracker-kind ... --issue-id ...` (a hidden
+   subcommand; see `src/mcp.rs`). How that wiring reaches the agent CLI differs per
+   backend, since neither exposes an equivalent flag:
+   - `claude`: `ClaudeSession::start_session` writes a `--mcp-config` file into the
+     workspace and passes `--mcp-config <file> --strict-mcp-config`.
+   - `opencode`: has no per-invocation config flag, only config-file discovery, but
+     does have `OPENCODE_CONFIG_CONTENT` (inline config content via env var) as its
+     own escape hatch for exactly this — `mcp_config_env` (`src/agent/opencode.rs`)
+     sets it to a `{"mcp": {"symphony": {"type": "local", "command": [...]}}}` blob.
+     Confirmed against opencode's own docs: config layers (global/project/env-var
+     inline) *deep-merge*, they don't replace each other, so this never disturbs the
+     separately-baked-in provider config (e.g. the image's own Fireworks setup) —
+     the inline blob only ever adds the `mcp` key.
+   Either way, the agent CLI spawns that command as its own MCP server subprocess
+   whenever the model calls the tool.
 3. That subprocess rebuilds the tracker adapter from the same config and executes the
-   write itself — the `claude` agent process never touches `issues/*.md` directly. This
+   write itself — the coding agent process never touches `issues/*.md` directly. This
    matches the spec's tracker-write boundary (Section 11.5): mutations happen host-side,
    through the adapter, not via raw agent file access.
-4. The tool is always auto-approved (`--allowedTools mcp__symphony__*`,
-   `--strict-mcp-config`) independent of `claude.permission_mode`, since it's
-   host-mediated and scoped to exactly one tool.
+4. The tool is always auto-approved independent of `claude.permission_mode`/
+   `opencode`'s own permission config, since it's host-mediated and scoped to exactly
+   one tool: `claude` via `--allowedTools mcp__symphony__* --strict-mcp-config`;
+   `opencode` has no equivalent allowlist flag, but `--auto` (its own high-trust
+   default, see above) already approves every tool call, MCP included, and a
+   restricted `OPENCODE_PERMISSION` deny-rule (SweBot's own sessions) only ever
+   targets `edit`/`write`/`patch`, not MCP tool calls, so this reaches the same
+   effective posture without needing one.
 
 `codex` doesn't get this wiring yet — Codex's own dynamic-tool-call mechanism
 (Section 10.5) would need separate plumbing in the (already best-effort) Codex client.

@@ -138,6 +138,56 @@ pub async fn poll_once(
             verdict = ?outcome.posted_as,
             "swebot: posted PR review"
         );
+
+        // A refusal is a dead end otherwise: the ticket's own issue is already sitting
+        // in "in review" (the coding agent moved it there when it opened the PR), and
+        // nothing else ever moves it back out -- the coding agent has no way to learn
+        // SweBot asked for changes, so the ticket just sits there forever, "reviewed"
+        // but never actually fixed. Reopening it into the first configured active
+        // state (same convention `drafting.rs`/chat's `finish_draft` already use for
+        // "the" active state) puts it back in front of the coding agent on the very
+        // next dispatch poll, the same way a human requesting changes would.
+        if outcome.posted_as == ReviewVerdict::RequestChanges {
+            match extract_closes_issue_number(&pr.body) {
+                Some(n) => match cfg.active_states.first() {
+                    Some(state) => {
+                        let result = tracker
+                            .execute_agent_tool(
+                                "update_issue_state",
+                                serde_json::json!({ "state": state }),
+                                &n.to_string(),
+                            )
+                            .await;
+                        if result.success {
+                            tracing::info!(
+                                pr = pr.number,
+                                issue = n,
+                                %state,
+                                "swebot: requested changes -- reopened the linked issue for the coding agent"
+                            );
+                        } else {
+                            tracing::warn!(
+                                pr = pr.number,
+                                issue = n,
+                                error = %result.content,
+                                "swebot: requested changes, but reopening the linked issue failed"
+                            );
+                        }
+                    }
+                    None => tracing::warn!(
+                        pr = pr.number,
+                        issue = n,
+                        "swebot: requested changes, but tracker.active_states is empty -- \
+                         nowhere to reopen the linked issue into"
+                    ),
+                },
+                None => tracing::debug!(
+                    pr = pr.number,
+                    "swebot: requested changes, but the PR body has no 'Closes #N' reference \
+                     -- no linked issue to reopen"
+                ),
+            }
+        }
     }
     Ok(())
 }
@@ -206,6 +256,27 @@ mod tests {
         ))
         .unwrap();
         config::resolve(&yaml, std::path::Path::new(".")).unwrap()
+    }
+
+    fn test_cfg_with_active_states(
+        repo_path: &std::path::Path,
+        active_states: &[&str],
+    ) -> config::EffectiveConfig {
+        let states = active_states
+            .iter()
+            .map(|s| format!("{s:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [{states}]\nrepo:\n  url: {:?}\n  default_branch: main\n",
+            repo_path.display()
+        ))
+        .unwrap();
+        config::resolve(&yaml, std::path::Path::new(".")).unwrap()
+    }
+
+    fn write_issue(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
     }
 
     fn test_host(server: &MockServer) -> GithubRepoHost {
@@ -421,6 +492,61 @@ mod tests {
         // Must succeed overall (the COMMENT fallback lands) rather than propagating
         // the 422 as a poll failure.
         poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
+    }
+
+    /// The coding agent has no way to learn SweBot asked for changes unless
+    /// something moves the linked issue back into an active state -- otherwise a
+    /// "request_changes" verdict is a dead end (see the comment at the call site in
+    /// `poll_once`). Verifies the linked issue's file actually gets rewritten.
+    #[tokio::test]
+    async fn request_changes_reopens_the_linked_issue_for_the_coding_agent() {
+        let origin = real_repo_with_a_ticket_branch();
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![json!({
+                "number": 42, "html_url": "https://github.com/owner/name/pull/42",
+                "body": "Closes #42", "head": {"ref": "issue-42", "sha": "fakesha123"}
+            })]))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/pulls/42/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/name/pulls/42/reviews"))
+            .and(body_string_contains("REQUEST_CHANGES"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+            .mount(&server)
+            .await;
+
+        let cfg = test_cfg_with_active_states(origin.path(), &["todo"]);
+        let host = test_host(&server);
+        let backend = FakeBackend::with_response(
+            "```json\n{\"verdict\": \"request_changes\", \"summary\": \"Missing tests.\"}\n```",
+        );
+        let tracker_dir = tempdir().unwrap();
+        write_issue(
+            tracker_dir.path(),
+            "42.md",
+            "---\nidentifier: \"42\"\ntitle: Ticket\nstate: in review\n---\nDo the thing.\n",
+        );
+        let tracker_provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker =
+            LocalTrackerAdapter::new(&tracker_provider, std::path::Path::new(".")).unwrap();
+
+        poll_once(&cfg, &host, &backend, &tracker).await.unwrap();
+
+        let issues = tracker
+            .fetch_issues_by_ids(&["42".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].normalized_state(), "todo");
     }
 
     #[tokio::test]

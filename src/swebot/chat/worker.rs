@@ -1,5 +1,9 @@
 //! Chat worker: the single authority that turns pending user messages into SweBot
-//! replies. One task per project, polled on `swebot.chat.poll_interval_ms`.
+//! replies. One task per project, polled on `swebot.chat.poll_interval_ms` -- kept
+//! fast since answering is purely local. Each remote connector's own `ingest`/
+//! `deliver` (e.g. GitHub Discussions) run on the separate, slower
+//! `swebot.chat.remote_poll_interval_ms` instead, so answering quickly never forces
+//! polling a rate-limited API just as often.
 //!
 //! Turn flow per message:
 //!
@@ -8,11 +12,14 @@
 //! 3. Insert an empty assistant message (`streaming`) and run the turn **streaming**
 //!    (`run_turn_streaming`): each `AgentEvent` text chunk is flushed into the store
 //!    (~150ms cadence), so the web UI shows the reply appearing rather than a blank
-//!    window. If the first text hasn't arrived within
-//!    `swebot.chat.first_text_deadline_ms` (default 5000) the worker inserts a system
-//!    notice ("still working…") so the user is *told* a slow turn is happening instead
-//!    of staring at a spinner -- the must-notify rule; the notice resolves to
-//!    `notice-done` once the reply lands.
+//!    window. A `tool_call` event live-updates a single "Using `<tool>`…" system
+//!    notice (throttled ~400ms) instead of the reply going silent while the model
+//!    reads files/runs commands; if nothing at all has arrived within
+//!    `swebot.chat.first_text_deadline_ms` (default 2000) that same notice is created
+//!    with a generic "still working" body -- the must-notify rule, now mostly a
+//!    fallback since real tool activity usually beats the deadline. The notice
+//!    resolves to `notice-done` (and the web UI removes its bubble) once the reply
+//!    lands.
 //! 4. Drafting: if the response's trailing ```json block says `ready`, either create
 //!    the issue immediately (`auto_create_issue`, default) or stash the draft in the
 //!    message `meta` and wait for a "create it" confirmation. A confirmation is
@@ -52,18 +59,25 @@ pub async fn run_loop(
         tracing::warn!(error = %e, "chat: stale-claim requeue failed");
     }
 
-    // Delivery runs on its *own* loop, concurrently with processing: a non-web
-    // connector (GitHub) must be able to post a slow turn's "still working" notice
-    // *while* the turn is still running, which is impossible if deliver only ever
-    // runs after the worker returns. The two loops only touch disjoint rows (the
-    // worker writes streaming/sent statuses; delivery marks `remote_message_id`),
-    // so WAL SQLite handles the concurrency.
+    // Delivery and ingest each run on their *own* loop, on `remote_poll_interval_ms`
+    // -- separate from `poll_interval_ms` (the fast, purely-local "answer whatever's
+    // pending" cadence below) so a connector with a real rate-limited API (GitHub's
+    // Discussions GraphQL) doesn't have to be polled as often as the worker answers
+    // messages. `web`'s `ingest`/`deliver` are no-ops, so this only matters once a
+    // remote connector is active. Delivery specifically also needs its own loop
+    // (independent of ingest, not just of answering) so a non-web connector can post
+    // a slow turn's "still working" notice *while* the turn is still running --
+    // impossible if deliver only ever ran after the worker returned. All three loops
+    // only ever touch disjoint rows (ingest writes new `pending` rows; the worker
+    // writes streaming/sent statuses; delivery marks `remote_message_id`), so WAL
+    // SQLite handles the concurrency between them.
     let connectors = Arc::new(connectors);
+    let remote_interval_ms = cfg.swebot.chat.remote_poll_interval_ms.max(100);
+
     let deliver_connectors = connectors.clone();
     let deliver_store = store.clone();
     tokio::spawn(async move {
-        let deliver_interval_ms = cfg.swebot.chat.poll_interval_ms.max(100);
-        let mut interval = tokio::time::interval(Duration::from_millis(deliver_interval_ms));
+        let mut interval = tokio::time::interval(Duration::from_millis(remote_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -75,16 +89,26 @@ pub async fn run_loop(
         }
     });
 
+    let ingest_connectors = connectors.clone();
+    let ingest_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(remote_interval_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            for connector in ingest_connectors.iter() {
+                if let Err(e) = connector.ingest(&ingest_store).await {
+                    tracing::warn!(connector = connector.name(), error = %e, "chat: connector ingest failed");
+                }
+            }
+        }
+    });
+
     let interval_ms = cfg.swebot.chat.poll_interval_ms.max(100);
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        for connector in connectors.iter() {
-            if let Err(e) = connector.ingest(&store).await {
-                tracing::warn!(connector = connector.name(), error = %e, "chat: connector ingest failed");
-            }
-        }
         if let Err(e) = process_cycle(&cfg, backend.as_ref(), tracker.as_ref(), &store).await {
             tracing::warn!(error = %e, "chat: processing cycle failed");
         }
@@ -100,16 +124,44 @@ async fn process_cycle(
     store: &ChatStore,
 ) -> Result<(), String> {
     refresh_shared_clone(cfg).await;
+    answer_pending(cfg, backend, tracker, store).await
+}
 
+/// Claim and answer up to `max_concurrent_replies` pending messages -- one per
+/// conversation (`pending_user_messages`' own ordering guarantee), answered
+/// *concurrently* rather than one after another. Each turn is I/O-bound (a
+/// subprocess + waiting on the model), so awaiting them together via `join_all`
+/// lets multiple chat threads' turns genuinely overlap instead of one thread's
+/// (possibly tens-of-seconds-long) turn queuing up every other thread's reply
+/// behind it -- the whole reason `max_concurrent_replies` exists, but the previous
+/// sequential-for-loop version never actually delivered on the name. Split out from
+/// `process_cycle` so tests can exercise the concurrency itself without also paying
+/// for (or depending on the network access of) `refresh_shared_clone`'s git pull.
+async fn answer_pending(
+    cfg: &EffectiveConfig,
+    backend: &dyn AgentBackend,
+    tracker: &dyn TrackerAdapter,
+    store: &ChatStore,
+) -> Result<(), String> {
     let limit = cfg.swebot.chat.max_concurrent_replies.max(1) as usize;
     let pending = store
         .pending_user_messages(limit)
         .map_err(|e| format!("pending query failed: {e}"))?;
-    for msg in pending {
+    for msg in &pending {
         store
             .set_message_status(msg.id, STATUS_PROCESSING)
             .map_err(|e| format!("claim failed: {e}"))?;
-        match respond_to(cfg, backend, tracker, store, &msg).await {
+    }
+
+    let results = futures::future::join_all(
+        pending
+            .iter()
+            .map(|msg| respond_to(cfg, backend, tracker, store, msg)),
+    )
+    .await;
+
+    for (msg, result) in pending.iter().zip(results) {
+        match result {
             Ok(()) => {
                 store
                     .set_message_status(msg.id, STATUS_PROCESSED)
@@ -432,11 +484,29 @@ async fn run_turn_streaming(
     let store2 = store.clone();
     let collector = tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(first_text_deadline_ms);
-        let mut notice_sent = false;
-        let mut last_message: Option<String> = None;
+        // The live-status notice, upserted (not re-inserted) as tool activity comes
+        // in -- one row per turn, its body replaced each time, so a turn that reads
+        // three files and runs a test shows "Using `read`…" -> "Using `bash`…" in
+        // place instead of a single static "still working" message the user gets to
+        // stare at for however long the turn actually takes. Lazily created either
+        // by the first tool_call event or by the deadline firing, whichever is
+        // first -- most real turns do *something* well before the deadline.
+        let mut notice_id: Option<i64> = None;
+        // Accumulated, not just the latest chunk: a real opencode turn was observed
+        // splitting one logical answer across several `notification` events (one text
+        // fragment per internal agentic-loop step, not a full restatement each time --
+        // see `agent::opencode`'s module doc on `step_finish` firing per step). Keeping
+        // only the last chunk silently truncated the persisted reply down to whatever
+        // the final step happened to say, discarding everything earlier steps
+        // contributed. Concatenating is safe for Claude too, whose steps do tend to
+        // each restate a self-contained message -- worst case that just surfaces a
+        // little intermediate commentary alongside the final answer instead of only
+        // the final answer, never less text than before.
+        let mut reply = String::new();
         let mut last_flush = tokio::time::Instant::now() - Duration::from_secs(1);
+        let mut last_notice_flush = tokio::time::Instant::now() - Duration::from_secs(1);
         loop {
-            let until_deadline: Option<tokio::time::Sleep> = if notice_sent {
+            let until_deadline: Option<tokio::time::Sleep> = if notice_id.is_some() {
                 None
             } else {
                 Some(tokio::time::sleep(
@@ -447,8 +517,7 @@ async fn run_turn_streaming(
                 tokio::select! {
                     maybe = rx.recv() => maybe,
                     _ = sleep => {
-                        let _ = store2.insert_system_notice(conversation_id, NOTICE_BODY);
-                        notice_sent = true;
+                        notice_id = store2.insert_system_notice(conversation_id, NOTICE_BODY).ok();
                         continue;
                     }
                 }
@@ -456,27 +525,61 @@ async fn run_turn_streaming(
                 rx.recv().await
             };
             match received {
-                Some(event) => {
-                    if let Some(text) = event.message
-                        && !text.trim().is_empty()
-                    {
-                        last_message = Some(text.clone());
-                        let now = tokio::time::Instant::now();
-                        if now.duration_since(last_flush) >= Duration::from_millis(150) {
-                            last_flush = now;
-                            let _ = store2.set_message_body(assistant_id, &text);
+                Some(event) => match event.event.as_str() {
+                    // Only `notification` events carry the assistant's actual text
+                    // (see `agent::claude`/`agent::opencode`'s own event mapping) --
+                    // `tool_call` events also set `.message` to the tool's *name*
+                    // (e.g. "bash", "read"), and `other_message`/`malformed` carry
+                    // diagnostic text. Treating any of those as the growing reply
+                    // would (and did, in production) clobber the real answer with
+                    // whatever tool ran last, right up to the final persisted body.
+                    "notification" => {
+                        if let Some(text) = event.message
+                            && !text.trim().is_empty()
+                        {
+                            if !reply.is_empty() {
+                                reply.push_str("\n\n");
+                            }
+                            reply.push_str(text.trim());
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_flush) >= Duration::from_millis(150) {
+                                last_flush = now;
+                                let _ = store2.set_message_body(assistant_id, &reply);
+                            }
                         }
                     }
-                }
+                    "tool_call" => {
+                        if let Some(tool) = event.message
+                            && !tool.trim().is_empty()
+                        {
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_notice_flush) >= Duration::from_millis(400) {
+                                last_notice_flush = now;
+                                let body = format!("Using `{tool}`…");
+                                match notice_id {
+                                    Some(id) => {
+                                        let _ = store2.set_message_body(id, &body);
+                                    }
+                                    None => {
+                                        notice_id = store2
+                                            .insert_system_notice(conversation_id, &body)
+                                            .ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 None => break,
             }
         }
-        if let Some(m) = &last_message {
-            let _ = store2.set_message_body(assistant_id, m);
+        if !reply.is_empty() {
+            let _ = store2.set_message_body(assistant_id, &reply);
         }
         let _ = store2.resolve_system_notices(conversation_id);
         let _ = store2.set_message_status(assistant_id, STATUS_SENT);
-        last_message
+        if reply.is_empty() { None } else { Some(reply) }
     });
 
     // Await the collector *before* inspecting the outcome: `run_turn` returning
@@ -508,6 +611,13 @@ fn unified_instructions(clone_dir: &Path) -> String {
          Answer questions directly and concretely, citing specific files/lines; say \
          plainly when something isn't knowable from the code alone rather than guessing. \
          Keep answers tight -- this is a chat, not a report.\n\
+         If answering will take real exploration (reading multiple files, running \
+         tests/greps, anything beyond an instant lookup), START your response with one \
+         short sentence naming what you're about to check (e.g. \"Let me check how the \
+         retry logic is wired up.\") before you actually do it, so the person sees that \
+         immediately instead of silence while you work -- then continue in the same \
+         response with your findings once you have them. Skip this for anything you can \
+         answer instantly from what you already know.\n\
          When the user asks you to draft or file a ticket, drive a short scoping dialogue: \
          ask only the clarifying questions that actually change scope (acceptance \
          criteria, edge cases, what's out of scope), then -- once you have enough to \
@@ -825,6 +935,223 @@ mod tests {
         let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
         assert_eq!(assistant.body, "finally");
         assert_eq!(assistant.status, STATUS_SENT);
+    }
+
+    /// A session that reports using two tools (with a real delay between each, so the
+    /// collector's per-event handling actually runs on each one) before its final text.
+    struct ToolUsingSession {
+        tools: Vec<&'static str>,
+        body: String,
+    }
+
+    #[async_trait]
+    impl AgentSession for ToolUsingSession {
+        fn session_id(&self) -> &str {
+            "tools"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, AgentError> {
+            // Spaced further apart than the collector's 400ms notice-flush throttle
+            // (`last_notice_flush`), so both updates actually land instead of the
+            // second being dropped as "too soon after the last write".
+            for tool in &self.tools {
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                let _ = events.send(AgentEvent::new("tool_call").with_message(tool.to_string()));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = events.send(AgentEvent::new("notification").with_message(self.body.clone()));
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    /// A session that reports two separate `notification` events before completing,
+    /// with a real delay between them so the collector's per-event handling actually
+    /// runs on each one.
+    struct MultiChunkSession {
+        chunks: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl AgentSession for MultiChunkSession {
+        fn session_id(&self) -> &str {
+            "multi-chunk"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, AgentError> {
+            for chunk in &self.chunks {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ =
+                    events.send(AgentEvent::new("notification").with_message(chunk.to_string()));
+            }
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    /// Regression test for a real bug found running this live: `opencode` (unlike
+    /// Claude) was observed splitting one logical reply across several separate
+    /// `notification` events -- one text fragment per internal agentic-loop step, not
+    /// a full restatement each time (see `agent::opencode`'s module doc on
+    /// `step_finish` firing per step). Persisting only the *latest* chunk silently
+    /// truncated the saved reply down to whatever the final step happened to say,
+    /// discarding every earlier fragment -- exactly the "got a truncated message in
+    /// the chat" bug reported live. Chunks must be concatenated instead.
+    #[tokio::test]
+    async fn multiple_notification_chunks_are_concatenated_not_overwritten() {
+        let cfg = test_cfg("    first_text_deadline_ms: 100000\n");
+        let (store, _tmp) = seeded("deep question");
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        struct MultiChunkBackend;
+        #[async_trait]
+        impl AgentBackend for MultiChunkBackend {
+            async fn start_session(
+                &self,
+                _workspace: &Path,
+                _issue_id: &str,
+                _title: &str,
+                _container: Option<&ContainerHandle>,
+            ) -> Result<Box<dyn AgentSession>, AgentError> {
+                Ok(Box::new(MultiChunkSession {
+                    chunks: vec!["First, the circuit breaker.", "Then the concurrency cap."],
+                }))
+            }
+        }
+        let msg = one_pending(&store);
+        respond_to(&cfg, &MultiChunkBackend, tracker.as_ref(), &store, &msg)
+            .await
+            .unwrap();
+
+        let assistant = last_assistant(&store, msg.conversation_id);
+        assert_eq!(
+            assistant.body,
+            "First, the circuit breaker.\n\nThen the concurrency cap."
+        );
+        assert_eq!(assistant.status, STATUS_SENT);
+    }
+
+    /// Regression test for a real bug found running this live: tool-call activity
+    /// during a slow turn showed only one static "still working" message for however
+    /// long the turn took, then the final answer appeared with no feedback in
+    /// between. Each `tool_call` event should now live-update a single status notice
+    /// (not insert a new row per tool) so the user sees what's actually happening.
+    #[tokio::test]
+    async fn tool_calls_live_update_a_single_status_notice() {
+        let cfg = test_cfg("    first_text_deadline_ms: 100000\n");
+        let (store, _tmp) = seeded("deep question");
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        struct ToolBackend;
+        #[async_trait]
+        impl AgentBackend for ToolBackend {
+            async fn start_session(
+                &self,
+                _workspace: &Path,
+                _issue_id: &str,
+                _title: &str,
+                _container: Option<&ContainerHandle>,
+            ) -> Result<Box<dyn AgentSession>, AgentError> {
+                Ok(Box::new(ToolUsingSession {
+                    tools: vec!["read", "bash"],
+                    body: "here's the answer".to_string(),
+                }))
+            }
+        }
+        let msg = one_pending(&store);
+        respond_to(&cfg, &ToolBackend, tracker.as_ref(), &store, &msg)
+            .await
+            .unwrap();
+
+        let msgs = store
+            .messages_of_conversation(msg.conversation_id, 0)
+            .unwrap();
+        let notices: Vec<_> = msgs.iter().filter(|m| m.role == ROLE_SYSTEM).collect();
+        // One row for the whole turn, not one per tool_call event.
+        assert_eq!(
+            notices.len(),
+            1,
+            "expected exactly one notice row, got {notices:?}"
+        );
+        // Its body ends up reflecting the *last* tool used before the deadline never
+        // even had to fire (first_text_deadline_ms is enormous above).
+        assert_eq!(notices[0].body, "Using `bash`…");
+        assert_eq!(notices[0].status, super::super::store::STATUS_NOTICE_DONE);
+        let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
+        assert_eq!(assistant.body, "here's the answer");
+    }
+
+    /// Regression test: two different conversations each with a pending message must
+    /// be answered *concurrently*, not one after the other. Before this fix,
+    /// `process_cycle` awaited each `respond_to` inside a plain `for` loop, so with
+    /// multiple chat threads in use at once, one thread's (possibly tens-of-seconds)
+    /// turn queued up every other thread's reply behind it. A 300ms-per-turn backend
+    /// answering two pending messages should take close to 300ms total, not ~600ms.
+    /// Calls `answer_pending` directly (not `process_cycle`) so this only measures
+    /// the answering step, not `refresh_shared_clone`'s unrelated git pull.
+    #[tokio::test]
+    async fn two_conversations_pending_at_once_are_answered_concurrently() {
+        let cfg = test_cfg("    max_concurrent_replies: 2\n");
+        let (store, _tmp) = chat_store();
+        let tracker_dir = tempfile::tempdir().unwrap();
+        let tracker = test_tracker(tracker_dir.path());
+        let backend = SlowBackend {
+            first_text_delay_ms: 1_000,
+            body: "done".to_string(),
+        };
+        let conv_a = store.create_conversation("test", None, "u", "a").unwrap();
+        let conv_b = store.create_conversation("test", None, "u", "b").unwrap();
+        store
+            .insert_message(
+                conv_a,
+                ROLE_USER,
+                "question a",
+                STATUS_PENDING,
+                &json!({}),
+                None,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                conv_b,
+                ROLE_USER,
+                "question b",
+                STATUS_PENDING,
+                &json!({}),
+                None,
+            )
+            .unwrap();
+
+        let start = tokio::time::Instant::now();
+        answer_pending(&cfg, &backend, tracker.as_ref(), &store)
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+        // Sequential would be at least 2s of guaranteed sleep alone, before any of
+        // this store's own (real SQLite, real disk) per-call overhead; concurrent
+        // overlaps both turns' sleeps, so total stays well under that regardless of
+        // how much overhead the store itself adds on top.
+        assert!(
+            elapsed < Duration::from_millis(1_700),
+            "expected two 1000ms turns to overlap (well under 2000ms total), took {elapsed:?}"
+        );
+
+        for conv in [conv_a, conv_b] {
+            let msgs = store.messages_of_conversation(conv, 0).unwrap();
+            let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
+            assert_eq!(assistant.body, "done");
+            assert_eq!(assistant.status, STATUS_SENT);
+        }
     }
 
     #[test]

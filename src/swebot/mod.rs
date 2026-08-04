@@ -93,14 +93,25 @@ fn answered_marker(id: u64) -> String {
     format!("<!-- swebot:answered:{id} -->")
 }
 
-/// Whether `body` is SweBot's own reply (carries an `answered_marker`) rather than a
-/// human comment. Matters because SweBot's own reply necessarily gets a *higher*
-/// `database_id` than the marker value it embeds -- without excluding it, the "find
+/// Marks a mid-turn "still working" notice (`chat::github::deliver_notices`) as
+/// SweBot's own -- deliberately *not* an `answered_marker`, since a notice hasn't
+/// answered anything yet and must not advance the thread's answered-marker before
+/// the real reply lands. Without some marker at all, `is_swebot_reply` can't tell a
+/// notice apart from a human comment, so the very next `ingest` poll enqueues
+/// SweBot's own "Still working on that..." text as a fresh question and answers it
+/// -- an observed-in-production feedback loop of SweBot replying to its own notices
+/// forever.
+const NOTICE_MARKER: &str = "<!-- swebot:notice -->";
+
+/// Whether `body` is SweBot's own post -- a reply (carries an `answered_marker`) or a
+/// "still working" notice (carries `NOTICE_MARKER`) -- rather than a human comment.
+/// Matters because SweBot's own reply necessarily gets a *higher* `database_id` than
+/// the marker value it embeds -- without excluding it (and its notices), the "find
 /// the newest comment past the last marker" scan below would treat SweBot's own
-/// just-posted reply as a fresh unanswered question on the very next poll, an
+/// just-posted text as a fresh unanswered question on the very next poll, an
 /// infinite reply-to-itself loop.
 fn is_swebot_reply(body: &str) -> bool {
-    body.contains("<!-- swebot:answered:")
+    body.contains("<!-- swebot:answered:") || body.contains(NOTICE_MARKER)
 }
 
 /// The highest `answered_marker` id found anywhere in the thread, or `None` if
@@ -220,6 +231,7 @@ fn build_restricted_backend(cfg: &EffectiveConfig) -> Option<Box<dyn AgentBacken
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
             permission_config: Some(DISALLOWED_OPENCODE_PERMISSION.to_string()),
+            mcp_wiring: None,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
         AgentBackendKind::Codex => {

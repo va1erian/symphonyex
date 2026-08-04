@@ -55,11 +55,23 @@
 //! is the main friction point on Windows -- baking it (plus a static provider config)
 //! into the Symphony base image once, per README.md "Docker mode", sidesteps that
 //! entirely.
+//!
+//! **Provider-native tracker tools** (Section 10.5, OPTIONAL, see `mcp_config_env`):
+//! `opencode` has no per-invocation config flag like `claude`'s `--mcp-config`, only
+//! config-file discovery -- but it does read `OPENCODE_CONFIG_CONTENT` (inline config
+//! content via an env var) as its own escape hatch for exactly this, and confirmed
+//! against opencode's own docs, config layers deep-merge rather than replace each
+//! other, so setting it never disturbs the separately-baked-in provider config (the
+//! image's own Fireworks setup). `mcp_wiring` carries the same `McpToolWiring` data
+//! `ClaudeBackend` uses; when set, `start_session` builds the `OPENCODE_CONFIG_CONTENT`
+//! value once and every subsequent turn forwards it as an env var (`-e` in Docker mode,
+//! `.env()` on the host), same delivery mechanism `permission_config` already uses.
 
+use super::claude::McpToolWiring;
 use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
-use crate::container::{ContainerHandle, ContainerKillGuard};
+use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -82,6 +94,15 @@ pub struct OpenCodeBackend {
     /// `None` (the default) leaves permissions untouched -- SweBot's restricted
     /// sessions set it, ticket dispatch does not.
     pub permission_config: Option<String>,
+    /// Section 10.5's provider-native-tool wiring (`open_pull_request`,
+    /// `update_issue_state`) -- the same `McpToolWiring` `ClaudeBackend` uses.
+    /// `opencode` supports MCP servers via its own config (`"mcp": {...}`, deep-merged
+    /// across config layers, confirmed against opencode's docs -- a project/session
+    /// layer adding an `"mcp"` entry never disturbs the separately-baked-in provider
+    /// config), so the same data drives both backends; only how it's delivered to the
+    /// subprocess differs (see `mcp_config_env`). `None` leaves the tools unwired, as
+    /// before this field existed.
+    pub mcp_wiring: Option<McpToolWiring>,
     /// Needed to map a host workspace path to its in-container equivalent in Docker
     /// mode (see README.md "Docker mode"), same reason `ClaudeBackend` keeps this.
     pub workflow_dir: PathBuf,
@@ -92,7 +113,7 @@ impl AgentBackend for OpenCodeBackend {
     async fn start_session(
         &self,
         workspace: &Path,
-        _issue_id: &str,
+        issue_id: &str,
         _title: &str,
         container: Option<&ContainerHandle>,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
@@ -105,6 +126,11 @@ impl AgentBackend for OpenCodeBackend {
         let container_workspace_path =
             container.map(|c| c.to_container_path(&self.workflow_dir, workspace));
 
+        let mcp_config_env = self
+            .mcp_wiring
+            .as_ref()
+            .map(|wiring| mcp_config_env(wiring, issue_id, container));
+
         Ok(Box::new(OpenCodeSession {
             command: self.command.clone(),
             model: self.model.clone(),
@@ -112,6 +138,7 @@ impl AgentBackend for OpenCodeBackend {
             auto_approve: self.auto_approve,
             turn_timeout_ms: self.turn_timeout_ms,
             permission_config: self.permission_config.clone(),
+            mcp_config_env,
             workspace: workspace.to_path_buf(),
             container: container.cloned(),
             container_workspace_path,
@@ -131,6 +158,10 @@ struct OpenCodeSession {
     auto_approve: bool,
     turn_timeout_ms: u64,
     permission_config: Option<String>,
+    /// `(OPENCODE_CONFIG_CONTENT, <json>)` when `mcp_wiring` is set -- bound once at
+    /// `start_session` (per Section 10.5's "one session snapshot" rule, same as
+    /// `ClaudeSession::mcp_config_path`), not recomputed per turn.
+    mcp_config_env: Option<(String, String)>,
     workspace: PathBuf,
     container: Option<ContainerHandle>,
     container_workspace_path: Option<PathBuf>,
@@ -149,6 +180,22 @@ impl AgentSession for OpenCodeSession {
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<TurnOutcome, AgentError> {
         let args = self.run_args(prompt);
+        // Everything but the prompt itself (last arg, and often long): enough to
+        // reproduce a hung/stalled turn's exact invocation by hand outside Symphony
+        // (`opencode <these args> "<the actual prompt>"`) without dumping a
+        // potentially huge prompt into every turn's log at debug level. Its *length*
+        // is logged unconditionally though (never sensitive on its own) -- an
+        // unexpectedly-empty or near-empty prompt is exactly what makes `opencode`
+        // print its own CLI usage/help text and exit 1 with no NDJSON at all (no
+        // `message` positional given), which otherwise looks identical in the log to
+        // any other immediate spawn failure.
+        tracing::debug!(
+            command = %self.command,
+            workspace = %self.workspace.display(),
+            args = ?&args[..args.len().saturating_sub(1)],
+            prompt_len = prompt.len(),
+            "opencode: starting turn"
+        );
 
         // Same container-vs-host branch as `claude.rs::ClaudeSession::run_turn`: in
         // Docker mode, `docker exec` into the per-ticket container instead of
@@ -157,18 +204,7 @@ impl AgentSession for OpenCodeSession {
         let mut cmd = match (&self.container, &self.container_workspace_path) {
             (Some(container), Some(container_workspace)) => {
                 let mut c = Command::new("docker");
-                c.arg("exec")
-                    .arg("-w")
-                    .arg(container_workspace.to_string_lossy().to_string())
-                    .arg(&container.name)
-                    .arg(&self.command)
-                    .args(&args);
-                // A container doesn't inherit the `docker` client's process env the
-                // way a plain child does, so a restricted session's permission JSON
-                // has to be forwarded explicitly via `-e`.
-                if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
-                    c.arg("-e").arg(format!("{k}={v}"));
-                }
+                c.args(self.docker_exec_args(container_workspace, &container.name, &args));
                 kill_guard = Some(ContainerKillGuard::armed(
                     container.name.clone(),
                     self.command.clone(),
@@ -179,6 +215,9 @@ impl AgentSession for OpenCodeSession {
                 let mut c = Command::new(&self.command);
                 c.args(&args).current_dir(&self.workspace);
                 if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
+                    c.env(k, v);
+                }
+                if let Some((k, v)) = &self.mcp_config_env {
                     c.env(k, v);
                 }
                 c
@@ -238,6 +277,14 @@ impl AgentSession for OpenCodeSession {
             if line.trim().is_empty() {
                 continue;
             }
+            // `handle_message` only ever surfaces a bare `type` string for anything
+            // it doesn't specifically recognize (`other_message`/`tool` with no
+            // name) -- the full raw line is the only way to actually see what an
+            // unrecognized event carried (a tool's arguments, a nested error, an id
+            // to correlate against). Opt-in (debug) since a chatty turn can be many
+            // lines; `RUST_LOG=debug` (or `RUST_LOG=symphony::agent::opencode=debug`)
+            // turns this on when diagnosing a stalled/hung turn after the fact.
+            tracing::debug!(target: "opencode_ndjson", "{line}");
             match serde_json::from_str::<Value>(&line) {
                 Ok(v) => {
                     if let Some(o) = self.handle_message(&v, &events) {
@@ -304,6 +351,45 @@ impl OpenCodeSession {
         // `claude.rs`'s `-p <prompt>` handling -- no injection surface from prompt
         // content containing shell metacharacters.
         args.push(prompt.to_string());
+        args
+    }
+
+    /// The full `docker exec` argv (everything after `docker`) for one Docker-mode
+    /// turn. Extracted from `run_turn` so tests can assert flag ordering without
+    /// spawning a process -- this is the exact ordering that matters: `docker exec
+    /// [OPTIONS] CONTAINER COMMAND [ARG...]` treats anything after CONTAINER as the
+    /// command and its own arguments, not a docker option. A real regression put
+    /// `-e` *after* `.arg(&container.name).arg(&self.command).args(&args)`, which
+    /// silently handed `-e OPENCODE_CONFIG_CONTENT=...` to `opencode` itself instead
+    /// of to `docker exec`; `opencode run` has no `-e` flag, so its yargs parser
+    /// rejected it and dumped its own usage/help text with exit 1 and zero NDJSON --
+    /// hit live once ticket dispatch started wiring `OPENCODE_CONFIG_CONTENT` through
+    /// this path (see `mcp_config_env`).
+    fn docker_exec_args(
+        &self,
+        container_workspace: &Path,
+        container_name: &str,
+        run_args: &[String],
+    ) -> Vec<String> {
+        let mut args = vec![
+            "exec".to_string(),
+            "-w".to_string(),
+            container_workspace.to_string_lossy().to_string(),
+        ];
+        // A container doesn't inherit the `docker` client's process env the way a
+        // plain child does, so a restricted session's permission JSON has to be
+        // forwarded explicitly via `-e`.
+        if let Some((k, v)) = permission_env(self.permission_config.as_deref()) {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        if let Some((k, v)) = &self.mcp_config_env {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(container_name.to_string());
+        args.push(self.command.clone());
+        args.extend_from_slice(run_args);
         args
     }
 
@@ -442,6 +528,63 @@ fn permission_env(config: Option<&str>) -> Option<(String, String)> {
     config.map(|c| ("OPENCODE_PERMISSION".to_string(), c.to_string()))
 }
 
+/// The `OPENCODE_CONFIG_CONTENT` env `(key, value)` pair wiring Section 10.5's
+/// provider-native tools (`open_pull_request`, `update_issue_state`) into an
+/// `opencode` session, mirroring `claude.rs::write_mcp_config` -- same
+/// `symphony __mcp_tool_server` subprocess, same args, same in-container path
+/// substitution (Docker mode runs `opencode` inside the container, so the `command`
+/// and `--workflow-dir` value must be in-container paths, not host ones) -- but
+/// delivered as inline config content via an env var rather than a file `--mcp-config`
+/// points at: `opencode` has no `claude`-equivalent per-invocation config flag, only
+/// config-file discovery, and `OPENCODE_CONFIG_CONTENT` is its own env-var escape
+/// hatch for exactly this (confirmed against opencode's docs: config layers deep-merge
+/// rather than replace each other, so this never disturbs the separately-baked-in
+/// Fireworks provider block in the image's own `opencode.json`).
+fn mcp_config_env(
+    wiring: &McpToolWiring,
+    issue_id: &str,
+    container: Option<&ContainerHandle>,
+) -> (String, String) {
+    let (command, workflow_dir_arg) = match container {
+        Some(c) => (
+            container::CONTAINER_SYMPHONY_BIN.to_string(),
+            c.container_root.to_string_lossy().to_string(),
+        ),
+        None => (
+            std::env::current_exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "symphony".to_string()),
+            wiring.workflow_dir.to_string_lossy().to_string(),
+        ),
+    };
+    let mut argv = vec![
+        command,
+        "__mcp_tool_server".to_string(),
+        "--tracker-kind".to_string(),
+        wiring.tracker_kind.clone(),
+        "--tracker-provider".to_string(),
+        wiring.tracker_provider_json.clone(),
+        "--workflow-dir".to_string(),
+        workflow_dir_arg,
+        "--issue-id".to_string(),
+        issue_id.to_string(),
+    ];
+    if let Some(repo_pr_json) = &wiring.repo_pr_json {
+        argv.push("--repo-pr".to_string());
+        argv.push(repo_pr_json.clone());
+    }
+    let config = json!({
+        "mcp": {
+            "symphony": {
+                "type": "local",
+                "command": argv,
+                "enabled": true
+            }
+        }
+    });
+    ("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string())
+}
+
 /// Extract token usage leniently, searching arbitrarily deep (unlike
 /// `shallow_find_str`) since usage blocks are commonly nested a variable number of
 /// levels deep in practice -- same approach and same reasoning as
@@ -560,6 +703,7 @@ mod tests {
             auto_approve: true,
             turn_timeout_ms: 1_000,
             permission_config: None,
+            mcp_config_env: None,
             workspace: PathBuf::from("."),
             container: None,
             container_workspace_path: None,
@@ -598,6 +742,122 @@ mod tests {
         session.auto_approve = false;
         let args = session.run_args("just the prompt");
         assert_eq!(args, vec!["run", "--format", "json", "just the prompt"]);
+    }
+
+    /// Regression test for a real bug found running this live: `-e` flags built for
+    /// `mcp_config_env`/`permission_env` were being appended *after* the container
+    /// name and command, so `docker exec` handed them to `opencode` itself instead
+    /// of consuming them as its own options -- `opencode run` has no `-e` flag, so
+    /// it rejected the extra argument and dumped its own usage text with exit 1 and
+    /// zero NDJSON, wasting a real ticket-dispatch turn. Every `-e` must land before
+    /// the container name.
+    #[test]
+    fn docker_exec_args_puts_env_flags_before_the_container_name() {
+        let mut session = new_session();
+        session.mcp_config_env = Some(("OPENCODE_CONFIG_CONTENT".to_string(), "{}".to_string()));
+        let run_args = session.run_args("do the thing");
+        let args = session.docker_exec_args(Path::new("/project"), "my-container", &run_args);
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "-w",
+                "/project",
+                "-e",
+                "OPENCODE_CONFIG_CONTENT={}",
+                "my-container",
+                "opencode",
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "do the thing",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_exec_args_includes_permission_env_before_the_container_name_too() {
+        let mut session = new_session();
+        session.permission_config = Some(r#"{"edit":"deny"}"#.to_string());
+        let run_args = session.run_args("prompt");
+        let args = session.docker_exec_args(Path::new("/project"), "my-container", &run_args);
+        let container_pos = args.iter().position(|a| a == "my-container").unwrap();
+        let env_pos = args.iter().position(|a| a == "-e").unwrap();
+        assert!(
+            env_pos < container_pos,
+            "-e must come before the container name: {args:?}"
+        );
+    }
+
+    fn test_wiring() -> McpToolWiring {
+        McpToolWiring {
+            tracker_kind: "local".to_string(),
+            tracker_provider_json: r#"{"dir":"issues"}"#.to_string(),
+            workflow_dir: PathBuf::from("/wf"),
+            repo_pr_json: None,
+        }
+    }
+
+    #[test]
+    fn mcp_config_env_wires_the_symphony_tool_server_on_the_host() {
+        let (key, value) = mcp_config_env(&test_wiring(), "42", None);
+        assert_eq!(key, "OPENCODE_CONFIG_CONTENT");
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        // Whatever binary is actually running the test (the test harness executable,
+        // not literally `symphony`) -- just confirm it resolved to *some* real path
+        // via `std::env::current_exe()`, not the "symphony" fallback used only when
+        // that call fails.
+        assert_ne!(argv[0], "symphony");
+        assert_eq!(
+            &argv[1..],
+            &[
+                "__mcp_tool_server",
+                "--tracker-kind",
+                "local",
+                "--tracker-provider",
+                r#"{"dir":"issues"}"#,
+                "--workflow-dir",
+                "/wf",
+                "--issue-id",
+                "42"
+            ]
+        );
+        assert_eq!(parsed["mcp"]["symphony"]["type"], "local");
+        assert_eq!(parsed["mcp"]["symphony"]["enabled"], true);
+    }
+
+    #[test]
+    fn mcp_config_env_includes_repo_pr_json_when_pull_request_is_enabled() {
+        let mut wiring = test_wiring();
+        wiring.repo_pr_json = Some(r#"{"url":"https://github.com/o/r.git"}"#.to_string());
+        let (_, value) = mcp_config_env(&wiring, "42", None);
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            argv.last(),
+            Some(&r#"{"url":"https://github.com/o/r.git"}"#)
+        );
+        assert_eq!(argv[argv.len() - 2], "--repo-pr");
+    }
+
+    #[test]
+    fn mcp_config_env_uses_in_container_paths_when_containerized() {
+        let container = ContainerHandle {
+            name: "symphony-abc-42".to_string(),
+            container_root: PathBuf::from("/project"),
+        };
+        let (_, value) = mcp_config_env(&test_wiring(), "42", Some(&container));
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        // In-container symphony binary and workflow-dir, not host paths.
+        assert_eq!(argv[0], container::CONTAINER_SYMPHONY_BIN);
+        let workflow_dir_idx = argv.iter().position(|a| *a == "--workflow-dir").unwrap() + 1;
+        assert_eq!(argv[workflow_dir_idx], "/project");
     }
 
     #[test]
