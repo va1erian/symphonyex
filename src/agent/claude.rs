@@ -126,6 +126,16 @@ fn write_mcp_config(
             wiring.workflow_dir.to_string_lossy().to_string(),
         ),
     };
+    // Same container-aware mapping as `workflow_dir_arg` above: the subprocess must see
+    // this path exactly as its own filesystem does, which is the in-container path when
+    // `claude` itself runs inside a container, and the host path otherwise.
+    let workspace_dir_arg = match container {
+        Some(c) => c
+            .to_container_path(&wiring.workflow_dir, workspace)
+            .to_string_lossy()
+            .to_string(),
+        None => workspace.to_string_lossy().to_string(),
+    };
     let mut args = vec![
         "__mcp_tool_server".to_string(),
         "--tracker-kind".to_string(),
@@ -136,6 +146,8 @@ fn write_mcp_config(
         workflow_dir_arg,
         "--issue-id".to_string(),
         issue_id.to_string(),
+        "--workspace-dir".to_string(),
+        workspace_dir_arg,
     ];
     if let Some(repo_pr_json) = &wiring.repo_pr_json {
         args.push("--repo-pr".to_string());

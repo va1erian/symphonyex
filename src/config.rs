@@ -46,6 +46,11 @@ pub enum ConfigError {
     #[error("invalid_config: repo.pull_request requires repo.token to be set")]
     PullRequestRequiresRepoToken,
     #[error(
+        "invalid_config: repo.evidence requires repo.pull_request to be true -- evidence is \
+         attached to a pull/merge request Symphony itself opens, so there has to be one"
+    )]
+    EvidenceRequiresPullRequest,
+    #[error(
         "invalid_config: swebot.enabled with repo.provider: github (the default) requires repo.url to be a github.com URL (owner/name)"
     )]
     SwebotRequiresGithubRepo,
@@ -236,6 +241,16 @@ pub struct RepoConfig {
     /// it's a real behavior change a project opts into deliberately, same posture as
     /// `workspace.docker.mount_claude_credentials`.
     pub pull_request: bool,
+    /// Opt-in: expose the `attach_evidence` agent tool (`src/repo_host/mod.rs`), which
+    /// uploads a screenshot (or other image) the agent already produced in its
+    /// workspace to this repo and hands back a markdown image snippet the agent can
+    /// paste into the `open_pull_request` body -- letting a reviewer see the working
+    /// app instead of taking the agent's word for it. Requires `pull_request: true`
+    /// (evidence is attached to a PR/MR Symphony itself opens; there's nothing to
+    /// attach it to otherwise). Off by default, same posture as `pull_request` itself:
+    /// this commits a real file to the real repo.
+    #[serde(default)]
+    pub evidence: bool,
 }
 
 /// Which code host `repo.url` points at (`repo.provider`, e.g. `provider: gitlab`).
@@ -562,6 +577,12 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                     return Err(ConfigError::PullRequestRequiresRepoToken);
                 }
             }
+            let evidence = get(r, "evidence")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if evidence && !pull_request {
+                return Err(ConfigError::EvidenceRequiresPullRequest);
+            }
             Ok(RepoConfig {
                 url,
                 provider,
@@ -569,6 +590,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 default_branch,
                 token_env,
                 pull_request,
+                evidence,
             })
         })
         .transpose()?;
@@ -1173,6 +1195,40 @@ mod tests {
             parse_yaml("tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n");
         let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert!(!cfg.repo.unwrap().pull_request);
+    }
+
+    #[test]
+    fn evidence_defaults_to_false() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_EVIDENCE_DEFAULT\n  pull_request: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.repo.unwrap().evidence);
+    }
+
+    #[test]
+    fn evidence_requires_pull_request_to_be_true() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_EVIDENCE_REQUIRES_PR\n  evidence: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::EvidenceRequiresPullRequest)
+        ));
+    }
+
+    #[test]
+    fn evidence_true_with_pull_request_true_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_EVIDENCE_OK\n  pull_request: true\n  evidence: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let repo = cfg.repo.unwrap();
+        assert!(repo.pull_request);
+        assert!(repo.evidence);
     }
 
     #[test]

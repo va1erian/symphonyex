@@ -18,6 +18,7 @@ use crate::repo_host::RepoHost;
 use crate::tracker::{ToolResult, TrackerAdapter};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Route a `tools/call` to whichever of the two independent tool sources actually
@@ -34,11 +35,13 @@ async fn route_call(
     name: &str,
     arguments: Value,
     issue_id: &str,
+    workspace_dir: &Path,
 ) -> ToolResult {
     if tracker_names.contains(name) {
         adapter.execute_agent_tool(name, arguments, issue_id).await
     } else if let Some(host) = repo_host {
-        host.execute_agent_tool(name, arguments, issue_id).await
+        host.execute_agent_tool(name, arguments, issue_id, workspace_dir)
+            .await
     } else {
         ToolResult::error(format!("unsupported tool '{name}'"))
     }
@@ -48,6 +51,7 @@ pub async fn run_stdio_server(
     adapter: Box<dyn TrackerAdapter>,
     repo_host: Option<Box<dyn RepoHost>>,
     issue_id: &str,
+    workspace_dir: &Path,
 ) -> anyhow::Result<()> {
     let tracker_specs = adapter.agent_tool_specs();
     let repo_specs = repo_host
@@ -114,6 +118,7 @@ pub async fn run_stdio_server(
                     name,
                     arguments,
                     issue_id,
+                    workspace_dir,
                 )
                 .await;
                 write_result(
@@ -249,6 +254,7 @@ mod tests {
             "update_issue_state",
             json!({}),
             "1",
+            Path::new("."),
         )
         .await;
         assert!(result.success);
@@ -281,6 +287,7 @@ mod tests {
             "open_pull_request",
             json!({"title": "t", "body": "b"}),
             "1",
+            Path::new("."),
         )
         .await;
         assert!(result.success, "{}", result.content);
@@ -292,7 +299,16 @@ mod tests {
         let specs = tracker.agent_tool_specs();
         let names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
 
-        let result = route_call(&tracker, None, &names, "nonexistent", json!({}), "1").await;
+        let result = route_call(
+            &tracker,
+            None,
+            &names,
+            "nonexistent",
+            json!({}),
+            "1",
+            Path::new("."),
+        )
+        .await;
         assert!(!result.success);
     }
 

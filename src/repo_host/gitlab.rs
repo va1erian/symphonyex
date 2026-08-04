@@ -28,8 +28,10 @@ use crate::config::{RepoConfig, RepoProvider};
 use crate::tracker::{ToolResult, ToolSpec};
 use crate::workspace;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct GitlabRepoHost {
@@ -39,6 +41,9 @@ pub struct GitlabRepoHost {
     project: String,
     token: String,
     default_branch: String,
+    /// `repo.evidence` -- whether `attach_evidence` should be offered alongside
+    /// `open_pull_request` (see `RepoConfig::evidence`'s own doc comment).
+    evidence: bool,
 }
 
 /// GitLab's REST API expects the project path (`group/subgroup/name`) percent-encoded
@@ -126,7 +131,16 @@ impl GitlabRepoHost {
             project: encode_project_path(&project_path),
             token,
             default_branch: repo.default_branch.clone(),
+            evidence: repo.evidence,
         })
+    }
+
+    /// The GitLab *origin* (`scheme://host`), derived from `base_url` (the REST API
+    /// root, always ending in `/api/v4` -- see `GitlabRepoHost::new`) by stripping that
+    /// suffix. Needed only for building a `-/raw/` content URL, which lives under the
+    /// plain web origin, not the API root.
+    fn origin(&self) -> &str {
+        self.base_url.trim_end_matches("/api/v4")
     }
 
     fn auth_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -204,6 +218,79 @@ impl GitlabRepoHost {
         }
     }
 
+    /// GitLab counterpart of `github::GithubRepoHost::attach_evidence` -- same
+    /// content-hashed repo path (so a plain create always succeeds, no existing-blob
+    /// `sha`/lock-token juggling), same markdown-snippet return shape, but via GitLab's
+    /// Repository Files API (`POST .../repository/files/:file_path`, `encoding: base64`)
+    /// and a `-/raw/<branch>/<path>` URL under the plain web origin instead of a
+    /// separate raw-content host.
+    async fn attach_evidence(
+        &self,
+        workspace_dir: &Path,
+        image_path: &str,
+        caption: &str,
+        issue_id: &str,
+    ) -> ToolResult {
+        let full_path = workspace_dir.join(image_path);
+        let bytes = match tokio::fs::read(&full_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                return ToolResult::error(format!(
+                    "could not read image at '{image_path}' (resolved to {}): {e}",
+                    full_path.display()
+                ));
+            }
+        };
+        let file_name = Path::new(image_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("evidence.png");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        let short_hash = digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let branch = format!("issue-{}", workspace::derive_workspace_key(issue_id));
+        let repo_path = format!(
+            ".symphony/evidence/{}/{short_hash}-{file_name}",
+            workspace::derive_workspace_key(issue_id)
+        );
+        let url = format!(
+            "{}/projects/{}/repository/files/{}",
+            self.base_url,
+            self.project,
+            encode_project_path(&repo_path)
+        );
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let req = self.client.post(&url).json(&json!({
+            "branch": branch,
+            "content": content_b64,
+            "encoding": "base64",
+            "commit_message": format!("Attach evidence: {caption}"),
+        }));
+        match self.auth_headers(req).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let raw_url = format!(
+                    "{}/{}/-/raw/{branch}/{repo_path}",
+                    self.origin(),
+                    self.project.replace("%2F", "/")
+                );
+                ToolResult::ok(format!(
+                    "Evidence uploaded. Paste this into the merge request body to embed it:\n\n![{caption}]({raw_url})"
+                ))
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                ToolResult::error(format!(
+                    "POST {url} -> {status}: {text} (has this branch been pushed yet?)"
+                ))
+            }
+            Err(e) => ToolResult::error(e.to_string()),
+        }
+    }
+
     /// Same marker convention `github::GithubRepoHost::review_marker` uses -- scanned
     /// here over MR Notes (GitLab has no separate "reviews" resource the way GitHub
     /// does, so Notes is the only place to look).
@@ -244,7 +331,7 @@ impl RepoHost for GitlabRepoHost {
     }
 
     fn agent_tool_specs(&self) -> Vec<ToolSpec> {
-        vec![ToolSpec {
+        let mut specs = vec![ToolSpec {
             name: "open_pull_request".to_string(),
             description: "Open (or update, if one already exists) a merge request for \
                 this ticket's branch, with a title and a body describing the work and \
@@ -271,7 +358,36 @@ impl RepoHost for GitlabRepoHost {
                 },
                 "required": ["title", "body"]
             }),
-        }]
+        }];
+        if self.evidence {
+            specs.push(ToolSpec {
+                name: "attach_evidence".to_string(),
+                description: "Upload an image file you already saved somewhere inside this \
+                    workspace (e.g. a screenshot of the app running, taken with a headless \
+                    browser) to this merge request's branch, and get back a markdown image \
+                    snippet. Paste that snippet into the merge request body \
+                    (open_pull_request's 'body' argument) so a reviewer can see the \
+                    evidence directly instead of taking your word for it. Call this before \
+                    open_pull_request so the snippet is ready to include; calling \
+                    open_pull_request again afterwards with an updated body works too."
+                    .to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "image_path": {
+                            "type": "string",
+                            "description": "Path to the image file, relative to this workspace's root"
+                        },
+                        "caption": {
+                            "type": "string",
+                            "description": "Short caption describing what the image shows"
+                        }
+                    },
+                    "required": ["image_path", "caption"]
+                }),
+            });
+        }
+        specs
     }
 
     async fn execute_agent_tool(
@@ -279,22 +395,35 @@ impl RepoHost for GitlabRepoHost {
         name: &str,
         arguments: serde_json::Value,
         issue_id: &str,
+        workspace_dir: &Path,
     ) -> ToolResult {
-        if name != "open_pull_request" {
-            return ToolResult::error(format!("unsupported tool '{name}'"));
-        }
-        let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'title'");
-        };
-        let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
-            return ToolResult::error("missing required argument 'body'");
-        };
-        let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
+        match name {
+            "open_pull_request" => {
+                let Some(title) = arguments.get("title").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'title'");
+                };
+                let Some(body) = arguments.get("body").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'body'");
+                };
+                let head = format!("issue-{}", workspace::derive_workspace_key(issue_id));
 
-        match self.find_open_mr(&head).await {
-            Ok(Some(iid)) => self.update_mr(iid, title, body).await,
-            Ok(None) => self.create_mr(&head, title, body).await,
-            Err(e) => ToolResult::error(e),
+                match self.find_open_mr(&head).await {
+                    Ok(Some(iid)) => self.update_mr(iid, title, body).await,
+                    Ok(None) => self.create_mr(&head, title, body).await,
+                    Err(e) => ToolResult::error(e),
+                }
+            }
+            "attach_evidence" if self.evidence => {
+                let Some(image_path) = arguments.get("image_path").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'image_path'");
+                };
+                let Some(caption) = arguments.get("caption").and_then(|v| v.as_str()) else {
+                    return ToolResult::error("missing required argument 'caption'");
+                };
+                self.attach_evidence(workspace_dir, image_path, caption, issue_id)
+                    .await
+            }
+            _ => ToolResult::error(format!("unsupported tool '{name}'")),
         }
     }
 
@@ -682,6 +811,7 @@ mod tests {
                 "open_pull_request",
                 json!({"title": "t", "body": "b"}),
                 "42",
+                std::path::Path::new("."),
             )
             .await;
         assert!(result.success, "{}", result.content);
@@ -715,10 +845,68 @@ mod tests {
                 "open_pull_request",
                 json!({"title": "t2", "body": "b2"}),
                 "42",
+                std::path::Path::new("."),
             )
             .await;
         assert!(result.success, "{}", result.content);
         assert!(result.content.contains("Updated"));
+    }
+
+    #[tokio::test]
+    async fn attach_evidence_uploads_the_file_and_returns_a_markdown_image_snippet() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/projects/group%2Fname/repository/files/.*$"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"file_path": "x"})))
+            .mount(&server)
+            .await;
+
+        set_token("SYMPHONY_TEST_GL_EVIDENCE_1", "t");
+        let h = GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/group/name.git".to_string(),
+            api_base_url: Some(server.uri()),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_GL_EVIDENCE_1".to_string()),
+            pull_request: true,
+            evidence: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("screenshot.png"), b"fake-png-bytes").unwrap();
+
+        let result = h
+            .execute_agent_tool(
+                "attach_evidence",
+                json!({"image_path": "screenshot.png", "caption": "App running"}),
+                "42",
+                workspace.path(),
+            )
+            .await;
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("![App running]"));
+        assert!(result.content.contains("/group/name/-/raw/issue-42/"));
+    }
+
+    #[tokio::test]
+    async fn attach_evidence_is_not_offered_when_repo_evidence_is_off() {
+        set_token("SYMPHONY_TEST_GL_EVIDENCE_2", "t");
+        let h = GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/group/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_GL_EVIDENCE_2".to_string()),
+            pull_request: true,
+            evidence: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(
+            !h.agent_tool_specs()
+                .iter()
+                .any(|s| s.name == "attach_evidence")
+        );
     }
 
     #[tokio::test]
@@ -900,6 +1088,6 @@ mod tests {
             .unwrap();
     }
 
-    use wiremock::matchers::{body_string_contains, method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 }
