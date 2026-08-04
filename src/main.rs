@@ -26,8 +26,21 @@ use std::path::PathBuf;
 
 /// Symphony: orchestrates coding agents against a configured issue tracker.
 /// See SPEC.md for the full specification this implements.
+///
+/// `version`: `build.rs` bakes in `<Cargo.toml version> (<branch>@<short-sha>)` when it
+/// runs -- plain `CARGO_PKG_VERSION` alone can't tell two worktrees of this repo on
+/// different branches apart, which is exactly the confusion `--version`/`-V` exists to
+/// resolve. `option_env!` (not `env!`): a build whose context never copies `build.rs`
+/// in the first place (e.g. this repo's own Dockerfile, which only `COPY`s
+/// `Cargo.toml`/`Cargo.lock`/`src` for the in-container `symphony` binary) never runs
+/// any build script at all, so the var is simply never set -- falling back to
+/// `CARGO_PKG_VERSION` (always present, set by Cargo itself, no build script needed)
+/// keeps that a normal build instead of a hard compile error.
 #[derive(Parser)]
-#[command(name = "symphony")]
+#[command(
+    name = "symphony",
+    version = option_env!("SYMPHONY_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+)]
 struct Cli {
     /// Path to WORKFLOW.md. Defaults to ./WORKFLOW.md (Section 5.1).
     workflow_path: Option<PathBuf>,

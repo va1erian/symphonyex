@@ -96,6 +96,12 @@ impl AppState {
 /// There's no "other users on the same host" to guard against inside that namespace;
 /// the container boundary itself is the isolation mechanism, and reachability is
 /// already gated by whether `-p` was passed at all.
+///
+/// `chat`: when set (the SweBot chat UI, `swebot::chat::web::router`), it is nested
+/// under `/chat` beside the dashboard routes. Passed in rather than built here so
+/// callers keep the router-rendering concern in `swebot::chat::web` and this stays
+/// purely "bind what I was handed and serve it."
+///
 /// The dashboard/fragment/events/usage routes on their own, with no bind/serve
 /// attached -- lets a caller that already owns an axum server (`src/service.rs`'s
 /// multi-project web UI) `.nest()` one of these per registered project instead of
@@ -120,13 +126,17 @@ pub fn router(
         .nest("/board", board_router)
 }
 
-pub async fn serve(
+pub async fn serve_composite(
     port: u16,
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
+    chat: Option<Router>,
 ) -> anyhow::Result<()> {
-    let app = router(status_rx, workflow_dir, "");
+    let mut app = router(status_rx, workflow_dir, "");
+    if let Some(chat) = chat {
+        app = app.nest("/chat", chat);
+    }
     let bind_addr = if bind_all_interfaces {
         "0.0.0.0"
     } else {

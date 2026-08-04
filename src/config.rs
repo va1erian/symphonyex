@@ -72,6 +72,14 @@ pub enum ConfigError {
          runs on the host regardless -- so enabling both silently doesn't do what it looks like)"
     )]
     DockerNotSupportedForCodex,
+    #[error(
+        "invalid_config: swebot.chat.enabled requires swebot.enabled -- chat mode is a SweBot capability"
+    )]
+    ChatRequiresSwebot,
+    #[error(
+        "invalid_config: swebot.chat.connectors lists '{0}', which is not a known connector (known: {1})"
+    )]
+    UnknownChatConnector(String, String),
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -272,6 +280,12 @@ impl RepoProvider {
 #[derive(Debug, Clone)]
 pub struct SwebotConfig {
     pub enabled: bool,
+    /// Coding-agent backend SweBot's own sessions use. `None` follows `agent.backend`
+    /// (the same backend ticket dispatch uses); set it to run SweBot on a different
+    /// backend than tickets -- e.g. tickets on `claude`, SweBot on `opencode`
+    /// (Fireworks). `codex` is not supported for SweBot yet and is rejected at
+    /// SweBot startup rather than silently misbehaving (see `swebot::run`).
+    pub backend: Option<AgentBackendKind>,
     /// GitHub: Discussion category name SweBot treats as incoming questions.
     pub qa_discussion_category: String,
     /// GitHub: Discussion category name SweBot treats as ticket ideas to draft.
@@ -305,6 +319,43 @@ pub struct SwebotConfig {
     /// pull request (422 "Can not approve your own pull request"), so if both roles
     /// share one token, SweBot silently can never approve the coding agent's own PRs.
     pub token_env: Option<String>,
+    /// Chat mode: a unified Q&A + ticket-drafting conversation surface for SweBot,
+    /// distinct from the polled GitHub Discussions loop (`qa`/`drafting` above).
+    /// See README.md "SweBot chat mode".
+    pub chat: SwebotChatConfig,
+}
+
+/// Known `swebot.chat.connectors` names. Single source of truth: config validation
+/// rejects unknown names here, and `swebot::chat::connector` builds the registry by
+/// this same list (each name maps to a constructable connector implementation).
+pub const KNOWN_CHAT_CONNECTORS: &[&str] = &["web"];
+
+#[derive(Debug, Clone)]
+pub struct SwebotChatConfig {
+    pub enabled: bool,
+    /// Connectors to activate, by name (`KNOWN_CHAT_CONNECTORS`). `web` is the bundled
+    /// chat UI served by the status dashboard. Future connectors (e.g. `teams`) plug
+    /// in here; see `swebot::chat::connector::ChatConnector` for the contract.
+    pub connectors: Vec<String>,
+    /// How often the chat worker polls for new/pending user messages. Independent of
+    /// `polling.interval_ms` (ticket dispatch's cadence) -- chat is interactive and
+    /// wants a snappier turn-around ("responds in a reasonable time, not instant").
+    pub poll_interval_ms: u64,
+    /// How many pending user messages the worker answers per tick, across all
+    /// conversations. 1-2 is plenty: one reply turn can take tens of seconds.
+    pub max_concurrent_replies: u32,
+    /// When SweBot finishes a draft, create the issue immediately (`true`, recommended
+    /// default) rather than asking the user to confirm by replying "create it".
+    pub auto_create_issue: bool,
+    /// How much of a conversation's history feeds each prompt (newest N messages).
+    /// Bounds prompt size -- the whole transcript is re-sent every turn; chat does not
+    /// use `--resume` continuity (same reasoning as `drafting.rs`).
+    pub max_history_messages: usize,
+    /// Latency budget (ms) for the assistant's *first streaming text* to arrive before
+    /// the worker posts a "still working" notice to the conversation (see `worker.rs`).
+    /// The must-notify rule: a turn that will take longer than this must tell the user
+    /// so immediately rather than leaving them staring at a silent input box.
+    pub first_text_deadline_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +414,12 @@ impl EffectiveConfig {
             AgentBackendKind::Codex => self.codex.stall_timeout_ms,
             AgentBackendKind::OpenCode => self.opencode.stall_timeout_ms,
         }
+    }
+
+    /// The backend SweBot's own sessions run on: `swebot.backend` when set, else the
+    /// same `agent.backend` ticket dispatch uses -- see `SwebotConfig::backend`.
+    pub fn swebot_backend(&self) -> AgentBackendKind {
+        self.swebot.backend.unwrap_or(self.agent_backend)
     }
 
     /// Per-state concurrency limit, falling back to the global limit (Section 8.3).
@@ -520,6 +577,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     let swebot_drafting = get(swebot_raw, "drafting").unwrap_or(&empty);
     let swebot_review = get(swebot_raw, "review").unwrap_or(&empty);
     let swebot_board = get(swebot_raw, "board").unwrap_or(&empty);
+    let swebot_chat = get(swebot_raw, "chat").unwrap_or(&empty);
     let swebot_token_env = get_str(swebot_raw, "token")
         .map(|t| {
             envsub::var_name_of(&t)
@@ -527,8 +585,27 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 .ok_or(ConfigError::InvalidSwebotToken)
         })
         .transpose()?;
+    let chat_connectors = get_vec_str(swebot_chat, "connectors");
+    let swebot_chat_cfg = SwebotChatConfig {
+        enabled: get(swebot_chat, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        connectors: if chat_connectors.is_empty() {
+            vec!["web".to_string()]
+        } else {
+            chat_connectors
+        },
+        poll_interval_ms: get_u64(swebot_chat, "poll_interval_ms", 5_000).max(100),
+        max_concurrent_replies: get_u64(swebot_chat, "max_concurrent_replies", 2).max(1) as u32,
+        auto_create_issue: get(swebot_chat, "auto_create_issue")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        max_history_messages: get_u64(swebot_chat, "max_history_messages", 40).max(1) as usize,
+        first_text_deadline_ms: get_u64(swebot_chat, "first_text_deadline_ms", 5_000),
+    };
     let swebot_cfg = SwebotConfig {
         enabled: swebot_enabled,
+        backend: get_str(swebot_raw, "backend").map(|s| AgentBackendKind::parse(&s)),
         qa_discussion_category: get_str(swebot_qa, "discussion_category")
             .unwrap_or_else(|| "Q&A".to_string()),
         drafting_discussion_category: get_str(swebot_drafting, "discussion_category")
@@ -543,7 +620,21 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .and_then(|v| v.as_bool())
             .unwrap_or(swebot_enabled),
         token_env: swebot_token_env,
+        chat: swebot_chat_cfg,
     };
+    if swebot_cfg.chat.enabled {
+        if !swebot_enabled {
+            return Err(ConfigError::ChatRequiresSwebot);
+        }
+        for name in &swebot_cfg.chat.connectors {
+            if !KNOWN_CHAT_CONNECTORS.contains(&name.as_str()) {
+                return Err(ConfigError::UnknownChatConnector(
+                    name.clone(),
+                    KNOWN_CHAT_CONNECTORS.join(", "),
+                ));
+            }
+        }
+    }
     if swebot_cfg.enabled {
         let repo = repo_cfg
             .as_ref()
@@ -1229,6 +1320,84 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::InvalidSwebotToken)
         ));
+    }
+
+    #[test]
+    fn chat_disabled_by_default_and_needs_no_connectors() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_8\nswebot:\n  enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.swebot.chat.enabled);
+    }
+
+    #[test]
+    fn chat_enabled_requires_swebot_enabled() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_9\nswebot:\n  chat:\n    enabled: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::ChatRequiresSwebot)
+        ));
+    }
+
+    #[test]
+    fn chat_resolves_defaults_and_overrides() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_10\nswebot:\n  enabled: true\n  \
+             chat:\n    enabled: true\n    connectors: [web]\n    poll_interval_ms: 1500\n    \
+             max_concurrent_replies: 3\n    auto_create_issue: false\n    max_history_messages: 10\n    \
+             first_text_deadline_ms: 2500\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let chat = &cfg.swebot.chat;
+        assert!(chat.enabled);
+        assert_eq!(chat.connectors, vec!["web".to_string()]);
+        assert_eq!(chat.poll_interval_ms, 1500);
+        assert_eq!(chat.max_concurrent_replies, 3);
+        assert!(!chat.auto_create_issue);
+        assert_eq!(chat.max_history_messages, 10);
+        assert_eq!(chat.first_text_deadline_ms, 2500);
+    }
+
+    #[test]
+    fn chat_connectors_default_to_web_when_unset() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_11\nswebot:\n  enabled: true\n  \
+             chat:\n    enabled: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.swebot.chat.connectors, vec!["web".to_string()]);
+    }
+
+    #[test]
+    fn chat_rejects_an_unknown_connector() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_12\nswebot:\n  enabled: true\n  \
+             chat:\n    enabled: true\n    connectors: [slack]\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::UnknownChatConnector(_, _))
+        ));
+    }
+
+    #[test]
+    fn chat_bounds_eager_settings() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_SWEBOT_TOKEN_13\nswebot:\n  enabled: true\n  \
+             chat:\n    enabled: true\n    poll_interval_ms: 0\n    max_concurrent_replies: 0\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.swebot.chat.poll_interval_ms, 100);
+        assert_eq!(cfg.swebot.chat.max_concurrent_replies, 1);
     }
 
     #[test]

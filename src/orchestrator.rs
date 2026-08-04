@@ -208,6 +208,7 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             extra_args: cfg.opencode.args.clone(),
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
+            permission_config: None,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
     };
@@ -316,6 +317,11 @@ pub struct ProjectHandles {
     /// `EffectiveConfig::workflow_dir` -- `status::router` derives both the
     /// eventlog and bulletin-board db paths from this itself.
     pub workflow_dir: PathBuf,
+    /// Present when `swebot.chat.enabled` -- chat mode's store+worker. The
+    /// multi-project service nests the web chat UI under `/projects/<id>/chat` only
+    /// when `web_enabled` is set (the single-project status server serves it at
+    /// `/chat` on the same condition).
+    pub chat: Option<crate::swebot::chat::ChatHandles>,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -399,20 +405,33 @@ async fn run_inner(
 
     let (status_tx, status_rx) = tokio::sync::watch::channel(status::StatusSnapshot::default());
     let workflow_dir = shared.config.workflow_dir.clone();
+
+    // Chat mode runs its worker headlessly even without --port (only the web UI's
+    // HTTP surface is gated on a port).
+    let chat = crate::swebot::chat::start(shared.config.clone(), shared.tracker.clone());
+
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
-        // with the port published (see status::serve's doc comment for why).
+        // with the port published (see status::serve_composite's doc comment for why).
         let bind_all_interfaces =
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         let status_rx_for_serve = status_rx.clone();
         let workflow_dir_for_serve = workflow_dir.clone();
+        // Composite dashboard: the status router at the root (which itself mounts the
+        // board under /board), chat's UI nested under /chat -- only when the web
+        // connector is enabled.
+        let chat_router = chat
+            .as_ref()
+            .filter(|handles| handles.web_enabled)
+            .map(|handles| crate::swebot::chat::web::router(handles.store.clone(), "/chat"));
         tokio::spawn(async move {
-            if let Err(e) = status::serve(
+            if let Err(e) = status::serve_composite(
                 port,
                 bind_all_interfaces,
                 status_rx_for_serve,
                 workflow_dir_for_serve,
+                chat_router,
             )
             .await
             {
@@ -424,6 +443,7 @@ async fn run_inner(
         let _ = handles_tx.send(ProjectHandles {
             status_rx: status_rx.clone(),
             workflow_dir: workflow_dir.clone(),
+            chat,
         });
     }
 

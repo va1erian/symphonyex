@@ -9,19 +9,29 @@
 //! daemon's existing container/volume/restart lifecycle -- not a second daemon to
 //! deploy and keep alive.
 //!
-//! All three capabilities are read-only with respect to the repo's own code: SweBot's
-//! sessions run with `Edit`/`Write`/`NotebookEdit` disallowed (see `restricted_backend`)
-//! -- it answers, drafts, and reviews, but it never edits the repo directly. That
-//! stays the coding agent's job, gated by the normal ticket-dispatch flow.
+//! All capabilities are read-only with respect to the repo's own code: SweBot's
+//! sessions run with file-mutating tools disallowed (see `build_restricted_backend` --
+//! `--disallowedTools` for the `claude` backend, an `{"edit":"deny"}` permission
+//! config for `opencode`) -- it answers, drafts, and reviews, but it never edits the
+//! repo directly. That stays the coding agent's job, gated by the normal ticket-dispatch
+//! flow. The backend SweBot runs on is `swebot.backend` when set, else `agent.backend`;
+//! `codex` is unsupported and refused rather than run unrestricted.
+//!
+//! Chat mode (`chat`) adds a unified Q&A + ticket-drafting conversation surface and
+//! browser chat UI; when it's enabled for a GitHub repo it owns that repo's
+//! Discussions (and the standalone `qa`/`drafting` loops below skip GitHub -- see
+//! `run`), while GitLab and the bulletin-board surface keep the standalone loops.
 
+pub mod chat;
 pub mod drafting;
 mod git;
 pub mod qa;
 pub mod review;
 
 use crate::agent::claude::ClaudeBackend;
-use crate::agent::{AgentEvent, AgentSession, TurnOutcome};
-use crate::config::{EffectiveConfig, RepoProvider};
+use crate::agent::opencode::OpenCodeBackend;
+use crate::agent::{AgentBackend, AgentEvent, AgentSession, TurnOutcome};
+use crate::config::{AgentBackendKind, EffectiveConfig, RepoProvider};
 use crate::repo_host::{self, DiscussionHost, DiscussionThread, RepoHost};
 use crate::tracker::TrackerAdapter;
 use async_trait::async_trait;
@@ -167,26 +177,59 @@ answering, drafting, or approving something is a real signal, not a formality.";
 
 const DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
 
-/// A `ClaudeBackend` configured the same way ticket dispatch's is (same command,
-/// model, timeout) but with file-mutating tools explicitly disallowed and no MCP
-/// tool wiring -- SweBot's drivers parse each turn's text/JSON response themselves
-/// and act via `RepoHost`/`TrackerAdapter` directly, rather than routing
-/// through an agent-invoked tool call the way ticket dispatch's `update_issue_state`
-/// does (that plumbing exists for a long tool-using coding session; SweBot's turns
-/// are single-shot conversational exchanges, so parsing the final response is enough).
-fn restricted_backend(cfg: &EffectiveConfig) -> ClaudeBackend {
-    let mut extra_args = cfg.claude.args.clone();
-    extra_args.push("--disallowedTools".to_string());
-    extra_args.push(DISALLOWED_TOOLS.to_string());
-    ClaudeBackend {
-        command: cfg.claude.command.clone(),
-        extra_args,
-        model: cfg.claude.model.clone(),
-        permission_mode: cfg.claude.permission_mode.clone(),
-        turn_timeout_ms: cfg.claude.turn_timeout_ms,
-        mcp_wiring: None,
-        workflow_dir: cfg.workflow_dir.clone(),
-    }
+/// opencode `permission` config for a restricted session, passed as
+/// `OPENCODE_PERMISSION` (see `agent::opencode::OpenCodeBackend::permission_config`):
+/// denies `edit`, the umbrella permission covering `edit`/`write`/`patch` -- the
+/// opencode-native equivalent of `Edit,Write,NotebookEdit` above. `opencode run
+/// --auto` approves everything *not* explicitly denied, so Bash/Read stay free:
+/// SweBot still needs them to explore the repo and run tests during review.
+const DISALLOWED_OPENCODE_PERMISSION: &str = r#"{"edit":"deny"}"#;
+
+/// A restricted `AgentBackend` for SweBot's sessions, built from whichever backend
+/// `cfg.swebot_backend()` resolves to (`swebot.backend` override, else `agent.backend`)
+/// -- same command/model/timeout as ticket dispatch but with file-mutating tools
+/// disallowed and no MCP tool wiring. SweBot's drivers parse each turn's text/JSON
+/// response themselves and act via `RepoHost`/`TrackerAdapter` directly, rather
+/// than routing through an agent-invoked tool call the way ticket dispatch's
+/// `update_issue_state` does (that plumbing exists for a long tool-using coding
+/// session; SweBot's turns are single-shot conversational exchanges, so parsing the
+/// final response is enough).
+///
+/// Returns `None` for `codex`, which SweBot doesn't support yet -- `swebot::run`
+/// refuses to start rather than silently running an unrestricted skeleton.
+fn build_restricted_backend(cfg: &EffectiveConfig) -> Option<Box<dyn AgentBackend>> {
+    Some(match cfg.swebot_backend() {
+        AgentBackendKind::Claude => {
+            let mut extra_args = cfg.claude.args.clone();
+            extra_args.push("--disallowedTools".to_string());
+            extra_args.push(DISALLOWED_TOOLS.to_string());
+            Box::new(ClaudeBackend {
+                command: cfg.claude.command.clone(),
+                extra_args,
+                model: cfg.claude.model.clone(),
+                permission_mode: cfg.claude.permission_mode.clone(),
+                turn_timeout_ms: cfg.claude.turn_timeout_ms,
+                mcp_wiring: None,
+                workflow_dir: cfg.workflow_dir.clone(),
+            })
+        }
+        AgentBackendKind::OpenCode => Box::new(OpenCodeBackend {
+            command: cfg.opencode.command.clone(),
+            model: cfg.opencode.model.clone(),
+            extra_args: cfg.opencode.args.clone(),
+            auto_approve: cfg.opencode.auto_approve,
+            turn_timeout_ms: cfg.opencode.turn_timeout_ms,
+            permission_config: Some(DISALLOWED_OPENCODE_PERMISSION.to_string()),
+            workflow_dir: cfg.workflow_dir.clone(),
+        }),
+        AgentBackendKind::Codex => {
+            tracing::error!(
+                "swebot is not supported with the codex backend yet -- set agent.backend \
+                 or swebot.backend to claude or opencode; SweBot will not start"
+            );
+            return None;
+        }
+    })
 }
 
 /// Run one turn to completion and return its final text response -- SweBot's drivers
@@ -244,15 +287,15 @@ fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
 
 /// Entry point spawned by `orchestrator::run` when `cfg.swebot.enabled`. Loops
 /// forever at the same cadence as ticket dispatch (`polling.interval_ms`); each
-/// capability's own poll failure is logged and doesn't stop the other two or the
-/// next cycle.
+/// capability's own poll failure is logged and doesn't stop the others or the next
+/// cycle.
 pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
-    // SweBot posts (Q&A, drafting, review) authenticate as `swebot.token` when set --
-    // a separate GitHub identity from `repo.token` (the coding agent's own, used for
-    // branch pushes and `open_pull_request`). Falls back to `repo.token` when
-    // `swebot.token` isn't configured, matching the old single-identity behavior. See
-    // `config::EffectiveConfig::swebot_repo_config`'s doc comment for why this split
-    // exists: GitHub rejects a PR review from the same account that authored the PR.
+    // SweBot posts (review) authenticate as `swebot.token` when set -- a separate
+    // GitHub identity from `repo.token` (the coding agent's own, used for branch
+    // pushes and `open_pull_request`). Falls back to `repo.token` when `swebot.token`
+    // isn't configured. See `config::EffectiveConfig::swebot_repo_config`'s doc
+    // comment for why this split exists: GitHub rejects a PR review from the same
+    // account that authored the PR.
     let Some(swebot_repo) = cfg.swebot_repo_config() else {
         tracing::error!(
             "swebot.enabled but no repo: block resolved -- config::resolve should have \
@@ -295,40 +338,55 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
         };
         (ConversationHost::Repo(host.clone()), qa, drafting)
     };
-    let backend = restricted_backend(&cfg);
+    let Some(backend) = build_restricted_backend(&cfg) else {
+        return;
+    };
     let shared_clone_dir = cfg.workspace_root.join(".swebot-shared-clone");
+
+    // Ownership split for GitHub Discussions: when chat mode's web surface is enabled
+    // (`swebot.chat.enabled`), its GitHub connector owns that repo's Discussions, so
+    // the standalone qa/drafting loops below skip GitHub to avoid double-answering.
+    // GitLab and the bulletin-board surface are never owned by chat, so they keep the
+    // standalone loops. Review always runs here regardless.
+    let chat_owns_discussions = cfg.swebot.chat.enabled
+        && !cfg.swebot.board_enabled
+        && matches!(swebot_repo.provider, RepoProvider::Github);
+    let run_standalone_qa_drafting = !chat_owns_discussions;
     let interval = Duration::from_millis(cfg.poll_interval_ms);
 
     tracing::info!("swebot starting");
     loop {
-        if let Err(e) = git::ensure_shared_clone(&swebot_repo, &shared_clone_dir).await {
-            tracing::warn!(error = %e, "swebot: failed to refresh shared clone; Q&A/drafting will retry next cycle");
-        } else {
-            if let Err(e) = qa::poll_once(
-                &conversation_host,
-                &qa_selector,
-                &backend,
-                &shared_clone_dir,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "swebot: Q&A poll failed");
-            }
-            if let Err(e) = drafting::poll_once(
-                &cfg,
-                &conversation_host,
-                &drafting_selector,
-                &backend,
-                &shared_clone_dir,
-                tracker.as_ref(),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "swebot: drafting poll failed");
+        if run_standalone_qa_drafting {
+            if let Err(e) = git::ensure_shared_clone(&swebot_repo, &shared_clone_dir).await {
+                tracing::warn!(error = %e, "swebot: failed to refresh shared clone; Q&A/drafting will retry next cycle");
+            } else {
+                if let Err(e) = qa::poll_once(
+                    &conversation_host,
+                    &qa_selector,
+                    backend.as_ref(),
+                    &shared_clone_dir,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "swebot: Q&A poll failed");
+                }
+                if let Err(e) = drafting::poll_once(
+                    &cfg,
+                    &conversation_host,
+                    &drafting_selector,
+                    backend.as_ref(),
+                    &shared_clone_dir,
+                    tracker.as_ref(),
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "swebot: drafting poll failed");
+                }
             }
         }
         if cfg.swebot.review_enabled
-            && let Err(e) = review::poll_once(&cfg, host.as_ref(), &backend, tracker.as_ref()).await
+            && let Err(e) =
+                review::poll_once(&cfg, host.as_ref(), backend.as_ref(), tracker.as_ref()).await
         {
             tracing::warn!(error = %e, "swebot: review poll failed");
         }
@@ -413,6 +471,72 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    fn backend_test_cfg(yaml_extra: &str) -> EffectiveConfig {
+        unsafe {
+            std::env::set_var("SYMPHONY_TEST_BACKEND_TOKEN", "t");
+        }
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/owner/name.git\n  \
+             token: $SYMPHONY_TEST_BACKEND_TOKEN\nswebot:\n  enabled: true\n{yaml_extra}"
+        ))
+        .unwrap();
+        crate::config::resolve(&yaml, std::path::Path::new(".")).unwrap()
+    }
+
+    /// The default (no `swebot.backend`) resolves to the global `agent.backend` value.
+    #[test]
+    fn swebot_backend_defaults_to_agent_backend() {
+        let cfg = backend_test_cfg("");
+        assert_eq!(cfg.swebot_backend(), AgentBackendKind::Claude);
+    }
+
+    #[test]
+    fn swebot_backend_override_wins_over_agent_backend() {
+        let cfg = backend_test_cfg("  backend: opencode\n");
+        assert_eq!(cfg.swebot_backend(), AgentBackendKind::OpenCode);
+    }
+
+    #[test]
+    fn swebot_backend_override_parses_unknown_values_as_claude_like_agent_backend() {
+        let cfg = backend_test_cfg("  backend: not-a-real-backend\n");
+        assert_eq!(cfg.swebot_backend(), AgentBackendKind::Claude);
+    }
+
+    #[test]
+    fn restricted_backend_defaults_to_claude_with_edits_disallowed() {
+        let cfg = backend_test_cfg("");
+        let backend = build_restricted_backend(&cfg).unwrap();
+        let cb = backend
+            .as_any()
+            .and_then(|a| a.downcast_ref::<ClaudeBackend>())
+            .expect("default should build a ClaudeBackend");
+        let joined = cb.extra_args.join(" ");
+        assert!(joined.contains("--disallowedTools"));
+        assert!(joined.contains("Edit,Write,NotebookEdit"));
+        assert!(cb.mcp_wiring.is_none());
+    }
+
+    #[test]
+    fn restricted_backend_opencode_overrides_deny_edits_via_permission_config() {
+        let cfg = backend_test_cfg("  backend: opencode\n");
+        let backend = build_restricted_backend(&cfg).unwrap();
+        let oc = backend
+            .as_any()
+            .and_then(|a| a.downcast_ref::<OpenCodeBackend>())
+            .expect("swebot.backend: opencode should build an OpenCodeBackend");
+        assert_eq!(
+            oc.permission_config.as_deref(),
+            Some(DISALLOWED_OPENCODE_PERMISSION)
+        );
+    }
+
+    #[test]
+    fn restricted_backend_codex_is_not_supported() {
+        let cfg = backend_test_cfg("  backend: codex\n");
+        assert_eq!(cfg.swebot_backend(), AgentBackendKind::Codex);
+        assert!(build_restricted_backend(&cfg).is_none());
+    }
+
     fn comment(database_id: u64, body: &str, author: &str) -> crate::repo_host::DiscussionComment {
         crate::repo_host::DiscussionComment {
             database_id,
@@ -454,45 +578,27 @@ mod tests {
         assert_eq!(last_answered_marker(&t), None);
     }
 
+    #[test]
+    fn is_swebot_reply_detects_marker_carriers_but_not_human_comments() {
+        assert!(is_swebot_reply(
+            "<!-- swebot:answered:10 -->\nSee src/dedup.rs"
+        ));
+        assert!(!is_swebot_reply(
+            "thanks, but what about videos specifically?"
+        ));
+    }
+
     /// Regression test for a real bug found running this live: GitHub Discussions
-    /// store the opening question in `body`, not as a `comment` -- a fresh
-    /// discussion with zero replies has an *empty* `comments` list, so the original
-    /// "only ever look at comments" logic found nothing to answer and silently did
-    /// nothing on every poll.
+    /// store the opening question in `body`, not as a `comment`. The chat GitHub
+    /// connector honors that by enqueuing the body (remote id 0) whenever no marker
+    /// exists yet -- the direct successor of the removed `next_to_answer` sentinel.
     #[test]
-    fn next_to_answer_answers_the_opening_body_when_there_are_no_comments_yet() {
-        let t = thread("how does the dedup logic work?", vec![]);
-        assert_eq!(next_to_answer(&t), Some(0));
-        assert!(transcript_up_to(&t, 0).contains("how does the dedup logic work?"));
-    }
-
-    #[test]
-    fn next_to_answer_does_not_re_answer_the_body_once_marked() {
-        let t = thread(
-            "how does the dedup logic work?",
-            vec![comment(
-                100,
-                &format!("{}\nSee src/dedup.rs", answered_marker(0)),
-                "swebot",
-            )],
-        );
-        assert_eq!(next_to_answer(&t), None);
-    }
-
-    #[test]
-    fn next_to_answer_picks_up_a_real_reply_after_the_body_was_already_answered() {
-        let t = thread(
-            "how does the dedup logic work?",
-            vec![
-                comment(
-                    100,
-                    &format!("{}\nSee src/dedup.rs", answered_marker(0)),
-                    "swebot",
-                ),
-                comment(101, "thanks, but what about videos specifically?", "alice"),
-            ],
-        );
-        assert_eq!(next_to_answer(&t), Some(101));
+    fn last_answered_marker_distinguishes_none_from_some_zero() {
+        // No marker at all: the body is still unanswered.
+        assert_eq!(last_answered_marker(&thread("ignored", vec![])), None);
+        // Marker 0: the body itself was already answered.
+        let t = thread("ignored", vec![comment(30, &answered_marker(0), "swebot")]);
+        assert_eq!(last_answered_marker(&t), Some(0));
     }
 
     #[test]
