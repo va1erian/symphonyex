@@ -28,6 +28,7 @@
 //! `repo.provider`'s own Q&A/drafting surface.
 
 use crate::repo_host::{DiscussionComment, DiscussionHost, DiscussionThread};
+use crate::web::{self, escape, urlencode};
 use async_trait::async_trait;
 use axum::Router;
 use axum::extract::{Form, Path as AxumPath, Query, State};
@@ -242,14 +243,6 @@ fn is_safe_url(url: &str) -> bool {
         || lower.starts_with('/')
 }
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 // --------------------------------------------------------------------------------
 // repo_host::DiscussionHost -- lets swebot::qa/swebot::drafting poll this board
 // exactly the way they poll a real RepoHost's Discussions/labels.
@@ -364,58 +357,44 @@ pub fn router(data_dir: PathBuf, base_path: &str) -> Router {
         .with_state(state)
 }
 
-const STYLE: &str = r#"
-  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
-  h1 { font-size: 1.1rem; font-weight: 600; color: #9cf; margin: 0 0 4px; }
-  h2 { font-size: 1rem; color: #fff; }
-  .meta { color: #888; font-size: 0.8rem; margin-bottom: 12px; }
-  nav { margin-bottom: 20px; }
-  nav a { color: #9cf; text-decoration: none; margin-right: 16px; font-size: 0.85rem; }
-  nav a:hover { text-decoration: underline; }
-  .tabs { margin-bottom: 16px; }
-  .tabs a { color: #9cf; text-decoration: none; margin-right: 16px; font-size: 0.9rem; padding-bottom: 4px; }
-  .tabs a.active { color: #fff; font-weight: 600; border-bottom: 2px solid #9cf; }
-  .thread-list { border: 1px solid #333; border-radius: 6px; overflow: hidden; }
-  .thread-row { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #2a2a2a; }
-  .thread-row:last-child { border-bottom: none; }
-  .thread-row a { color: #eee; text-decoration: none; font-size: 0.92rem; }
-  .thread-row a:hover { text-decoration: underline; }
-  .thread-row .sub { color: #888; font-size: 0.78rem; margin-top: 2px; }
-  .thread-row .count { color: #9f9; background: #1c2e1c; border-radius: 10px; padding: 1px 9px; font-size: 0.75rem; align-self: center; }
-  .empty { color: #666; font-style: italic; padding: 14px; }
-  .post { background: #1c1c1c; border: 1px solid #333; border-radius: 6px; padding: 12px 16px; margin-bottom: 12px; }
-  .post .byline { color: #888; font-size: 0.78rem; margin-bottom: 8px; }
-  .post .byline b { color: #9cf; }
-  .post-body { font-size: 0.9rem; line-height: 1.5; }
-  .post-body p:first-child { margin-top: 0; }
-  .post-body pre { background: #0d0d0d; padding: 8px 10px; border-radius: 4px; overflow-x: auto; }
-  .post-body code { background: #0d0d0d; padding: 1px 4px; border-radius: 3px; }
-  .badge { display: inline-block; background: #2d4d2d; color: #9f9; border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; margin-left: 8px; }
-  .badge.closed { background: #4d2d2d; color: #f99; }
-  form.compose { margin-top: 16px; }
-  form.compose input[type=text], form.compose textarea, form.compose select { width: 100%; box-sizing: border-box; background: #1c1c1c; border: 1px solid #333; color: #eee; padding: 8px 10px; border-radius: 4px; font-size: 0.85rem; margin-bottom: 8px; font-family: inherit; }
-  form.compose textarea { min-height: 100px; resize: vertical; }
-  form.compose button { background: #2d4d2d; border: 1px solid #3a6a3a; color: #9f9; padding: 6px 16px; border-radius: 4px; font-size: 0.85rem; cursor: pointer; }
-  form.compose button:hover { background: #3a5f3a; }
-  label { display: block; font-size: 0.78rem; color: #888; margin-bottom: 3px; }
-"#;
+/// The board's own routes (`/`, `/new`, `/threads/:id`) are nested under `status.rs`'s
+/// router at `<parent>/board` (see `router()` below); `parent_nav` re-derives that
+/// parent base so board pages carry the same Status/Events/Usage/Board nav every other
+/// page has, instead of being an island with no way back except the browser's Back
+/// button.
+fn parent_nav(base_path: &str, active: &str) -> String {
+    let parent = base_path.strip_suffix("/board").unwrap_or(base_path);
+    web::nav(status_nav_links(), active, parent)
+}
 
-fn page_shell(title: &str, body: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Symphony Board &mdash; {title}</title>
-<style>{STYLE}</style>
-</head>
-<body>
-<h1>Symphony Board</h1>
-{body}
-</body>
-</html>
-"#,
-        title = escape(title),
+fn status_nav_links() -> &'static [web::NavLink<'static>] {
+    &[
+        web::NavLink {
+            href: "/",
+            label: "Status",
+        },
+        web::NavLink {
+            href: "/events",
+            label: "Events",
+        },
+        web::NavLink {
+            href: "/usage",
+            label: "Usage",
+        },
+        web::NavLink {
+            href: "/board",
+            label: "Board",
+        },
+    ]
+}
+
+fn page_shell(title: &str, base_path: &str, body: &str) -> Html<String> {
+    Html(web::page_shell(
+        "Symphony Board",
+        title,
+        &parent_nav(base_path, "/board"),
+        body,
+        "",
     ))
 }
 
@@ -452,7 +431,7 @@ async fn board_list(State(state): State<BoardState>, Query(q): Query<BoardQuery>
         .unwrap_or(BOARDS[0]);
     let conn = match open(&state.data_dir) {
         Ok(c) => c,
-        Err(e) => return error_response(&e.to_string()),
+        Err(e) => return error_response(&e.to_string(), base),
     };
     let threads = list_threads(&conn, active, true).unwrap_or_default();
 
@@ -498,7 +477,7 @@ async fn board_list(State(state): State<BoardState>, Query(q): Query<BoardQuery>
         cat = urlencode(active),
         cat_esc = escape(active),
     );
-    page_shell(active, &body).into_response()
+    page_shell(active, base, &body).into_response()
 }
 
 async fn new_thread_form(State(state): State<BoardState>, Query(q): Query<BoardQuery>) -> Response {
@@ -508,6 +487,26 @@ async fn new_thread_form(State(state): State<BoardState>, Query(q): Query<BoardQ
         .as_deref()
         .filter(|c| BOARDS.contains(c))
         .unwrap_or(BOARDS[0]);
+    new_thread_form_response(base, active, "", "", "", None)
+}
+
+/// Shared by the plain GET form (empty fields, no error) and `create_thread_submit`'s
+/// error path (fields pre-filled with what the poster already typed, plus an error
+/// banner) -- a failed submission used to just redirect to a blank form, silently
+/// discarding a half-written post.
+fn new_thread_form_response(
+    base: &str,
+    category: &str,
+    author: &str,
+    title: &str,
+    body_text: &str,
+    error: Option<&str>,
+) -> Response {
+    let active = if BOARDS.contains(&category) {
+        category
+    } else {
+        BOARDS[0]
+    };
     let options: String = BOARDS
         .iter()
         .map(|b| {
@@ -519,25 +518,33 @@ async fn new_thread_form(State(state): State<BoardState>, Query(q): Query<BoardQ
             )
         })
         .collect();
+    let error_html = error
+        .map(|e| web::error_banner(&format!("Couldn't post: {}", escape(e))))
+        .unwrap_or_default();
     let body = format!(
         r#"<p><a href="{base}?category={cat}">&larr; back to board</a></p>
 <h2>New thread</h2>
+{error_html}
 <form class="compose" method="post" action="{base}/threads">
-  <label>Board</label>
-  <select name="category">{options}</select>
-  <label>Your name</label>
-  <input type="text" name="author" placeholder="anonymous" maxlength="80">
-  <label>Title</label>
-  <input type="text" name="title" required maxlength="200">
-  <label>Body (markdown supported)</label>
-  <textarea name="body" required></textarea>
+  <label for="nt-category">Board</label>
+  <select id="nt-category" name="category">{options}</select>
+  <label for="nt-author">Your name</label>
+  <input type="text" id="nt-author" name="author" placeholder="anonymous" maxlength="80" value="{author}">
+  <label for="nt-title">Title</label>
+  <input type="text" id="nt-title" name="title" required maxlength="200" value="{title}">
+  <label for="nt-body">Body (markdown supported)</label>
+  <textarea id="nt-body" name="body" required maxlength="10000">{body_text}</textarea>
   <button type="submit">Post</button>
 </form>"#,
         base = base,
         cat = urlencode(active),
         options = options,
+        error_html = error_html,
+        author = escape(author),
+        title = escape(title),
+        body_text = escape(body_text),
     );
-    page_shell("new thread", &body).into_response()
+    page_shell("new thread", base, &body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -553,12 +560,13 @@ async fn create_thread_submit(
     State(state): State<BoardState>,
     Form(form): Form<NewThreadForm>,
 ) -> Response {
+    let base = state.base_path.as_str();
     if !BOARDS.contains(&form.category.as_str()) {
-        return error_response("unknown board");
+        return error_response("unknown board", base);
     }
     let conn = match open(&state.data_dir) {
         Ok(c) => c,
-        Err(e) => return error_response(&e.to_string()),
+        Err(e) => return error_response(&e.to_string(), base),
     };
     let author = if form.author.trim().is_empty() {
         "anonymous".to_string()
@@ -573,20 +581,46 @@ async fn create_thread_submit(
         &author,
     ) {
         Ok(id) => Redirect::to(&format!("{}/threads/{id}", state.base_path)).into_response(),
-        Err(e) => error_response(&e.to_string()),
+        Err(e) => {
+            // Re-render the compose form with the operator's input intact instead of
+            // just an error + "try again" link -- losing a half-written post/reply to
+            // a transient DB error is exactly the kind of thing that makes people stop
+            // trusting a form.
+            new_thread_form_response(
+                base,
+                &form.category,
+                &form.author,
+                &form.title,
+                &form.body,
+                Some(&e.to_string()),
+            )
+        }
     }
 }
 
 async fn thread_view(State(state): State<BoardState>, AxumPath(id): AxumPath<i64>) -> Response {
+    render_thread_page(&state, id, "", "", None).await
+}
+
+/// Shared by the plain GET thread view and `reply_submit`'s error path -- same
+/// "don't discard what the poster already typed" reasoning as
+/// `new_thread_form_response` above.
+async fn render_thread_page(
+    state: &BoardState,
+    id: i64,
+    reply_author: &str,
+    reply_body: &str,
+    error: Option<&str>,
+) -> Response {
     let base = state.base_path.as_str();
     let conn = match open(&state.data_dir) {
         Ok(c) => c,
-        Err(e) => return error_response(&e.to_string()),
+        Err(e) => return error_response(&e.to_string(), base),
     };
     let Ok(Some(thread)) = get_thread(&conn, id) else {
         return (
             axum::http::StatusCode::NOT_FOUND,
-            page_shell("not found", "<p>No such thread.</p>"),
+            page_shell("not found", base, "<p>No such thread.</p>"),
         )
             .into_response();
     };
@@ -621,19 +655,26 @@ async fn thread_view(State(state): State<BoardState>, AxumPath(id): AxumPath<i64
     } else {
         ""
     };
+    let error_html = error
+        .map(|e| web::error_banner(&format!("Couldn't post reply: {}", escape(e))))
+        .unwrap_or_default();
     let reply_form = if thread.closed {
         r#"<p class="empty">This thread is closed.</p>"#.to_string()
     } else {
         format!(
-            r#"<form class="compose" method="post" action="{base}/threads/{id}/replies">
-  <label>Your name</label>
-  <input type="text" name="author" placeholder="anonymous" maxlength="80">
-  <label>Reply (markdown supported)</label>
-  <textarea name="body" required></textarea>
+            r#"{error_html}
+<form class="compose" method="post" action="{base}/threads/{id}/replies">
+  <label for="r-author">Your name</label>
+  <input type="text" id="r-author" name="author" placeholder="anonymous" maxlength="80" value="{reply_author}">
+  <label for="r-body">Reply (markdown supported)</label>
+  <textarea id="r-body" name="body" required maxlength="10000">{reply_body}</textarea>
   <button type="submit">Reply</button>
 </form>"#,
             base = base,
             id = id,
+            error_html = error_html,
+            reply_author = escape(reply_author),
+            reply_body = escape(reply_body),
         )
     };
 
@@ -652,7 +693,7 @@ async fn thread_view(State(state): State<BoardState>, AxumPath(id): AxumPath<i64
         replies = replies,
         reply_form = reply_form,
     );
-    page_shell(&thread.title, &body).into_response()
+    page_shell(&thread.title, base, &body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -669,7 +710,7 @@ async fn reply_submit(
 ) -> Response {
     let conn = match open(&state.data_dir) {
         Ok(c) => c,
-        Err(e) => return error_response(&e.to_string()),
+        Err(e) => return error_response(&e.to_string(), &state.base_path),
     };
     let author = if form.author.trim().is_empty() {
         "anonymous".to_string()
@@ -678,33 +719,18 @@ async fn reply_submit(
     };
     match add_post(&conn, id, &author, &form.body) {
         Ok(_) => Redirect::to(&format!("{}/threads/{id}", state.base_path)).into_response(),
-        Err(e) => error_response(&e.to_string()),
+        Err(e) => {
+            render_thread_page(&state, id, &form.author, &form.body, Some(&e.to_string())).await
+        }
     }
 }
 
-fn error_response(msg: &str) -> Response {
+fn error_response(msg: &str, base: &str) -> Response {
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        page_shell("error", &format!("<p class=\"empty\">{}</p>", escape(msg))),
+        page_shell("error", base, &web::error_banner(&escape(msg))),
     )
         .into_response()
-}
-
-fn urlencode(s: &str) -> String {
-    // Minimal, dependency-free percent-encoding -- mirrors status.rs's own
-    // urlencode: board names/titles are short, mostly-ASCII strings, so covering the
-    // handful of characters meaningful in a query string is enough.
-    s.chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '#' => "%23".to_string(),
-            '%' => "%25".to_string(),
-            '+' => "%2B".to_string(),
-            c => c.to_string(),
-        })
-        .collect()
 }
 
 #[cfg(test)]

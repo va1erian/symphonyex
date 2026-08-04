@@ -20,6 +20,7 @@ use crate::orchestrator;
 use crate::registry;
 use crate::repo_host;
 use crate::status;
+use crate::web;
 use axum::Router;
 use axum::extract::{Form, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -253,38 +254,36 @@ fn build_router(state: ServiceState) -> Router {
         .with_state(state)
 }
 
-const HEAD: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Symphony</title><style>
-body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; max-width: 900px; }
-h1 { font-size: 1.1rem; font-weight: 600; color: #9cf; margin: 0 0 4px; }
-.meta { color: #888; font-size: 0.85rem; margin-bottom: 16px; }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #333; font-size: 0.9rem; }
-a { color: #9cf; }
-label { display: block; font-size: 0.85rem; color: #ccc; margin-top: 10px; }
-input { background: #1a1a1a; color: #eee; border: 1px solid #333; padding: 5px 7px; margin-top: 4px; width: 320px; max-width: 100%; }
-button { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 5px 12px; cursor: pointer; margin-top: 12px; }
-button:hover { background: #333; }
-.empty { color: #666; }
-.status-running { color: #8c8; }
-.status-starting { color: #cc8; }
-</style></head><body>"#;
-const TAIL: &str = "</body></html>";
+const NAV_LINKS: &[web::NavLink] = &[
+    web::NavLink {
+        href: "/",
+        label: "Dashboard",
+    },
+    web::NavLink {
+        href: "/register",
+        label: "Register",
+    },
+];
 
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn page_shell(title: &str, active: &str, body: &str) -> Html<String> {
+    Html(web::page_shell(
+        "Symphony",
+        title,
+        &web::nav(NAV_LINKS, active, ""),
+        body,
+        "",
+    ))
 }
 
 async fn dashboard(State(state): State<ServiceState>) -> Html<String> {
     let rows = match registry::open(&state.data_dir).and_then(|c| Ok(registry::list_active(&c)?)) {
         Ok(rows) => rows,
         Err(e) => {
-            return Html(format!(
-                "{HEAD}<h1>Symphony</h1><p>registry error: {}</p>{TAIL}",
-                escape(&e.to_string())
-            ));
+            return page_shell(
+                "dashboard",
+                "/",
+                &web::error_banner(&format!("registry error: {}", web::escape(&e.to_string()))),
+            );
         }
     };
     let running = state.running.lock().await;
@@ -297,12 +296,16 @@ async fn dashboard(State(state): State<ServiceState>) -> Html<String> {
     };
     drop(running);
 
-    Html(format!(
-        "{HEAD}<h1>Symphony</h1>\
-         <p class=\"meta\">Multi-repo service &mdash; <a href=\"/register\">register a repo</a></p>\
-         <table><tr><th>Repo</th><th>Branch</th><th>Status</th><th></th></tr>{project_rows}</table>\
-         {TAIL}"
-    ))
+    let body = format!(
+        r#"<p class="meta">Multi-repo service &mdash; <a href="/register">register a repo</a></p>
+<div class="table-wrap">
+<table>
+<tr><th data-sort>Repo</th><th data-sort>Branch</th><th data-sort>Status</th><th></th></tr>
+{project_rows}
+</table>
+</div>"#
+    );
+    page_shell("dashboard", "/", &body)
 }
 
 fn project_row(p: &registry::ProjectRow, is_running: bool) -> String {
@@ -312,24 +315,33 @@ fn project_row(p: &registry::ProjectRow, is_running: bool) -> String {
         ("status-starting", "starting / failed to start")
     };
     format!(
-        "<tr><td><a href=\"/projects/{id}/\">{repo}</a></td><td>{branch}</td>\
-         <td class=\"{status_class}\">{status_text}</td>\
-         <td><form method=\"post\" action=\"/projects/{id}/remove\">\
-         <button type=\"submit\">Remove</button></form></td></tr>",
-        id = escape(&p.id),
-        repo = escape(&p.repo_url),
-        branch = escape(&p.default_branch),
+        r#"<tr><td><a href="/projects/{id}/">{repo}</a></td><td>{branch}</td>
+<td class="{status_class}">{status_text}</td>
+<td><form method="post" action="/projects/{id}/remove" data-confirm="Remove {repo}? This stops it running and cannot be undone.">
+<button type="submit" class="btn btn-danger">Remove</button></form></td></tr>"#,
+        id = web::escape(&p.id),
+        repo = web::escape(&p.repo_url),
+        branch = web::escape(&p.default_branch),
     )
 }
 
 async fn login_form() -> Html<String> {
-    Html(format!(
-        "{HEAD}<h1>Symphony</h1>\
-         <form method=\"post\" action=\"/login\">\
-         <label>Admin token <input type=\"password\" name=\"token\" autofocus></label>\
-         <br><button type=\"submit\">Log in</button>\
-         </form>{TAIL}"
-    ))
+    login_form_response(None)
+}
+
+fn login_form_response(error: Option<&str>) -> Html<String> {
+    let error_html = error
+        .map(|_| web::error_banner("Invalid token."))
+        .unwrap_or_default();
+    let body = format!(
+        r#"{error_html}
+<form class="admin" method="post" action="/login">
+  <label for="login-token">Admin token</label>
+  <input type="password" id="login-token" name="token" autofocus>
+  <br><button type="submit">Log in</button>
+</form>"#
+    );
+    page_shell("log in", "", &body)
 }
 
 #[derive(Deserialize)]
@@ -350,10 +362,7 @@ async fn login_submit(Form(form): Form<LoginForm>) -> Response {
         }
         resp
     } else {
-        Html(format!(
-            "{HEAD}<p>Invalid token.</p><p><a href=\"/login\">Try again</a></p>{TAIL}"
-        ))
-        .into_response()
+        login_form_response(Some("invalid")).into_response()
     }
 }
 
@@ -390,17 +399,44 @@ async fn require_admin(headers: HeaderMap, req: Request, next: Next) -> Response
 }
 
 async fn register_form() -> Html<String> {
-    Html(format!(
-        "{HEAD}<h1>Register a repo</h1>\
-         <form method=\"post\" action=\"/register\">\
-         <label>Repo URL <input name=\"repo_url\" placeholder=\"https://github.com/owner/repo\" required></label>\
-         <label>Branch <input name=\"branch\" value=\"main\"></label>\
-         <label>WORKFLOW.md path in repo <input name=\"workflow_path\" value=\"WORKFLOW.md\"></label>\
-         <label>Token env var (optional -- for private repos; must already be set in this \
-         service's own environment, never a literal token) <input name=\"token_env\" placeholder=\"GITHUB_TOKEN\"></label>\
-         <br><button type=\"submit\">Register</button>\
-         </form><p class=\"meta\"><a href=\"/\">&larr; back</a></p>{TAIL}"
-    ))
+    register_form_response("", "main", "WORKFLOW.md", "", None)
+}
+
+/// Shared by the plain GET form and `register_submit`'s error path -- a failed
+/// registration used to redirect to a blank form, discarding whatever repo
+/// URL/branch/path/token-env-var name the operator had already typed.
+fn register_form_response(
+    repo_url: &str,
+    branch: &str,
+    workflow_path: &str,
+    token_env: &str,
+    error: Option<&str>,
+) -> Html<String> {
+    let error_html = error
+        .map(|e| web::error_banner(&format!("Failed to register: {}", web::escape(e))))
+        .unwrap_or_default();
+    let body = format!(
+        r#"{error_html}
+<form class="admin" method="post" action="/register">
+  <label for="reg-url">Repo URL</label>
+  <input id="reg-url" name="repo_url" placeholder="https://github.com/owner/repo" required value="{repo_url}">
+  <label for="reg-branch">Branch</label>
+  <input id="reg-branch" name="branch" value="{branch}">
+  <label for="reg-path">WORKFLOW.md path in repo</label>
+  <input id="reg-path" name="workflow_path" value="{workflow_path}">
+  <label for="reg-token">Token env var (optional &mdash; for private repos; must already be set in
+  this service's own environment, never a literal token)</label>
+  <input id="reg-token" name="token_env" placeholder="GITHUB_TOKEN" value="{token_env}">
+  <br><button type="submit">Register</button>
+</form>
+<p class="meta"><a href="/">&larr; back</a></p>"#,
+        error_html = error_html,
+        repo_url = web::escape(repo_url),
+        branch = web::escape(branch),
+        workflow_path = web::escape(workflow_path),
+        token_env = web::escape(token_env),
+    );
+    page_shell("register a repo", "/register", &body)
 }
 
 #[derive(Deserialize)]
@@ -425,7 +461,7 @@ async fn register_submit(
     } else {
         form.workflow_path.trim().to_string()
     };
-    let token_env = form.token_env.filter(|s| !s.trim().is_empty());
+    let token_env = form.token_env.clone().filter(|s| !s.trim().is_empty());
     match do_register(
         &state,
         form.repo_url.trim(),
@@ -436,10 +472,13 @@ async fn register_submit(
     .await
     {
         Ok(_id) => Redirect::to("/").into_response(),
-        Err(e) => Html(format!(
-            "{HEAD}<p>Failed to register: {}</p><p><a href=\"/register\">Try again</a></p>{TAIL}",
-            escape(&e.to_string())
-        ))
+        Err(e) => register_form_response(
+            &form.repo_url,
+            &branch,
+            &workflow_path,
+            form.token_env.as_deref().unwrap_or(""),
+            Some(&e.to_string()),
+        )
         .into_response(),
     }
 }
@@ -447,11 +486,18 @@ async fn register_submit(
 async fn remove_project(State(state): State<ServiceState>, Path(id): Path<String>) -> Response {
     match do_remove(&state, &id).await {
         Ok(()) => Redirect::to("/").into_response(),
-        Err(e) => Html(format!(
-            "{HEAD}<p>Failed to remove '{}': {}</p>{TAIL}",
-            escape(&id),
-            escape(&e.to_string())
-        ))
+        Err(e) => page_shell(
+            "remove failed",
+            "/",
+            &format!(
+                "{}<p class=\"meta\"><a href=\"/\">&larr; back to dashboard</a></p>",
+                web::error_banner(&format!(
+                    "Failed to remove '{}': {}",
+                    web::escape(&id),
+                    web::escape(&e.to_string())
+                ))
+            ),
+        )
         .into_response(),
     }
 }

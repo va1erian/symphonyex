@@ -7,12 +7,17 @@
 //!
 //! `/` used to full-page-reload every second via `<meta http-equiv="refresh">` --
 //! every tick was a real browser navigation (scroll position reset, any open
-//! selection lost, a visible flash). It now renders once and polls `/fragment` via a
-//! small inline `<script>` (`fetch` + `innerHTML` swap on the two data containers
-//! only), which has none of that: no navigation event, so nothing about the page
-//! *outside* those two containers ever moves. `/fragment` reuses the exact same
-//! `running_card`/`retry_row` render functions `/` itself uses -- no HTML templating
-//! duplicated into JS, everything server-rendered as before.
+//! selection lost, a visible flash). It now renders once and subscribes to
+//! `/fragment-stream` (Server-Sent Events, `fragment_stream` below) via a small inline
+//! `<script>` (`EventSource` + `innerHTML` swap on the one data container), which has
+//! none of that: no navigation event, so nothing about the page *outside* that
+//! container ever moves -- and unlike the flat-interval poll this replaced, a push
+//! only happens when `status_rx` actually changes, landing as soon as it does rather
+//! than up to one poll interval late. `/fragment-stream` reuses the exact same
+//! `render_fragment`/`running_card`/`retry_row` functions `/` itself uses to build its
+//! initial paint -- no HTML templating duplicated into JS, everything server-rendered
+//! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
+//! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 //!
 //! Also nests `crate::board`'s bulletin-board UI at `/board`, unconditionally --
 //! harmless when a project isn't using `swebot.board.enabled` (an empty board, same
@@ -21,13 +26,18 @@
 //! through this constructor just to decide whether to mount one more route.
 
 use crate::eventlog;
+use crate::web::{escape, urlencode};
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Html;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
+use tokio_stream::{Stream, StreamExt};
 
 #[derive(Clone, Serialize, Default)]
 pub struct StatusSnapshot {
@@ -120,6 +130,7 @@ pub fn router(
     Router::new()
         .route("/", get(dashboard))
         .route("/fragment", get(fragment))
+        .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
         .with_state(state)
@@ -148,94 +159,57 @@ pub async fn serve_composite(
     Ok(())
 }
 
-const STYLE: &str = r#"
-  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
-  h1 { font-size: 1.1rem; font-weight: 600; color: #9cf; margin: 0 0 4px; }
-  .meta { color: #888; font-size: 0.8rem; margin-bottom: 12px; }
-  nav { margin-bottom: 20px; }
-  nav a { color: #9cf; text-decoration: none; margin-right: 16px; font-size: 0.85rem; }
-  nav a:hover { text-decoration: underline; }
-  .grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 32px; }
-  .card { background: #1c1c1c; border: 1px solid #333; border-left: 4px solid #4caf50; border-radius: 6px; padding: 12px 14px; width: 300px; }
-  .card h2 { font-size: 0.95rem; margin: 0 0 6px; color: #fff; }
-  .card .row { font-size: 0.8rem; color: #aaa; margin: 2px 0; }
-  .card .row b { color: #ccc; }
-  .card .msg { margin-top: 8px; font-size: 0.78rem; color: #ddd; background: #151515; border-radius: 4px; padding: 6px 8px; max-height: 4.5em; overflow: hidden; }
-  .badge { display: inline-block; background: #2d4d2d; color: #9f9; border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; }
-  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
-  th, td { text-align: left; padding: 6px 10px; font-size: 0.82rem; border-bottom: 1px solid #2a2a2a; }
-  th { color: #888; font-weight: 500; }
-  .empty { color: #666; font-style: italic; }
-  section h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; }
-  form.filters { margin: 12px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  form.filters input, form.filters select { background: #1c1c1c; border: 1px solid #333; color: #eee; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; }
-  form.filters button { background: #2d4d2d; border: 1px solid #3a6a3a; color: #9f9; padding: 4px 12px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
-  .pager { margin-top: 12px; font-size: 0.82rem; }
-  .pager a { color: #9cf; margin-right: 12px; text-decoration: none; }
-  .totals { display: flex; gap: 24px; margin-bottom: 24px; flex-wrap: wrap; }
-  .totals .stat { background: #1c1c1c; border: 1px solid #333; border-radius: 6px; padding: 10px 16px; min-width: 100px; }
-  .totals .stat .n { font-size: 1.4rem; font-weight: 600; color: #9cf; }
-  .totals .stat .l { font-size: 0.72rem; color: #888; text-transform: uppercase; letter-spacing: 0.04em; }
-"#;
-
-/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`);
-/// `base` (`AppState::base_path`) is prepended only to the emitted `href`, so callers
-/// keep comparing/passing the same unprefixed identifiers regardless of where this
-/// router ends up mounted.
-fn nav(active: &str, base: &str) -> String {
-    let link = |href: &str, label: &str| {
-        if href == active {
-            format!(r#"<a href="{base}{href}" style="color:#fff;font-weight:600">{label}</a>"#)
-        } else {
-            format!(r#"<a href="{base}{href}">{label}</a>"#)
-        }
-    };
-    format!(
-        "<nav>{}{}{}{}</nav>",
-        link("/", "Status"),
-        link("/events", "Events"),
-        link("/usage", "Usage"),
-        link("/board", "Board"),
-    )
-}
+/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`,
+/// `"/board"`); `base` (`AppState::base_path`) is prepended only to the emitted `href`
+/// by `web::nav`, so callers keep comparing/passing the same unprefixed identifiers
+/// regardless of where this router ends up mounted.
+const NAV_LINKS: &[crate::web::NavLink] = &[
+    crate::web::NavLink {
+        href: "/",
+        label: "Status",
+    },
+    crate::web::NavLink {
+        href: "/events",
+        label: "Events",
+    },
+    crate::web::NavLink {
+        href: "/usage",
+        label: "Usage",
+    },
+    crate::web::NavLink {
+        href: "/board",
+        label: "Board",
+    },
+];
 
 fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Symphony &mdash; {title}</title>
-<style>{STYLE}</style>
-{extra_head}
-</head>
-<body>
-<h1>Symphony</h1>
-{nav}
-{body}
-</body>
-</html>
-"#,
-        nav = nav(active_nav, base),
+    crate::web::page_shell(
+        "Symphony",
+        title,
+        &crate::web::nav(NAV_LINKS, active_nav, base),
+        body,
+        extra_head,
     )
 }
 
 async fn dashboard(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
+    // `EventSource` pushes a re-render only when `status_rx` actually changes
+    // (`fragment_stream` below), instead of the previous flat 2s poll -- fewer
+    // requests when nothing's happening, and updates land as soon as they occur
+    // rather than up to 2s late. `EventSource` reconnects automatically on its own
+    // (with backoff) if the connection drops, so no reconnect logic is needed here.
     let script = format!(
         r#"<script>
-function refreshFragment() {{
-  fetch('{base}/fragment').then(r => r.text()).then(html => {{
-    document.getElementById('symphony-fragment').innerHTML = html;
-  }}).catch(() => {{}});
-}}
-setInterval(refreshFragment, 2000);
+new EventSource('{base}/fragment-stream').onmessage = function (e) {{
+  document.getElementById('symphony-fragment').innerHTML = e.data;
+}};
 </script>"#,
         base = state.base_path,
     );
     let body = format!(
-        r#"<div class="meta">generated {generated} &middot; live-updates every 2s, in place (no page reload)</div>
-<div id="symphony-fragment">{fragment}</div>"#,
+        r#"<div class="meta">generated {generated} &middot; live-updates in place, pushed as they happen (no page reload, no polling)</div>
+<div id="symphony-fragment" aria-live="polite" role="status">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
         fragment = render_fragment(&snapshot),
     );
@@ -251,6 +225,21 @@ setInterval(refreshFragment, 2000);
 async fn fragment(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
     Html(render_fragment(&snapshot))
+}
+
+/// Server-Sent Events push of the same fragment `/fragment` renders on demand, but
+/// driven directly off `status_rx` (a `watch::Receiver`) instead of a client poll
+/// interval: `WatchStream` yields the current value immediately on subscribe, then a
+/// new one each time the orchestrator's status-publishing side calls `watch::Sender::
+/// send` -- no fixed-interval guesswork, no requests while nothing's changed.
+/// `KeepAlive` sends periodic SSE comment pings so idle proxies/load balancers don't
+/// time out the connection during a long quiet stretch.
+async fn fragment_stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = WatchStream::new(state.status_rx.clone())
+        .map(|snapshot| Ok(Event::default().data(render_fragment(&snapshot))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 fn render_fragment(s: &StatusSnapshot) -> String {
@@ -291,6 +280,15 @@ fn render_fragment(s: &StatusSnapshot) -> String {
 }
 
 fn running_card(r: &RunningRow) -> String {
+    let message = r.last_message.as_deref().unwrap_or("");
+    // Only hint "click to expand" when the message is actually long enough that the
+    // 4.5-line clamp (`.msg`'s `max-height` in web::STYLE) would clip it -- showing the
+    // hint on a one-line message would be misleading, since expanding it changes nothing.
+    let expandable_attr = if message.len() > 140 {
+        " data-expandable"
+    } else {
+        ""
+    };
     format!(
         r#"<div class="card">
   <h2>{identifier}</h2>
@@ -298,7 +296,7 @@ fn running_card(r: &RunningRow) -> String {
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
   <div class="row"><b>last event</b> {event}</div>
-  <div class="msg">{message}</div>
+  <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
         identifier = escape(&r.identifier),
         title = escape(&r.title),
@@ -307,7 +305,7 @@ fn running_card(r: &RunningRow) -> String {
         turn = r.turn_count,
         tools = r.tool_call_count,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
-        message = escape(r.last_message.as_deref().unwrap_or("")),
+        message = escape(message),
     )
 }
 
@@ -358,19 +356,19 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let importance_toggle = if include_low_importance {
         format!(
             r#"<a href="{}">Hide low-importance (e.g. streaming heartbeats)</a>"#,
-            events_link(&q, offset, Some("normal"), base)
+            events_link(&q, offset, Some("normal"), None, base)
         )
     } else {
         format!(
             r#"<a href="{}">Show all (incl. low-importance)</a>"#,
-            events_link(&q, offset, Some("all"), base)
+            events_link(&q, offset, Some("all"), None, base)
         )
     };
 
     let prev = if offset > 0 {
         format!(
             r#"<a href="{}">&larr; Newer</a>"#,
-            events_link(&q, (offset - limit).max(0), None, base)
+            events_link(&q, (offset - limit).max(0), None, None, base)
         )
     } else {
         String::new()
@@ -378,29 +376,42 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     let next = if rows.len() as i64 == limit {
         format!(
             r#"<a href="{}">Older &rarr;</a>"#,
-            events_link(&q, offset + limit, None, base)
+            events_link(&q, offset + limit, None, None, base)
         )
     } else {
         String::new()
     };
+    let event_types = eventlog::distinct_event_types(&state.eventlog_db_path()).unwrap_or_default();
+    let type_options: String = event_types
+        .iter()
+        .map(|t| format!(r#"<option value="{}">"#, escape(t)))
+        .collect();
 
     let body = format!(
         r#"<form class="filters" method="get">
-  <input type="text" name="issue" placeholder="issue id" value="{issue}">
-  <input type="text" name="type" placeholder="event type" value="{event_type}">
+  <label for="f-issue">Issue</label>
+  <input type="text" id="f-issue" name="issue" placeholder="issue id" value="{issue}">
+  <label for="f-type">Type</label>
+  <input type="text" id="f-type" name="type" placeholder="event type" value="{event_type}" list="event-types">
+  <datalist id="event-types">{type_options}</datalist>
   <button type="submit">Filter</button>
   {importance_toggle}
 </form>
+{chips}
+<div class="table-wrap">
 <table>
-<thead><tr><th>ID</th><th>Time</th><th>Issue</th><th>Session</th><th>Type</th><th>Message</th><th>Tokens</th></tr></thead>
+<thead><tr><th data-sort>ID</th><th data-sort>Time</th><th data-sort>Issue</th><th data-sort>Session</th><th data-sort>Type</th><th>Message</th><th data-sort>Tokens</th></tr></thead>
 <tbody>
 {table_rows}
 </tbody>
 </table>
+</div>
 <div class="pager">{prev} {next}</div>"#,
         issue = escape(q.issue.as_deref().unwrap_or("")),
         event_type = escape(q.event_type.as_deref().unwrap_or("")),
+        type_options = type_options,
         importance_toggle = importance_toggle,
+        chips = chips(&q, base),
         table_rows = table_rows,
         prev = prev,
         next = next,
@@ -408,19 +419,28 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
     Html(page_shell("events", "/events", &body, "", base))
 }
 
+/// Which active filter a "clear" chip link should drop -- see `chips()` below.
+enum ClearFilter {
+    Issue,
+    Type,
+}
+
 fn events_link(
     q: &EventsQuery,
     offset: i64,
     importance_override: Option<&str>,
+    clear: Option<ClearFilter>,
     base: &str,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(issue) = &q.issue
+    if !matches!(clear, Some(ClearFilter::Issue))
+        && let Some(issue) = &q.issue
         && !issue.is_empty()
     {
         parts.push(format!("issue={}", urlencode(issue)));
     }
-    if let Some(t) = &q.event_type
+    if !matches!(clear, Some(ClearFilter::Type))
+        && let Some(t) = &q.event_type
         && !t.is_empty()
     {
         parts.push(format!("type={}", urlencode(t)));
@@ -431,6 +451,37 @@ fn events_link(
     }
     parts.push(format!("offset={offset}"));
     format!("{base}/events?{}", parts.join("&"))
+}
+
+/// Active-filter chips row: one chip per non-empty filter with a small "x" that links
+/// to the same page minus that one filter, plus a "clear all" link when more than one
+/// filter is active. Previously the only feedback that a filter was applied was the
+/// URL itself.
+fn chips(q: &EventsQuery, base: &str) -> String {
+    let mut items = Vec::new();
+    if let Some(issue) = q.issue.as_deref().filter(|s| !s.is_empty()) {
+        items.push(format!(
+            r#"<span class="chip">issue: {}<a href="{}" aria-label="clear issue filter">&times;</a></span>"#,
+            escape(issue),
+            events_link(q, 0, None, Some(ClearFilter::Issue), base)
+        ));
+    }
+    if let Some(t) = q.event_type.as_deref().filter(|s| !s.is_empty()) {
+        items.push(format!(
+            r#"<span class="chip">type: {}<a href="{}" aria-label="clear type filter">&times;</a></span>"#,
+            escape(t),
+            events_link(q, 0, None, Some(ClearFilter::Type), base)
+        ));
+    }
+    if items.is_empty() {
+        return String::new();
+    }
+    if items.len() > 1 {
+        items.push(format!(
+            r#"<span class="chip"><a href="{base}/events">clear all</a></span>"#
+        ));
+    }
+    format!(r#"<div class="chips">{}</div>"#, items.join(""))
 }
 
 fn event_row(r: &eventlog::EventRow, base: &str) -> String {
@@ -455,7 +506,7 @@ fn event_row(r: &eventlog::EventRow, base: &str) -> String {
         escape(&r.event_type)
     };
     format!(
-        "<tr><td>{id}</td><td>{time}</td><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td>{message}</td><td>{tokens}</td></tr>",
+        "<tr><td>{id}</td><td>{time}</td><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td class=\"msg-cell\">{message}</td><td>{tokens}</td></tr>",
         id = r.id,
         time = escape(&r.created_at),
         issue_link = urlencode(&r.issue_id),
@@ -484,7 +535,7 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     };
 
     let body = format!(
-        r#"<div class="totals">
+        r#"<div class="stats">
   <div class="stat"><div class="n">{dispatches}</div><div class="l">Dispatches</div></div>
   <div class="stat"><div class="n">{turns}</div><div class="l">Turns</div></div>
   <div class="stat"><div class="n">{tools}</div><div class="l">Tool calls</div></div>
@@ -494,12 +545,14 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
 </div>
 <section>
 <h3>Per issue</h3>
+<div class="table-wrap">
 <table>
-<thead><tr><th>Issue</th><th>Dispatches</th><th>Turns</th><th>Tool calls</th><th>Input</th><th>Output</th><th>Total</th><th>Last event</th></tr></thead>
+<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th>Last event</th></tr></thead>
 <tbody>
 {issue_rows}
 </tbody>
 </table>
+</div>
 </section>"#,
         dispatches = summary.dispatch_count,
         turns = summary.turn_count,
@@ -529,35 +582,60 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     )
 }
 
-fn urlencode(s: &str) -> String {
-    // Minimal, dependency-free percent-encoding: this codebase's identifiers/event
-    // types are plain ASCII (issue numbers, snake_case event names), so covering the
-    // handful of characters that are actually meaningful in a query string (space,
-    // &, =, #, %, +) is enough -- not a general-purpose encoder.
-    s.chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '#' => "%23".to_string(),
-            '%' => "%25".to_string(),
-            '+' => "%2B".to_string(),
-            c => c.to_string(),
-        })
-        .collect()
-}
-
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let mut resp = client
+            .get(format!("http://{addr}/fragment-stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("timed out waiting for initial SSE event")
+            .unwrap()
+            .expect("stream ended before first event");
+        let first = String::from_utf8_lossy(&first);
+        assert!(first.contains("No agents running"), "{first}");
+
+        tx.send(StatusSnapshot {
+            generated_at: "now".to_string(),
+            running: vec![RunningRow {
+                identifier: "AR-1".to_string(),
+                title: "Scaffold".to_string(),
+                session_id: "sess".to_string(),
+                started_secs_ago: 1.0,
+                turn_count: 1,
+                tool_call_count: 0,
+                last_event: None,
+                last_message: None,
+            }],
+            retrying: vec![],
+        })
+        .unwrap();
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("timed out waiting for pushed update")
+            .unwrap()
+            .expect("stream ended before update event");
+        let second = String::from_utf8_lossy(&second);
+        assert!(second.contains("AR-1"), "{second}");
+    }
 
     #[test]
     fn render_fragment_shows_empty_states() {
@@ -625,9 +703,33 @@ mod tests {
     }
 
     #[test]
-    fn urlencode_handles_query_meaningful_characters() {
-        assert_eq!(urlencode("a b"), "a%20b");
-        assert_eq!(urlencode("a&b"), "a%26b");
-        assert_eq!(urlencode("plain"), "plain");
+    fn chips_empty_when_no_filters_active() {
+        let q = EventsQuery::default();
+        assert_eq!(chips(&q, ""), "");
+    }
+
+    #[test]
+    fn chips_shows_one_per_active_filter_and_clear_all_when_multiple() {
+        let q = EventsQuery {
+            issue: Some("42".to_string()),
+            event_type: Some("tool_call".to_string()),
+            ..Default::default()
+        };
+        let html = chips(&q, "/base");
+        assert!(html.contains("issue: 42"));
+        assert!(html.contains("type: tool_call"));
+        assert!(html.contains("clear all"));
+        assert!(html.contains("/base/events"));
+    }
+
+    #[test]
+    fn chips_omits_clear_all_when_only_one_filter_active() {
+        let q = EventsQuery {
+            issue: Some("42".to_string()),
+            ..Default::default()
+        };
+        let html = chips(&q, "");
+        assert!(html.contains("issue: 42"));
+        assert!(!html.contains("clear all"));
     }
 }
