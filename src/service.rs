@@ -22,15 +22,19 @@ use crate::repo_host;
 use crate::status;
 use crate::web;
 use axum::Router;
-use axum::extract::{Form, Path, Request, State};
+use axum::extract::{ConnectInfo, Form, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, oneshot, watch};
 use tower::ServiceExt;
 
@@ -47,6 +51,50 @@ struct RunningProject {
 struct ServiceState {
     data_dir: PathBuf,
     running: Arc<Mutex<HashMap<String, RunningProject>>>,
+    login_attempts: LoginAttempts,
+}
+
+/// Per-IP sliding-window limiter on `/login` -- the admin token is otherwise a bare
+/// bearer credential with no other brute-force defense. Keyed on the TCP peer address
+/// (`ConnectInfo`), so behind a reverse proxy every request shares the proxy's IP and
+/// this degrades to one shared bucket rather than true per-client limiting; acceptable
+/// for a single-operator deployment, worth revisiting if this ever sits behind a
+/// corporate load balancer shared by many real clients.
+#[derive(Clone, Default)]
+struct LoginAttempts(Arc<Mutex<HashMap<IpAddr, Vec<Instant>>>>);
+
+const LOGIN_RATE_LIMIT: usize = 5;
+const LOGIN_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+impl LoginAttempts {
+    /// Records an attempt from `ip` and returns whether it's within the rate limit.
+    async fn allow(&self, ip: IpAddr) -> bool {
+        let mut attempts = self.0.lock().await;
+        let now = Instant::now();
+        let entry = attempts.entry(ip).or_default();
+        entry.retain(|t| now.duration_since(*t) < LOGIN_RATE_WINDOW);
+        if entry.len() >= LOGIN_RATE_LIMIT {
+            false
+        } else {
+            entry.push(now);
+            true
+        }
+    }
+}
+
+/// Constant-time token check: compares SHA-256 digests rather than the raw strings so
+/// neither a byte-value nor a length mismatch is observable via early-return timing
+/// (`subtle::ConstantTimeEq` alone still requires equal-length inputs to stay
+/// constant-time; hashing first sidesteps that entirely). `expected` empty always
+/// fails -- that's a fixed deployment-time state, not a per-request secret, so it's
+/// fine to branch on it.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let provided_hash = Sha256::digest(provided.as_bytes());
+    let expected_hash = Sha256::digest(expected.as_bytes());
+    provided_hash.ct_eq(&expected_hash).into()
 }
 
 /// Entry point for `symphony serve --port <port> [--data-dir <dir>]` (`main.rs`).
@@ -71,6 +119,7 @@ pub async fn run(port: u16, data_dir: PathBuf) -> anyhow::Result<()> {
     let state = ServiceState {
         data_dir,
         running: Arc::new(Mutex::new(HashMap::new())),
+        login_attempts: LoginAttempts::default(),
     };
 
     let existing = {
@@ -88,7 +137,11 @@ pub async fn run(port: u16, data_dir: PathBuf) -> anyhow::Result<()> {
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("symphony serve listening on http://0.0.0.0:{port}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -349,12 +402,33 @@ struct LoginForm {
     token: String,
 }
 
-async fn login_submit(Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<ServiceState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if !state.login_attempts.allow(addr.ip()).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            page_shell(
+                "log in",
+                "",
+                &web::error_banner("Too many login attempts. Try again in a minute."),
+            ),
+        )
+            .into_response();
+    }
+
     let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
-    if !expected.is_empty() && form.token == expected {
+    if token_matches(&form.token, &expected) {
         let mut resp = Redirect::to("/").into_response();
+        // `Secure` requires the service to actually be served over TLS (e.g. behind a
+        // TLS-terminating reverse proxy) -- see AGENTS.md "Long-running multi-repo
+        // service" for the deployment guidance. Without it the browser drops the
+        // cookie silently rather than sending it over plain HTTP, which is the safe
+        // failure mode here.
         let cookie = format!(
-            "symphony_admin={}; HttpOnly; Path=/; SameSite=Strict",
+            "symphony_admin={}; HttpOnly; Secure; Path=/; SameSite=Strict",
             form.token
         );
         if let Ok(v) = HeaderValue::from_str(&cookie) {
@@ -391,7 +465,7 @@ fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
 async fn require_admin(headers: HeaderMap, req: Request, next: Next) -> Response {
     let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
     let provided = extract_admin_token(&headers).unwrap_or_default();
-    if !expected.is_empty() && provided == expected {
+    if token_matches(&provided, &expected) {
         next.run(req).await
     } else {
         Redirect::to("/login").into_response()
