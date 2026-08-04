@@ -397,6 +397,10 @@ async fn create_from_pending_draft(
 
 /// The words that confirm a pending draft. Keep narrow -- a confirmation is asked
 /// for explicitly ("reply \"create it\" to confirm"), so only explicit accepts count.
+/// Deliberately excludes bare generic acknowledgements like "yes"/"confirm"/"go
+/// ahead": a pending draft stays un-created until the next assistant reply, so a
+/// user's next short answer to some unrelated follow-up question (which could
+/// easily be "yes") must not be mistaken for filing an old draft.
 fn is_confirmation(body: &str) -> bool {
     let t = body.trim().to_lowercase().replace('.', "");
     matches!(
@@ -405,10 +409,9 @@ fn is_confirmation(body: &str) -> bool {
             | "create it"
             | "file it"
             | "file the ticket"
-            | "yes"
             | "yes, create it"
-            | "confirm"
-            | "go ahead"
+            | "yes create it"
+            | "yes, file it"
     )
 }
 
@@ -837,5 +840,15 @@ mod tests {
         assert!(is_confirmation(" Yes, create it."));
         assert!(!is_confirmation("create a ticket about X"));
         assert!(!is_confirmation("what is the auth flow?"));
+    }
+
+    #[test]
+    fn is_confirmation_rejects_bare_generic_acknowledgements() {
+        // "yes"/"confirm"/"go ahead" alone are too generic: a user's short reply to
+        // some unrelated follow-up question must not be mistaken for confirming a
+        // still-pending draft from earlier in the conversation.
+        assert!(!is_confirmation("yes"));
+        assert!(!is_confirmation("confirm"));
+        assert!(!is_confirmation("go ahead"));
     }
 }

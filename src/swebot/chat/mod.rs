@@ -4,11 +4,14 @@
 //! `first_text_deadline_ms` tells the user so), and connectors bridge the shared
 //! `ChatStore` to each platform:
 //!
-//! - `github` (always on when SweBot is) -- GitHub Discussions Q&A/drafting, folded
-//!   in from the old standalone loop: each discussion is a conversation, replies are
-//!   delivered back as comments. This is why the store+worker pipeline runs even
-//!   when `swebot.chat.enabled` is false: `chat` is the home for discussions too.
-//! - `web` (when `swebot.chat.enabled`) -- the bundled chat UI served by the status
+//! The whole pipeline (store, worker, and both connectors below) runs only under
+//! `swebot.chat.enabled` -- see `start`'s own doc comment for the ownership split
+//! with the standalone `qa`/`drafting` loops when it's off.
+//!
+//! - `github` (for a GitHub repo, when chat is on) -- GitHub Discussions Q&A/drafting,
+//!   folded in from the old standalone loop: each discussion is a conversation,
+//!   replies are delivered back as comments.
+//! - `web` (always, when chat is on) -- the bundled chat UI served by the status
 //!   dashboard.
 //!
 //! Future connectors (MS Teams, ...) implement the `ChatConnector` contract and are

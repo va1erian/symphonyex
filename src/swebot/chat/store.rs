@@ -127,6 +127,12 @@ impl ChatStore {
         let c = Connection::open(&self.path)?;
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "foreign_keys", "ON")?;
+        // The worker's ingest/process loop and its separately-spawned delivery loop
+        // (worker::run_loop) both write to this file concurrently. WAL still
+        // serializes writers, so a lock conflict without a busy_timeout returns
+        // SQLITE_BUSY immediately instead of waiting a moment for the other loop's
+        // short-lived connection to finish -- avoid the spurious failure/retry.
+        c.pragma_update(None, "busy_timeout", 5_000)?;
         Ok(c)
     }
 
