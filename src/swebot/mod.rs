@@ -271,10 +271,10 @@ fn extract_json_blocks(text: &str) -> Vec<serde_json::Value> {
             out.push(v);
         }
     }
-    if out.is_empty() {
-        if let Ok(v) = extract_json_block(text) {
-            out.push(v);
-        }
+    if out.is_empty()
+        && let Ok(v) = extract_json_block(text)
+    {
+        out.push(v);
     }
     out
 }
