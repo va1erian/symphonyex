@@ -266,6 +266,30 @@ hand-written WORKFLOW.md can), a loud failure on push (not swallowed), and an
 `is-inside-work-tree` guard so a silently-failed `after_create` fails loudly on the
 next hook instead of quietly no-op'ing forever.
 
+**Keeping a long-running ticket rebased on `default_branch`**: every `before_run` (so
+every turn, not just the first) fetches `default_branch` and rebases the ticket
+branch onto it. Real drift over a multi-turn ticket is exactly what this catches --
+without it, a ticket that runs for a while while other work merges to main only
+discovers the conflict at PR-open time, as a merge conflict a human then has to sort
+out by hand. Two outcomes:
+- **Clean rebase**: silent, nothing for the agent to do differently this turn.
+- **Real conflict**: the hook does *not* fail -- resolving a conflict needs the
+  agent's own understanding of the code, not a script, so it leaves the workspace
+  genuinely mid-rebase (`.git/rebase-merge`/`.git/rebase-apply` present, files with
+  `<<<<<<<` markers) and prints a clear `MERGE CONFLICT:` line to stderr instead. A
+  project's own prompt needs to tell the agent what to do when it finds itself in
+  that state (see bsky-archiver's `WORKFLOW.md` for a template instruction) --
+  Symphony can detect and surface the conflict, but resolving it is inherently a
+  content decision only the coding agent (or a human) can make.
+  `after_run` refuses to commit/push while still mid-rebase (a partial/conflicted
+  tree must never reach the shared repo), and once a rebase *did* happen, pushes with
+  `--force-with-lease` instead of a plain push -- a rebase rewrites the ticket
+  branch's own commit history, so a plain push would be rejected as non-fast-forward
+  against whatever was pushed there before.
+- A rebase failing for a reason *other* than a conflict (network, corrupt state,
+  etc.) gets `git rebase --abort`ed automatically, leaving the branch exactly as it
+  was; a `WARNING:` line notes it, and the next turn's `before_run` just tries again.
+
 **Credentials**: `repo.token` names an env var (not a literal value) holding a git
 credential; the synthesized hooks reference it by name in a generated `git config
 credential.helper`, so the secret's actual value never gets embedded in the hook

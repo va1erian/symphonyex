@@ -867,22 +867,43 @@ fn synthesize_repo_hooks(repo: &RepoConfig) -> (String, String, String) {
         ),
     };
 
-    let before_run = "name=\"$(basename \"$PWD\")\"\n\
+    let before_run = format!(
+        "name=\"$(basename \"$PWD\")\"\n\
         if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n\
         \x20\x20echo \"FATAL: workspace is not a git repository (after_create must have failed silently)\" >&2\n\
         \x20\x20exit 1\n\
         fi\n\
-        git pull --ff-only origin \"issue-$name\" || true\n"
-        .to_string();
+        git pull --ff-only origin \"issue-$name\" || true\n\
+        git fetch origin \"{branch}\" -q || true\n\
+        if git rev-parse --verify -q \"origin/{branch}\" >/dev/null 2>&1 \
+            && ! git rebase \"origin/{branch}\"; then\n\
+        \x20\x20if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then\n\
+        \x20\x20\x20\x20echo \"MERGE CONFLICT: issue-$name is behind {branch} and could not be \
+rebased automatically. Resolve the conflicts yourself this turn -- edit each file with conflict \
+markers, 'git add' it, then 'git rebase --continue' (repeat until it reports the rebase is done, \
+or 'git rebase --abort' if the conflict genuinely can't be resolved) -- before doing anything \
+else.\" >&2\n\
+        \x20\x20else\n\
+        \x20\x20\x20\x20git rebase --abort >/dev/null 2>&1 || true\n\
+        \x20\x20\x20\x20echo \"WARNING: rebase onto origin/{branch} failed for a reason other \
+than a conflict; aborted it and left issue-$name as it was.\" >&2\n\
+        \x20\x20fi\n\
+        fi\n"
+    );
 
     let after_run = "name=\"$(basename \"$PWD\")\"\n\
         if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n\
         \x20\x20echo \"FATAL: workspace is not a git repository (after_create must have failed silently)\" >&2\n\
         \x20\x20exit 1\n\
         fi\n\
+        if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then\n\
+        \x20\x20echo \"FATAL: issue-$name is mid-rebase (unresolved merge conflict) -- resolve \
+it (or 'git rebase --abort') before this attempt's work can be committed/pushed\" >&2\n\
+        \x20\x20exit 1\n\
+        fi\n\
         git add -A\n\
         git commit -m \"symphony: $name\" -q --allow-empty-message || true\n\
-        if ! git push origin \"HEAD:refs/heads/issue-$name\" -q; then\n\
+        if ! git push --force-with-lease origin \"HEAD:refs/heads/issue-$name\" -q; then\n\
         \x20\x20echo \"FATAL: git push failed -- this attempt's work did NOT reach the shared repo\" >&2\n\
         \x20\x20exit 1\n\
         fi\n"
@@ -1020,10 +1041,17 @@ mod tests {
         let before = cfg.hook_before_run.unwrap();
         assert!(before.contains("is-inside-work-tree"));
         assert!(before.contains("git pull --ff-only origin \"issue-$name\""));
+        assert!(before.contains("git fetch origin \"main\""));
+        assert!(before.contains("git rebase \"origin/main\""));
+        assert!(before.contains("MERGE CONFLICT"));
 
         let after = cfg.hook_after_run.unwrap();
-        assert!(after.contains("git push origin \"HEAD:refs/heads/issue-$name\" -q"));
+        assert!(
+            after.contains("git push --force-with-lease origin \"HEAD:refs/heads/issue-$name\" -q")
+        );
         assert!(after.contains("is-inside-work-tree"));
+        // A mid-rebase (unresolved conflict) workspace must not be committed/pushed.
+        assert!(after.contains("rebase-merge"));
         // FATAL guard comes before the push, not after.
         assert!(after.find("is-inside-work-tree").unwrap() < after.find("git push").unwrap());
     }
@@ -1584,6 +1612,180 @@ mod tests {
             "after_run's push should have created branch issue-42 on origin with new_file.txt: {}",
             String::from_utf8_lossy(&show.stderr)
         );
+
+        let _ = std::fs::remove_dir_all(&ws_named);
+        unsafe {
+            std::env::remove_var("GIT_CONFIG_GLOBAL");
+            std::env::remove_var("GIT_CONFIG_SYSTEM");
+        }
+    }
+
+    /// Real end-to-end exercise of the merge-conflict path added to `before_run`:
+    /// a ticket branch pushed once, then `main` on origin advances with a
+    /// conflicting change to the same line before the ticket's next turn.
+    /// `before_run` must detect the conflict and leave the workspace mid-rebase
+    /// (not fail the hook outright) so an agent's own turn gets a chance to resolve
+    /// it; `after_run` must then refuse to commit/push while still mid-rebase, and
+    /// (once the conflict actually is resolved, simulating what an agent turn would
+    /// do) `--force-with-lease` the rewritten history through successfully.
+    #[tokio::test]
+    async fn before_run_detects_a_real_conflict_and_after_run_pushes_it_once_resolved() {
+        unsafe {
+            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
+        }
+
+        let origin = tempdir().unwrap();
+        let git_id = ["-c", "user.email=t@t", "-c", "user.name=t"];
+        std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::fs::write(origin.path().join("shared.txt"), "line1\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(git_id)
+            .args(["commit", "-m", "seed"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "receive.denyCurrentBranch", "updateInstead"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+
+        let origin_wsl_path = to_wsl_path(origin.path());
+        let cfg_yaml = parse_yaml(&format!(
+            "tracker:\n  kind: local\nrepo:\n  url: {origin_wsl_path:?}\n  default_branch: main\n"
+        ));
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let ws_named = origin.path().parent().unwrap().join("99");
+        std::fs::create_dir_all(&ws_named).unwrap();
+
+        crate::hooks::run_hook(
+            "after_create",
+            cfg.hook_after_create.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+
+        // The "agent's" own change on the ticket branch, first push -- a normal,
+        // conflict-free push (fast-forward from origin's perspective).
+        std::fs::write(ws_named.join("shared.txt"), "line1\nagent-change\n").unwrap();
+        crate::hooks::run_hook(
+            "after_run",
+            cfg.hook_after_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+
+        // `main` advances on origin with a conflicting edit to the exact same line
+        // -- origin is a normal (non-bare) checkout still on `main`, so this is just
+        // a local commit there, no push machinery needed.
+        std::fs::write(origin.path().join("shared.txt"), "line1\nmain-change\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(git_id)
+            .args(["commit", "-m", "main advances"])
+            .current_dir(origin.path())
+            .status()
+            .unwrap();
+
+        // before_run must detect the now-unrebaseable branch, leave it mid-rebase,
+        // and still succeed (Ok(())) -- resolving a real conflict is the agent
+        // turn's job, not this hook's.
+        crate::hooks::run_hook(
+            "before_run",
+            cfg.hook_before_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            ws_named.join(".git/rebase-merge").exists()
+                || ws_named.join(".git/rebase-apply").exists(),
+            "before_run should have left the workspace mid-rebase on a real conflict"
+        );
+        let conflicted = std::fs::read_to_string(ws_named.join("shared.txt")).unwrap();
+        assert!(
+            conflicted.contains("<<<<<<<"),
+            "shared.txt should carry real conflict markers, got: {conflicted}"
+        );
+
+        // after_run must refuse to touch a mid-rebase workspace.
+        let blocked = crate::hooks::run_hook(
+            "after_run",
+            cfg.hook_after_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "after_run must not commit/push while the workspace is mid-rebase"
+        );
+
+        // The agent's own turn resolves it -- pick "main"'s side plus keep the
+        // agent's own change, exactly what a real conflict resolution looks like.
+        std::fs::write(
+            ws_named.join("shared.txt"),
+            "line1\nmain-change\nagent-change\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&ws_named)
+            .status()
+            .unwrap();
+        let continue_status = std::process::Command::new("git")
+            .args(git_id)
+            .args(["rebase", "--continue"])
+            .env("GIT_EDITOR", "true")
+            .current_dir(&ws_named)
+            .status()
+            .unwrap();
+        assert!(
+            continue_status.success(),
+            "git rebase --continue should have finished cleanly"
+        );
+        assert!(!ws_named.join(".git/rebase-merge").exists());
+
+        // Now after_run should push the rewritten history through with
+        // --force-with-lease (a plain push would be rejected as non-fast-forward,
+        // since the rebase changed issue-99's commit history on top of main).
+        crate::hooks::run_hook(
+            "after_run",
+            cfg.hook_after_run.as_deref().unwrap(),
+            &ws_named,
+            15_000,
+        )
+        .await
+        .unwrap();
+
+        let show = std::process::Command::new("git")
+            .args(["show", "issue-99:shared.txt"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        assert!(show.status.success());
+        let content = String::from_utf8_lossy(&show.stdout).to_string();
+        assert!(content.contains("main-change") && content.contains("agent-change"));
 
         let _ = std::fs::remove_dir_all(&ws_named);
         unsafe {

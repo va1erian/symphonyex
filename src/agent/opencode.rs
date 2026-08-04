@@ -183,11 +183,17 @@ impl AgentSession for OpenCodeSession {
         // Everything but the prompt itself (last arg, and often long): enough to
         // reproduce a hung/stalled turn's exact invocation by hand outside Symphony
         // (`opencode <these args> "<the actual prompt>"`) without dumping a
-        // potentially huge prompt into every turn's log at debug level.
+        // potentially huge prompt into every turn's log at debug level. Its *length*
+        // is logged unconditionally though (never sensitive on its own) -- an
+        // unexpectedly-empty or near-empty prompt is exactly what makes `opencode`
+        // print its own CLI usage/help text and exit 1 with no NDJSON at all (no
+        // `message` positional given), which otherwise looks identical in the log to
+        // any other immediate spawn failure.
         tracing::debug!(
             command = %self.command,
             workspace = %self.workspace.display(),
             args = ?&args[..args.len().saturating_sub(1)],
+            prompt_len = prompt.len(),
             "opencode: starting turn"
         );
 
