@@ -7,12 +7,17 @@
 //!
 //! `/` used to full-page-reload every second via `<meta http-equiv="refresh">` --
 //! every tick was a real browser navigation (scroll position reset, any open
-//! selection lost, a visible flash). It now renders once and polls `/fragment` via a
-//! small inline `<script>` (`fetch` + `innerHTML` swap on the two data containers
-//! only), which has none of that: no navigation event, so nothing about the page
-//! *outside* those two containers ever moves. `/fragment` reuses the exact same
-//! `running_card`/`retry_row` render functions `/` itself uses -- no HTML templating
-//! duplicated into JS, everything server-rendered as before.
+//! selection lost, a visible flash). It now renders once and subscribes to
+//! `/fragment-stream` (Server-Sent Events, `fragment_stream` below) via a small inline
+//! `<script>` (`EventSource` + `innerHTML` swap on the one data container), which has
+//! none of that: no navigation event, so nothing about the page *outside* that
+//! container ever moves -- and unlike the flat-interval poll this replaced, a push
+//! only happens when `status_rx` actually changes, landing as soon as it does rather
+//! than up to one poll interval late. `/fragment-stream` reuses the exact same
+//! `render_fragment`/`running_card`/`retry_row` functions `/` itself uses to build its
+//! initial paint -- no HTML templating duplicated into JS, everything server-rendered
+//! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
+//! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 //!
 //! Also nests `crate::board`'s bulletin-board UI at `/board`, unconditionally --
 //! harmless when a project isn't using `swebot.board.enabled` (an empty board, same
@@ -25,10 +30,14 @@ use crate::web::{escape, urlencode};
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Html;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
+use tokio_stream::{Stream, StreamExt};
 
 #[derive(Clone, Serialize, Default)]
 pub struct StatusSnapshot {
@@ -121,6 +130,7 @@ pub fn router(
     Router::new()
         .route("/", get(dashboard))
         .route("/fragment", get(fragment))
+        .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
         .with_state(state)
@@ -184,19 +194,21 @@ fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base:
 
 async fn dashboard(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
+    // `EventSource` pushes a re-render only when `status_rx` actually changes
+    // (`fragment_stream` below), instead of the previous flat 2s poll -- fewer
+    // requests when nothing's happening, and updates land as soon as they occur
+    // rather than up to 2s late. `EventSource` reconnects automatically on its own
+    // (with backoff) if the connection drops, so no reconnect logic is needed here.
     let script = format!(
         r#"<script>
-function refreshFragment() {{
-  fetch('{base}/fragment').then(r => r.text()).then(html => {{
-    document.getElementById('symphony-fragment').innerHTML = html;
-  }}).catch(() => {{}});
-}}
-setInterval(refreshFragment, 2000);
+new EventSource('{base}/fragment-stream').onmessage = function (e) {{
+  document.getElementById('symphony-fragment').innerHTML = e.data;
+}};
 </script>"#,
         base = state.base_path,
     );
     let body = format!(
-        r#"<div class="meta">generated {generated} &middot; live-updates every 2s, in place (no page reload)</div>
+        r#"<div class="meta">generated {generated} &middot; live-updates in place, pushed as they happen (no page reload, no polling)</div>
 <div id="symphony-fragment" aria-live="polite" role="status">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
         fragment = render_fragment(&snapshot),
@@ -213,6 +225,21 @@ setInterval(refreshFragment, 2000);
 async fn fragment(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
     Html(render_fragment(&snapshot))
+}
+
+/// Server-Sent Events push of the same fragment `/fragment` renders on demand, but
+/// driven directly off `status_rx` (a `watch::Receiver`) instead of a client poll
+/// interval: `WatchStream` yields the current value immediately on subscribe, then a
+/// new one each time the orchestrator's status-publishing side calls `watch::Sender::
+/// send` -- no fixed-interval guesswork, no requests while nothing's changed.
+/// `KeepAlive` sends periodic SSE comment pings so idle proxies/load balancers don't
+/// time out the connection during a long quiet stretch.
+async fn fragment_stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = WatchStream::new(state.status_rx.clone())
+        .map(|snapshot| Ok(Event::default().data(render_fragment(&snapshot))));
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 fn render_fragment(s: &StatusSnapshot) -> String {
@@ -558,6 +585,57 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let mut resp = client
+            .get(format!("http://{addr}/fragment-stream"))
+            .send()
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("timed out waiting for initial SSE event")
+            .unwrap()
+            .expect("stream ended before first event");
+        let first = String::from_utf8_lossy(&first);
+        assert!(first.contains("No agents running"), "{first}");
+
+        tx.send(StatusSnapshot {
+            generated_at: "now".to_string(),
+            running: vec![RunningRow {
+                identifier: "AR-1".to_string(),
+                title: "Scaffold".to_string(),
+                session_id: "sess".to_string(),
+                started_secs_ago: 1.0,
+                turn_count: 1,
+                tool_call_count: 0,
+                last_event: None,
+                last_message: None,
+            }],
+            retrying: vec![],
+        })
+        .unwrap();
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), resp.chunk())
+            .await
+            .expect("timed out waiting for pushed update")
+            .unwrap()
+            .expect("stream ended before update event");
+        let second = String::from_utf8_lossy(&second);
+        assert!(second.contains("AR-1"), "{second}");
+    }
 
     #[test]
     fn render_fragment_shows_empty_states() {

@@ -28,6 +28,7 @@ sha2 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "fs", "time", "sync", "io-util", "signal", "io-std", "net"] }
+tokio-stream = { version = "0.1.17", default-features = false, features = ["sync"] }
 tower = { version = "0.5.2", default-features = false, features = ["util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
