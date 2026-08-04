@@ -457,7 +457,15 @@ async fn run_turn_streaming(
             };
             match received {
                 Some(event) => {
-                    if let Some(text) = event.message
+                    // Only `notification` events carry the assistant's actual text
+                    // (see `agent::claude`/`agent::opencode`'s own event mapping) --
+                    // `tool_call` events also set `.message` to the tool's *name*
+                    // (e.g. "bash", "read"), and `other_message`/`malformed` carry
+                    // diagnostic text. Treating any of those as the growing reply
+                    // would (and did, in production) clobber the real answer with
+                    // whatever tool ran last, right up to the final persisted body.
+                    if event.event == "notification"
+                        && let Some(text) = event.message
                         && !text.trim().is_empty()
                     {
                         last_message = Some(text.clone());

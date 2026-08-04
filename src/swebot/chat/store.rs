@@ -626,14 +626,36 @@ fn has_column(c: &Connection, table: &str, column: &str) -> rusqlite::Result<boo
     Ok(false)
 }
 
-/// Requeue any user message a crashed run left claimed (`processing`). Called once at
-/// `open`; the worker is the only thing that ever sets `processing`, and it's a
-/// single task, so there is never a legitimately in-flight row at startup.
+/// Resolve everything a crashed/interrupted run left mid-flight. Called once at
+/// `open`; the worker is the only thing that ever sets any of these three statuses,
+/// and it's a single task, so there is never a legitimately in-flight row at startup:
+///
+/// - a `processing` user message (claimed but never answered) -> requeue to
+///   `pending` so the next cycle picks it up;
+/// - a `streaming` assistant message (the turn never reached `run_turn_streaming`'s
+///   own `STATUS_SENT` write) -> `failed`, since there's no way to know whether it
+///   actually finished;
+/// - an active `notice-active` "still working" system row -> `notice-done`.
+///
+/// Without the last two, a process killed mid-turn (Ctrl+C, a crash, `docker rm`
+/// during Docker-mode dispatch) leaves that conversation's `has_active_work` true
+/// forever on every subsequent run -- the web UI's typing banner and the *previous*
+/// turn's "still working" notice both stay stuck on screen even once a brand new
+/// question gets answered normally, since nothing else ever clears rows in these two
+/// terminal-shaped statuses.
 fn reset_stale_processing(path: &Path) -> Result<(), ChatError> {
     let c = Connection::open(path)?;
     c.execute(
         "UPDATE messages SET status=?1 WHERE role=?2 AND status=?3",
         params![STATUS_PENDING, ROLE_USER, STATUS_PROCESSING],
+    )?;
+    c.execute(
+        "UPDATE messages SET status=?1 WHERE role=?2 AND status=?3",
+        params![STATUS_FAILED, ROLE_ASSISTANT, STATUS_STREAMING],
+    )?;
+    c.execute(
+        "UPDATE messages SET status=?1 WHERE role=?2 AND status=?3",
+        params![STATUS_NOTICE_DONE, ROLE_SYSTEM, STATUS_NOTICE_ACTIVE],
     )?;
     Ok(())
 }
@@ -753,6 +775,32 @@ mod tests {
         let pending = s.pending_user_messages(10).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].status, STATUS_PENDING);
+    }
+
+    /// Regression test for a real bug found running this live: a process killed
+    /// mid-turn (Ctrl+C, a crash) left a `streaming` assistant row and a
+    /// `notice-active` system row behind. Neither is a `processing` user message, so
+    /// the old cleanup missed both -- `has_active_work` then stayed permanently
+    /// `true` for that conversation, showing the web UI's typing banner and a stale
+    /// "still working" notice forever, even once later turns completed normally.
+    #[test]
+    fn reset_stale_processing_also_resolves_orphaned_streaming_and_notice_rows() {
+        let (s, _d) = store();
+        let c = s.create_conversation("test", None, "u", "t").unwrap();
+        let assistant_id = s
+            .insert_message(c, ROLE_ASSISTANT, "", STATUS_STREAMING, &json!({}), None)
+            .unwrap();
+        let notice_id = s.insert_system_notice(c, "still working").unwrap();
+        assert!(s.has_active_work(c).unwrap());
+
+        ChatStore::open(s.path.clone()).unwrap();
+
+        assert_eq!(s.message(assistant_id).unwrap().unwrap().status, STATUS_FAILED);
+        assert_eq!(
+            s.message(notice_id).unwrap().unwrap().status,
+            STATUS_NOTICE_DONE
+        );
+        assert!(!s.has_active_work(c).unwrap());
     }
 
     #[test]

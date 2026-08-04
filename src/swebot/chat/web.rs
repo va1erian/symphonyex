@@ -207,6 +207,14 @@ const STYLE: &str = r#"
   .msg.assistant { align-self: flex-start; }
   .msg.system { align-self: center; max-width: 100%; }
   .bubble { border-radius: 10px; padding: 8px 12px; font-size: 0.9rem; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+  .bubble :first-child { margin-top: 0; }
+  .bubble :last-child { margin-bottom: 0; }
+  .bubble code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }
+  .bubble pre { background: #0d0d0d; border: 1px solid #333; border-radius: 6px; padding: 8px 10px; overflow-x: auto; white-space: pre; }
+  .bubble pre code { background: none; padding: 0; }
+  .bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 4px; font-size: 1em; color: #9cf; }
+  .bubble ul, .bubble ol { margin: 4px 0; padding-left: 20px; }
+  .bubble a { color: #9cf; }
   .msg.user .bubble { background: #1c3a5f; border: 1px solid #2a5a8f; }
   .msg.assistant .bubble { background: #242424; border: 1px solid #383838; }
   .msg.system .bubble { color: #aaa; background: #181818; font-style: italic; border: 1px dashed #333; }
@@ -237,6 +245,33 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
+// Small, self-contained markdown-to-HTML subset (fenced/inline code, headers, bold,
+// italic, links, "- " lists) -- no CDN dependency, matching this page's minimal-JS,
+// self-contained posture (see module doc comment). Escapes first, so markdown syntax
+// is only ever recognized in already-HTML-safe text; no raw HTML from a message body
+// is ever interpreted, even inside a code block.
+function md(raw) {
+  let s = esc(raw);
+  const blocks = [];
+  s = s.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (_, code) => {
+    blocks.push("<pre><code>" + code + "</code></pre>");
+    return "\x00" + (blocks.length - 1) + "\x00";
+  });
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+  s = s.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+  s = s.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/(?:^|\n)((?:[-*] .*(?:\n|$))+)/g, (m) => {
+    const items = m.trim().split("\n").map((l) => "<li>" + l.replace(/^[-*] /, "") + "</li>").join("");
+    return "\n<ul>" + items + "</ul>";
+  });
+  s = s.replace(/\x00(\d+)\x00/g, (_, i) => blocks[Number(i)]);
+  return s;
+}
+
 function statusLine(m) {
   if (m.role === "user") {
     if (m.status === "pending") return "sending&hellip;";
@@ -254,7 +289,7 @@ function statusLine(m) {
 }
 
 function render(m) {
-  const body = esc(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
+  const body = md(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
   return '<div class="msg ' + m.role + '" id="msg-' + m.id + '">' +
     '<div class="bubble">' + body + '</div>' +
     '<div class="status">' + statusLine(m) + '</div>' +
