@@ -372,11 +372,26 @@ function isDoneNotice(m) {
   return m.role === "system" && m.status === "notice-done";
 }
 
+// `created_at` is stored/served as RFC3339 (UTC) -- render it in the browser's own
+// local time/format rather than shipping a fixed format from the server, so it reads
+// naturally regardless of where the browser is. Empty/unparseable falls back to "".
+function formatTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  const datePart = d.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+  const timePart = d.toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
+  return datePart + ", " + timePart;
+}
+
 function render(m) {
   const body = md(m.body) || (m.role === "assistant" && m.status === "streaming" ? "…" : "");
+  const status = statusLine(m);
+  const time = esc(formatTime(m.created_at));
   return '<div class="msg ' + m.role + '" id="msg-' + m.id + '">' +
     '<div class="bubble">' + body + '</div>' +
-    '<div class="status">' + statusLine(m) + '</div>' +
+    '<div class="status"><span class="time">' + time + '</span>' +
+    (status ? ' &middot; ' + status : '') + '</div>' +
     '</div>';
 }
 

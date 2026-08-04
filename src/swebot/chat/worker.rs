@@ -577,6 +577,13 @@ fn unified_instructions(clone_dir: &Path) -> String {
          Answer questions directly and concretely, citing specific files/lines; say \
          plainly when something isn't knowable from the code alone rather than guessing. \
          Keep answers tight -- this is a chat, not a report.\n\
+         If answering will take real exploration (reading multiple files, running \
+         tests/greps, anything beyond an instant lookup), START your response with one \
+         short sentence naming what you're about to check (e.g. \"Let me check how the \
+         retry logic is wired up.\") before you actually do it, so the person sees that \
+         immediately instead of silence while you work -- then continue in the same \
+         response with your findings once you have them. Skip this for anything you can \
+         answer instantly from what you already know.\n\
          When the user asks you to draft or file a ticket, drive a short scoping dialogue: \
          ask only the clarifying questions that actually change scope (acceptance \
          criteria, edge cases, what's out of scope), then -- once you have enough to \
