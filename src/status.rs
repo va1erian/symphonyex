@@ -21,6 +21,7 @@
 //! through this constructor just to decide whether to mount one more route.
 
 use crate::eventlog;
+use crate::web::{escape, urlencode};
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Html;
@@ -148,75 +149,36 @@ pub async fn serve_composite(
     Ok(())
 }
 
-const STYLE: &str = r#"
-  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
-  h1 { font-size: 1.1rem; font-weight: 600; color: #9cf; margin: 0 0 4px; }
-  .meta { color: #888; font-size: 0.8rem; margin-bottom: 12px; }
-  nav { margin-bottom: 20px; }
-  nav a { color: #9cf; text-decoration: none; margin-right: 16px; font-size: 0.85rem; }
-  nav a:hover { text-decoration: underline; }
-  .grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 32px; }
-  .card { background: #1c1c1c; border: 1px solid #333; border-left: 4px solid #4caf50; border-radius: 6px; padding: 12px 14px; width: 300px; }
-  .card h2 { font-size: 0.95rem; margin: 0 0 6px; color: #fff; }
-  .card .row { font-size: 0.8rem; color: #aaa; margin: 2px 0; }
-  .card .row b { color: #ccc; }
-  .card .msg { margin-top: 8px; font-size: 0.78rem; color: #ddd; background: #151515; border-radius: 4px; padding: 6px 8px; max-height: 4.5em; overflow: hidden; }
-  .badge { display: inline-block; background: #2d4d2d; color: #9f9; border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; }
-  table { border-collapse: collapse; width: 100%; max-width: 1100px; }
-  th, td { text-align: left; padding: 6px 10px; font-size: 0.82rem; border-bottom: 1px solid #2a2a2a; }
-  th { color: #888; font-weight: 500; }
-  .empty { color: #666; font-style: italic; }
-  section h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; }
-  form.filters { margin: 12px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  form.filters input, form.filters select { background: #1c1c1c; border: 1px solid #333; color: #eee; padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; }
-  form.filters button { background: #2d4d2d; border: 1px solid #3a6a3a; color: #9f9; padding: 4px 12px; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
-  .pager { margin-top: 12px; font-size: 0.82rem; }
-  .pager a { color: #9cf; margin-right: 12px; text-decoration: none; }
-  .totals { display: flex; gap: 24px; margin-bottom: 24px; flex-wrap: wrap; }
-  .totals .stat { background: #1c1c1c; border: 1px solid #333; border-radius: 6px; padding: 10px 16px; min-width: 100px; }
-  .totals .stat .n { font-size: 1.4rem; font-weight: 600; color: #9cf; }
-  .totals .stat .l { font-size: 0.72rem; color: #888; text-transform: uppercase; letter-spacing: 0.04em; }
-"#;
-
-/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`);
-/// `base` (`AppState::base_path`) is prepended only to the emitted `href`, so callers
-/// keep comparing/passing the same unprefixed identifiers regardless of where this
-/// router ends up mounted.
-fn nav(active: &str, base: &str) -> String {
-    let link = |href: &str, label: &str| {
-        if href == active {
-            format!(r#"<a href="{base}{href}" style="color:#fff;font-weight:600">{label}</a>"#)
-        } else {
-            format!(r#"<a href="{base}{href}">{label}</a>"#)
-        }
-    };
-    format!(
-        "<nav>{}{}{}{}</nav>",
-        link("/", "Status"),
-        link("/events", "Events"),
-        link("/usage", "Usage"),
-        link("/board", "Board"),
-    )
-}
+/// `active` and each route below are mount-relative (`"/"`, `"/events"`, `"/usage"`,
+/// `"/board"`); `base` (`AppState::base_path`) is prepended only to the emitted `href`
+/// by `web::nav`, so callers keep comparing/passing the same unprefixed identifiers
+/// regardless of where this router ends up mounted.
+const NAV_LINKS: &[crate::web::NavLink] = &[
+    crate::web::NavLink {
+        href: "/",
+        label: "Status",
+    },
+    crate::web::NavLink {
+        href: "/events",
+        label: "Events",
+    },
+    crate::web::NavLink {
+        href: "/usage",
+        label: "Usage",
+    },
+    crate::web::NavLink {
+        href: "/board",
+        label: "Board",
+    },
+];
 
 fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base: &str) -> String {
-    format!(
-        r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Symphony &mdash; {title}</title>
-<style>{STYLE}</style>
-{extra_head}
-</head>
-<body>
-<h1>Symphony</h1>
-{nav}
-{body}
-</body>
-</html>
-"#,
-        nav = nav(active_nav, base),
+    crate::web::page_shell(
+        "Symphony",
+        title,
+        &crate::web::nav(NAV_LINKS, active_nav, base),
+        body,
+        extra_head,
     )
 }
 
@@ -291,6 +253,15 @@ fn render_fragment(s: &StatusSnapshot) -> String {
 }
 
 fn running_card(r: &RunningRow) -> String {
+    let message = r.last_message.as_deref().unwrap_or("");
+    // Only hint "click to expand" when the message is actually long enough that the
+    // 4.5-line clamp (`.msg`'s `max-height` in web::STYLE) would clip it -- showing the
+    // hint on a one-line message would be misleading, since expanding it changes nothing.
+    let expandable_attr = if message.len() > 140 {
+        " data-expandable"
+    } else {
+        ""
+    };
     format!(
         r#"<div class="card">
   <h2>{identifier}</h2>
@@ -298,7 +269,7 @@ fn running_card(r: &RunningRow) -> String {
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
   <div class="row"><b>last event</b> {event}</div>
-  <div class="msg">{message}</div>
+  <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
         identifier = escape(&r.identifier),
         title = escape(&r.title),
@@ -307,7 +278,7 @@ fn running_card(r: &RunningRow) -> String {
         turn = r.turn_count,
         tools = r.tool_call_count,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
-        message = escape(r.last_message.as_deref().unwrap_or("")),
+        message = escape(message),
     )
 }
 
@@ -386,17 +357,21 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
 
     let body = format!(
         r#"<form class="filters" method="get">
-  <input type="text" name="issue" placeholder="issue id" value="{issue}">
-  <input type="text" name="type" placeholder="event type" value="{event_type}">
+  <label for="f-issue">Issue</label>
+  <input type="text" id="f-issue" name="issue" placeholder="issue id" value="{issue}">
+  <label for="f-type">Type</label>
+  <input type="text" id="f-type" name="type" placeholder="event type" value="{event_type}">
   <button type="submit">Filter</button>
   {importance_toggle}
 </form>
+<div class="table-wrap">
 <table>
-<thead><tr><th>ID</th><th>Time</th><th>Issue</th><th>Session</th><th>Type</th><th>Message</th><th>Tokens</th></tr></thead>
+<thead><tr><th data-sort>ID</th><th data-sort>Time</th><th data-sort>Issue</th><th data-sort>Session</th><th data-sort>Type</th><th>Message</th><th data-sort>Tokens</th></tr></thead>
 <tbody>
 {table_rows}
 </tbody>
 </table>
+</div>
 <div class="pager">{prev} {next}</div>"#,
         issue = escape(q.issue.as_deref().unwrap_or("")),
         event_type = escape(q.event_type.as_deref().unwrap_or("")),
@@ -455,7 +430,7 @@ fn event_row(r: &eventlog::EventRow, base: &str) -> String {
         escape(&r.event_type)
     };
     format!(
-        "<tr><td>{id}</td><td>{time}</td><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td>{message}</td><td>{tokens}</td></tr>",
+        "<tr><td>{id}</td><td>{time}</td><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td class=\"empty\">{session}</td><td>{event_type}</td><td class=\"msg-cell\">{message}</td><td>{tokens}</td></tr>",
         id = r.id,
         time = escape(&r.created_at),
         issue_link = urlencode(&r.issue_id),
@@ -484,7 +459,7 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     };
 
     let body = format!(
-        r#"<div class="totals">
+        r#"<div class="stats">
   <div class="stat"><div class="n">{dispatches}</div><div class="l">Dispatches</div></div>
   <div class="stat"><div class="n">{turns}</div><div class="l">Turns</div></div>
   <div class="stat"><div class="n">{tools}</div><div class="l">Tool calls</div></div>
@@ -494,12 +469,14 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
 </div>
 <section>
 <h3>Per issue</h3>
+<div class="table-wrap">
 <table>
-<thead><tr><th>Issue</th><th>Dispatches</th><th>Turns</th><th>Tool calls</th><th>Input</th><th>Output</th><th>Total</th><th>Last event</th></tr></thead>
+<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th>Last event</th></tr></thead>
 <tbody>
 {issue_rows}
 </tbody>
 </table>
+</div>
 </section>"#,
         dispatches = summary.dispatch_count,
         turns = summary.turn_count,
@@ -527,32 +504,6 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
         last_event = escape(&r.last_event_type),
         last_at = escape(&r.last_event_at),
     )
-}
-
-fn urlencode(s: &str) -> String {
-    // Minimal, dependency-free percent-encoding: this codebase's identifiers/event
-    // types are plain ASCII (issue numbers, snake_case event names), so covering the
-    // handful of characters that are actually meaningful in a query string (space,
-    // &, =, #, %, +) is enough -- not a general-purpose encoder.
-    s.chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            '&' => "%26".to_string(),
-            '=' => "%3D".to_string(),
-            '#' => "%23".to_string(),
-            '%' => "%25".to_string(),
-            '+' => "%2B".to_string(),
-            c => c.to_string(),
-        })
-        .collect()
-}
-
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -622,12 +573,5 @@ mod tests {
         };
         let html = event_row(&row, "");
         assert!(html.contains(">-<"));
-    }
-
-    #[test]
-    fn urlencode_handles_query_meaningful_characters() {
-        assert_eq!(urlencode("a b"), "a%20b");
-        assert_eq!(urlencode("a&b"), "a%26b");
-        assert_eq!(urlencode("plain"), "plain");
     }
 }

@@ -18,6 +18,7 @@ mod status;
 mod swebot;
 mod template;
 mod tracker;
+mod web;
 mod workflow;
 mod workspace;
 
