@@ -289,11 +289,22 @@ async fn run_mcp_tool_server(
         },
         None => None,
     };
+    // `pipeline.enabled` gates both `record_artifact` (AIR-3) and the delivery
+    // pipeline's own tools (AIR-4: `record_requirements`/`record_acceptance_criteria`/
+    // `raise_clarification`) the same way `repo_pr_json`'s presence gates
+    // `open_pull_request` above. Both wirings share the same `db_path`/`workflow_dir`
+    // pair (`crate::artifacts` is the one store both write through), and
+    // `pipeline_enabled` is already resolved and passed down to this subprocess, so
+    // there's no need to re-resolve WORKFLOW.md here.
     let artifacts_wiring = pipeline_enabled.then(|| mcp::ArtifactsWiring {
         db_path: workflow_dir.join(eventlog::DB_FILENAME),
         workflow_dir: workflow_dir.to_path_buf(),
     });
-    match mcp::run_stdio_server(adapter, repo_host, artifacts_wiring, issue_id, workspace_dir).await {
+    let pipeline = pipeline_enabled.then(|| mcp::PipelineToolCtx {
+        db_path: workflow_dir.join(eventlog::DB_FILENAME),
+        workflow_dir: workflow_dir.to_path_buf(),
+    });
+    match mcp::run_stdio_server(adapter, repo_host, artifacts_wiring, pipeline, issue_id, workspace_dir).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");
