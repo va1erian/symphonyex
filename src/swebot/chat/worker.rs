@@ -1,4 +1,4 @@
-//! Chat worker: the single authority that turns pending user messages into SweBot
+﻿//! Chat worker: the single authority that turns pending user messages into SweBot
 //! replies. One task per project, polled on `swebot.chat.poll_interval_ms` -- kept
 //! fast since answering is purely local. Each remote connector's own `ingest`/
 //! `deliver` (e.g. GitHub Discussions) run on the separate, slower
@@ -12,7 +12,7 @@
 //! 3. Insert an empty assistant message (`streaming`) and run the turn **streaming**
 //!    (`run_turn_streaming`): each `AgentEvent` text chunk is flushed into the store
 //!    (~150ms cadence), so the web UI shows the reply appearing rather than a blank
-//!    window. A `tool_call` event live-updates a single "Using `<tool>`…" system
+//!    window. A `tool_call` event live-updates a single "Using `<tool>`â€¦" system
 //!    notice (throttled ~400ms) instead of the reply going silent while the model
 //!    reads files/runs commands; if nothing at all has arrived within
 //!    `swebot.chat.first_text_deadline_ms` (default 2000) that same notice is created
@@ -44,7 +44,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Placeholder shown while an assistant message streams its first text.
-const NOTICE_BODY: &str = "Still working on that — checking the code; I'll reply shortly.";
+const NOTICE_BODY: &str = "Still working on that â€” checking the code; I'll reply shortly.";
 
 pub async fn run_loop(
     cfg: EffectiveConfig,
@@ -178,7 +178,7 @@ async fn answer_pending(
                 // superseded): the user on a non-web connector must actually see it.
                 if let Ok(notice_id) = store.insert_system_notice(
                     msg.conversation_id,
-                    &format!("Sorry — I hit an error answering that: {e}"),
+                    &format!("Sorry â€” I hit an error answering that: {e}"),
                 ) {
                     let _ = store.set_message_status(notice_id, STATUS_NOTICE_ERROR);
                 }
@@ -230,6 +230,7 @@ async fn respond_to(
             &format!("chat-{}", msg.id),
             &format!("chat-{}", msg.id),
             None,
+            &crate::agent::ToolPolicy::SWEBOT,
         )
         .await
         .map_err(|e| format!("session startup failed: {e}"))?;
@@ -471,7 +472,7 @@ async fn create_from_pending_draft(
         lines.push(format!("**{title}** ({ref_str})"));
     }
     let reply = format!(
-        "Done — created {}. Symphony will pick {} up on its next poll.",
+        "Done â€” created {}. Symphony will pick {} up on its next poll.",
         lines.join(", "),
         if lines.len() == 1 { "it" } else { "them" },
     );
@@ -535,7 +536,7 @@ async fn run_turn_streaming(
         let deadline = tokio::time::Instant::now() + Duration::from_millis(first_text_deadline_ms);
         // The live-status notice, upserted (not re-inserted) as tool activity comes
         // in -- one row per turn, its body replaced each time, so a turn that reads
-        // three files and runs a test shows "Using `read`…" -> "Using `bash`…" in
+        // three files and runs a test shows "Using `read`â€¦" -> "Using `bash`â€¦" in
         // place instead of a single static "still working" message the user gets to
         // stare at for however long the turn actually takes. Lazily created either
         // by the first tool_call event or by the deadline firing, whichever is
@@ -604,7 +605,7 @@ async fn run_turn_streaming(
                             let now = tokio::time::Instant::now();
                             if now.duration_since(last_notice_flush) >= Duration::from_millis(400) {
                                 last_notice_flush = now;
-                                let body = format!("Using `{tool}`…");
+                                let body = format!("Using `{tool}`â€¦");
                                 match notice_id {
                                     Some(id) => {
                                         let _ = store2.set_message_body(id, &body);
@@ -712,13 +713,13 @@ fn truncate_body(body: &str) -> String {
     const MAX_CHARS: usize = 4_000;
     let s: String = body.chars().take(MAX_CHARS).collect();
     if s.chars().count() < body.chars().count() {
-        format!("{s}\n…[truncated]")
+        format!("{s}\nâ€¦[truncated]")
     } else {
         s
     }
 }
 
-/// Cut every trailing fenced ```json … ``` block (and surrounding whitespace) out of
+/// Cut every trailing fenced ```json â€¦ ``` block (and surrounding whitespace) out of
 /// a turn's raw response so the JSON scaffold never shows up in the chat UI. Uses
 /// the *first* fence, not the last, so a multi-ticket response (several ```json
 /// blocks in a row) has all of them stripped, not just the last. A bare JSON object
@@ -940,7 +941,7 @@ mod tests {
             .unwrap();
         assert!(
             msgs.iter()
-                .any(|m| m.role == ROLE_ASSISTANT && m.body.contains("Done — created"))
+                .any(|m| m.role == ROLE_ASSISTANT && m.body.contains("Done â€” created"))
         );
     }
 
@@ -959,6 +960,7 @@ mod tests {
             _issue_id: &str,
             _title: &str,
             _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
         ) -> Result<Box<dyn AgentSession>, AgentError> {
             Ok(Box::new(SlowSession {
                 delay_ms: self.first_text_delay_ms,
@@ -1101,6 +1103,7 @@ mod tests {
                 _issue_id: &str,
                 _title: &str,
                 _container: Option<&ContainerHandle>,
+                _tool_policy: &crate::agent::ToolPolicy,
             ) -> Result<Box<dyn AgentSession>, AgentError> {
                 Ok(Box::new(MultiChunkSession {
                     chunks: vec!["First, the circuit breaker.", "Then the concurrency cap."],
@@ -1140,6 +1143,7 @@ mod tests {
                 _issue_id: &str,
                 _title: &str,
                 _container: Option<&ContainerHandle>,
+                _tool_policy: &crate::agent::ToolPolicy,
             ) -> Result<Box<dyn AgentSession>, AgentError> {
                 Ok(Box::new(ToolUsingSession {
                     tools: vec!["read", "bash"],
@@ -1164,7 +1168,7 @@ mod tests {
         );
         // Its body ends up reflecting the *last* tool used before the deadline never
         // even had to fire (first_text_deadline_ms is enormous above).
-        assert_eq!(notices[0].body, "Using `bash`…");
+        assert_eq!(notices[0].body, "Using `bash`â€¦");
         assert_eq!(notices[0].status, super::super::store::STATUS_NOTICE_DONE);
         let assistant = msgs.iter().find(|m| m.role == ROLE_ASSISTANT).unwrap();
         assert_eq!(assistant.body, "here's the answer");
