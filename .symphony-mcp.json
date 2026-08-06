@@ -10,9 +10,9 @@
         "--workflow-dir",
         "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66",
         "--issue-id",
-        "AIR-2",
+        "AIR-7",
         "--workspace-dir",
-        "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66\\.symphony\\dogfood-workspaces\\AIR-2"
+        "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66\\.symphony\\dogfood-workspaces\\AIR-7"
       ],
       "command": "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66\\target\\debug\\symphony.exe"
     }

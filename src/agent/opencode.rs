@@ -603,6 +603,9 @@ fn mcp_config_env(
         argv.push("--repo-pr".to_string());
         argv.push(repo_pr_json.clone());
     }
+    if wiring.pipeline_enabled {
+        argv.push("--pipeline-enabled".to_string());
+    }
     let config = json!({
         "mcp": {
             "symphony": {
@@ -826,6 +829,7 @@ mod tests {
             tracker_provider_json: r#"{"dir":"issues"}"#.to_string(),
             workflow_dir: PathBuf::from("/wf"),
             repo_pr_json: None,
+            pipeline_enabled: false,
         }
     }
 
@@ -874,6 +878,26 @@ mod tests {
             Some(&r#"{"url":"https://github.com/o/r.git"}"#)
         );
         assert_eq!(argv[argv.len() - 2], "--repo-pr");
+    }
+
+    #[test]
+    fn mcp_config_env_includes_pipeline_enabled_flag_when_the_pipeline_is_on() {
+        let mut wiring = test_wiring();
+        wiring.pipeline_enabled = true;
+        let (_, value) = mcp_config_env(&wiring, "42", Path::new("/wf/ws-42"), None);
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(argv.contains(&"--pipeline-enabled"));
+    }
+
+    #[test]
+    fn mcp_config_env_omits_pipeline_enabled_flag_by_default() {
+        let (_, value) = mcp_config_env(&test_wiring(), "42", Path::new("/wf/ws-42"), None);
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(!argv.contains(&"--pipeline-enabled"));
     }
 
     #[test]

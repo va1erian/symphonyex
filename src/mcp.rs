@@ -14,29 +14,57 @@
 //! stdout is reserved for protocol messages only — all logging in this process must go
 //! to stderr (enforced in `main.rs`).
 
+use crate::artifacts;
 use crate::repo_host::RepoHost;
 use crate::tracker::{ToolResult, TrackerAdapter};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-/// Route a `tools/call` to whichever of the two independent tool sources actually
-/// owns `name` (Section "PR-based branch workflow"): the tracker's own tools (e.g.
-/// `update_issue_state`) or, when `repo.pull_request` is enabled, `open_pull_request`
-/// from `repo_host` -- a pull request is a property of the code host, not the issue
-/// tracker, so it's kept as its own capability rather than folded into
-/// `TrackerAdapter`. `tracker_names` decides routing explicitly (not by matching on
+/// `record_artifact`'s own wiring (`crate::artifacts`), present only when
+/// `pipeline.enabled` -- see this module's own doc comment and `artifacts.rs`'s. Kept
+/// as its own struct (rather than two loose `PathBuf` params threaded everywhere)
+/// since both fields always travel together.
+pub struct ArtifactsWiring {
+    pub db_path: PathBuf,
+    pub workflow_dir: PathBuf,
+}
+
+/// Route a `tools/call` to whichever of the three independent tool sources actually
+/// owns `name` (Section "PR-based branch workflow", AIR-3): the tracker's own tools
+/// (e.g. `update_issue_state`), `record_artifact` (owned by the cycle, not the tracker
+/// or the code host -- checked first since it never overlaps with the other two), or,
+/// when `repo.pull_request` is enabled, `open_pull_request`/`attach_evidence` from
+/// `repo_host`. `tracker_names` decides tracker routing explicitly (not by matching on
 /// the tracker's own "unsupported tool" error text, which would be fragile).
+#[allow(clippy::too_many_arguments)]
 async fn route_call(
     adapter: &dyn TrackerAdapter,
     repo_host: Option<&dyn RepoHost>,
+    artifacts_wiring: Option<&ArtifactsWiring>,
     tracker_names: &HashSet<&str>,
     name: &str,
     arguments: Value,
     issue_id: &str,
     workspace_dir: &Path,
 ) -> ToolResult {
+    if name == "record_artifact" {
+        return match artifacts_wiring {
+            Some(w) => {
+                artifacts::execute_tool(
+                    &w.db_path,
+                    &w.workflow_dir,
+                    workspace_dir,
+                    issue_id,
+                    issue_id,
+                    arguments,
+                )
+                .await
+            }
+            None => ToolResult::error("record_artifact is unavailable: pipeline is not enabled"),
+        };
+    }
     if tracker_names.contains(name) {
         adapter.execute_agent_tool(name, arguments, issue_id).await
     } else if let Some(host) = repo_host {
@@ -50,6 +78,7 @@ async fn route_call(
 pub async fn run_stdio_server(
     adapter: Box<dyn TrackerAdapter>,
     repo_host: Option<Box<dyn RepoHost>>,
+    artifacts_wiring: Option<ArtifactsWiring>,
     issue_id: &str,
     workspace_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -58,8 +87,17 @@ pub async fn run_stdio_server(
         .as_ref()
         .map(|r| r.agent_tool_specs())
         .unwrap_or_default();
+    let artifact_specs = if artifacts_wiring.is_some() {
+        vec![artifacts::tool_spec()]
+    } else {
+        Vec::new()
+    };
     let tracker_names: HashSet<&str> = tracker_specs.iter().map(|s| s.name.as_str()).collect();
-    let specs: Vec<_> = tracker_specs.iter().chain(repo_specs.iter()).collect();
+    let specs: Vec<_> = tracker_specs
+        .iter()
+        .chain(repo_specs.iter())
+        .chain(artifact_specs.iter())
+        .collect();
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
@@ -114,6 +152,7 @@ pub async fn run_stdio_server(
                 let result = route_call(
                     adapter.as_ref(),
                     repo_host.as_deref(),
+                    artifacts_wiring.as_ref(),
                     &tracker_names,
                     name,
                     arguments,
@@ -250,6 +289,7 @@ mod tests {
         let result = route_call(
             &tracker,
             Some(&host),
+            None,
             &names,
             "update_issue_state",
             json!({}),
@@ -283,6 +323,7 @@ mod tests {
         let result = route_call(
             &tracker,
             Some(&host),
+            None,
             &names,
             "open_pull_request",
             json!({"title": "t", "body": "b"}),
@@ -301,6 +342,7 @@ mod tests {
 
         let result = route_call(
             &tracker,
+            None,
             None,
             &names,
             "nonexistent",
@@ -327,5 +369,57 @@ mod tests {
         let merged: Vec<_> = tracker_specs.iter().chain(repo_specs.iter()).collect();
         let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["update_issue_state", "open_pull_request"]);
+    }
+
+    #[tokio::test]
+    async fn record_artifact_is_unavailable_when_pipeline_is_not_enabled() {
+        let tracker = FakeTracker;
+        let specs = tracker.agent_tool_specs();
+        let names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+
+        let result = route_call(
+            &tracker,
+            None,
+            None,
+            &names,
+            "record_artifact",
+            json!({}),
+            "1",
+            Path::new("."),
+        )
+        .await;
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn record_artifact_routes_to_the_artifact_store_when_pipeline_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let wiring = ArtifactsWiring {
+            db_path: dir.path().join("symphony.db"),
+            workflow_dir: dir.path().to_path_buf(),
+        };
+        let tracker = FakeTracker;
+        let specs = tracker.agent_tool_specs();
+        let names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+
+        let result = route_call(
+            &tracker,
+            None,
+            Some(&wiring),
+            &names,
+            "record_artifact",
+            json!({
+                "kind": "plan",
+                "content_type": "text/plain",
+                "content": "do the thing",
+                "summary": "plan"
+            }),
+            "1",
+            &workspace,
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
     }
 }
