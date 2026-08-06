@@ -19,10 +19,12 @@
 //! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 
+use crate::artifacts;
 use crate::eventlog;
 use crate::web::{escape, urlencode};
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::StatusCode;
 use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
@@ -133,6 +135,8 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/artifacts", get(artifacts_page))
+        .route("/artifacts/{id}", get(artifact_raw_page))
         .with_state(state)
 }
 
@@ -732,6 +736,129 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
         last_event = escape(&r.last_event_type),
         last_at = escape(&r.last_event_at),
     )
+}
+
+// --------------------------------------------------------------------------------
+// /artifacts -- browsable AIR-3 artifact store (`crate::artifacts`), grouped by issue
+// and cycle, plus a per-artifact raw view. Read-only: recording only ever happens
+// through the `record_artifact` agent tool, never from this dashboard -- there's no
+// human action to expose here (unlike a future "approve"/"override" surface), just
+// visibility into what each cycle produced.
+// --------------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct ArtifactsQuery {
+    cycle: Option<String>,
+}
+
+async fn artifacts_page(
+    State(state): State<AppState>,
+    Query(q): Query<ArtifactsQuery>,
+) -> Html<String> {
+    let db_path = state.eventlog_db_path();
+    let rows = match q.cycle.as_deref().filter(|s| !s.is_empty()) {
+        Some(cycle) => artifacts::list_for_cycle(&db_path, cycle),
+        None => artifacts::list_all(&db_path),
+    };
+    let base = state.base_path.as_str();
+
+    let table_rows: String = if rows.is_empty() {
+        "<tr><td colspan=\"6\" class=\"empty\">No artifacts recorded yet.</td></tr>".to_string()
+    } else {
+        rows.iter().map(|r| artifact_row(r, base)).collect()
+    };
+
+    let filter_chip = q
+        .cycle
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|cycle| {
+            format!(
+                r#"<div class="chips"><span class="chip">cycle: {}<a href="{base}/artifacts" aria-label="clear cycle filter">&times;</a></span></div>"#,
+                escape(cycle)
+            )
+        })
+        .unwrap_or_default();
+
+    let body = format!(
+        r#"<form class="filters" method="get">
+  <label for="f-cycle">Cycle</label>
+  <input type="text" id="f-cycle" name="cycle" placeholder="issue id" value="{cycle}">
+  <button type="submit">Filter</button>
+</form>
+{filter_chip}
+<div class="table-wrap">
+<table>
+<thead><tr><th data-sort>Recorded</th><th data-sort>Issue</th><th data-sort>Stage</th><th data-sort>Kind</th><th>Summary</th><th data-sort>Content type</th></tr></thead>
+<tbody>
+{table_rows}
+</tbody>
+</table>
+</div>"#,
+        cycle = escape(q.cycle.as_deref().unwrap_or("")),
+        filter_chip = filter_chip,
+        table_rows = table_rows,
+    );
+    Html(page_shell("artifacts", "/artifacts", &body, "", base))
+}
+
+fn artifact_row(r: &artifacts::ArtifactRow, base: &str) -> String {
+    format!(
+        "<tr><td>{created}</td><td><a href=\"{base}/artifacts?cycle={cycle_link}\">{issue}</a></td><td>{stage}</td>\
+         <td>{kind}</td><td><a href=\"{base}/artifacts/{id_link}\">{summary}</a></td><td class=\"empty\">{content_type}</td></tr>",
+        created = escape(&r.created_at),
+        cycle_link = urlencode(&r.cycle_id),
+        issue = escape(&r.issue_identifier),
+        stage = escape(r.stage_id.as_deref().unwrap_or("-")),
+        kind = escape(&r.kind),
+        id_link = urlencode(&r.id),
+        summary = escape(&r.summary),
+        content_type = escape(&r.content_type),
+    )
+}
+
+async fn artifact_raw_page(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Html<String>, StatusCode> {
+    let db_path = state.eventlog_db_path();
+    let row = artifacts::find_by_id(&db_path, &id).ok_or(StatusCode::NOT_FOUND)?;
+    let base = state.base_path.as_str();
+    let content = artifacts::read_content(&state.workflow_dir, &row)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_else(|e| format!("(could not read artifact content: {e})"));
+
+    let body = format!(
+        r#"<div class="meta">
+  <div class="row"><b>id</b> {id}</div>
+  <div class="row"><b>issue</b> <a href="{base}/artifacts?cycle={cycle_link}">{issue}</a></div>
+  <div class="row"><b>stage</b> {stage}</div>
+  <div class="row"><b>kind</b> {kind}</div>
+  <div class="row"><b>content type</b> {content_type}</div>
+  <div class="row"><b>sha256</b> {sha}</div>
+  <div class="row"><b>recorded</b> {created}</div>
+  <div class="row"><b>summary</b> {summary}</div>
+</div>
+<pre class="table-wrap">{content}</pre>"#,
+        id = escape(&row.id),
+        base = base,
+        cycle_link = urlencode(&row.cycle_id),
+        issue = escape(&row.issue_identifier),
+        stage = escape(row.stage_id.as_deref().unwrap_or("-")),
+        kind = escape(&row.kind),
+        content_type = escape(&row.content_type),
+        sha = escape(&row.sha256),
+        created = escape(&row.created_at),
+        summary = escape(&row.summary),
+        content = escape(&content),
+    );
+    Ok(Html(page_shell(
+        &format!("artifact {}", row.id),
+        "/artifacts",
+        &body,
+        "",
+        base,
+    )))
 }
 
 #[cfg(test)]

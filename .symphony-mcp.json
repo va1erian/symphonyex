@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "symphony": {
+      "args": [
+        "__mcp_tool_server",
+        "--tracker-kind",
+        "local",
+        "--tracker-provider",
+        "{\"dir\":\"./issues\"}",
+        "--workflow-dir",
+        "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66",
+        "--issue-id",
+        "AIR-3",
+        "--workspace-dir",
+        "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66\\.symphony\\dogfood-workspaces\\AIR-3"
+      ],
+      "command": "C:\\Users\\hadri\\Documents\\repos\\symphony\\.claude\\worktrees\\code-tree-improvements-1a9f66\\target\\debug\\symphony.exe"
+    }
+  }
+}

@@ -138,9 +138,31 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_importance ON events(importance);
+
+-- AIR-3: per-cycle artifact store (see `crate::artifacts`). Added here, not a
+-- separate database, so an old `symphony.db` upgrades in place the same way the
+-- `events` table above always has: `CREATE TABLE IF NOT EXISTS` on every `open()`,
+-- no explicit version-numbered migration step needed.
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL,
+    issue_identifier TEXT NOT NULL,
+    stage_id TEXT,
+    kind TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    summary TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_cycle ON artifacts(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_issue ON artifacts(issue_identifier);
 ";
 
-fn open(path: &Path) -> rusqlite::Result<Connection> {
+/// `pub(crate)`: `crate::artifacts` opens the same `symphony.db` connection through
+/// this function too, so its `artifacts` table (added to `SCHEMA` above) gets the same
+/// "open, migrate, keep going" treatment as `events` -- one schema, one open path.
+pub(crate) fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(SCHEMA)?;
@@ -382,6 +404,48 @@ mod tests {
         };
         let all = recent_events(&db, &all_filter, 50, 0).unwrap();
         assert_eq!(all.len(), 2, "{all:?}");
+    }
+
+    /// AIR-3: a `symphony.db` created before the `artifacts` table existed must gain it
+    /// on the next `open()` without losing what's already there -- the same "open,
+    /// migrate, keep going" guarantee `events` itself relies on.
+    #[tokio::test]
+    async fn opening_a_pre_artifacts_db_adds_the_table_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("symphony.db");
+        {
+            // Simulates a database written before this table existed: only `events`.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, issue_id TEXT NOT NULL, \
+                 identifier TEXT NOT NULL, title TEXT NOT NULL, session_id TEXT, event_type TEXT NOT NULL, \
+                 importance TEXT NOT NULL, message TEXT, input_tokens INTEGER, output_tokens INTEGER, \
+                 total_tokens INTEGER, created_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        conn.execute(
+            "INSERT INTO artifacts (id, cycle_id, issue_identifier, stage_id, kind, content_type, \
+             path, sha256, created_at, summary) VALUES ('a', '1', '1', NULL, 'plan', 'text/plain', \
+             'p', 'h', 'now', 's')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Re-opening (mirrors a process restart) still works and both tables persist.
+        let conn = open(&db).unwrap();
+        let artifact_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(artifact_count, 1);
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
     }
 
     #[tokio::test]
