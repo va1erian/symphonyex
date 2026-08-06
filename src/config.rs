@@ -87,9 +87,7 @@ pub enum ConfigError {
     UnknownChatConnector(String, String),
     #[error("invalid_config: pipeline.enabled is true but pipeline.stages is empty")]
     EmptyPipelineStages,
-    #[error(
-        "invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field"
-    )]
+    #[error("invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field")]
     InvalidPipelineStage(usize),
 }
 
@@ -398,6 +396,32 @@ pub struct PipelineConfig {
     /// state already documents), so the orchestrator's existing eligibility checks
     /// simply stop selecting it for dispatch rather than needing new logic of their own.
     pub blocked_state: String,
+    /// How the project's tests actually run (AIR-6) -- `None` unless `pipeline.test` is
+    /// configured, in which case a stage identified as `id: test` runs these suites
+    /// through the hook plumbing instead of (in addition to) the agent's own turns.
+    pub test: Option<TestConfig>,
+}
+
+/// `pipeline.test` (AIR-6): the project declares how its own suites and coverage tool
+/// run, since Symphony has no built-in notion of "run the tests" for an arbitrary
+/// language/toolchain.
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    /// Suite name -> shell command, in declaration order (`commands:` is a mapping in
+    /// YAML, but order still matters for a stable, readable `test_report`).
+    pub commands: Vec<(String, String)>,
+    pub coverage: Option<CoverageConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageConfig {
+    pub command: String,
+    pub format: crate::quality::CoverageFormat,
+    /// Advisory unless the stage itself is `blocking: true` (`StageConfig::blocking`).
+    pub min_line_percent: Option<f64>,
+    /// Where the coverage command writes its report, relative to the workspace root.
+    /// Defaults to a sensible filename per `format` when not given explicitly.
+    pub path: String,
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -572,6 +596,21 @@ fn get_vec_str(v: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Conventional output filename per coverage format, used when `pipeline.test.coverage`
+/// doesn't set an explicit `path:` -- matches what each tool's docs use as its own
+/// default (e.g. `cargo llvm-cov --json --output-path coverage.json`'s own example).
+fn default_coverage_path(format: crate::quality::CoverageFormat) -> String {
+    use crate::quality::CoverageFormat as F;
+    match format {
+        F::LlvmCov => "coverage.json",
+        F::Lcov => "lcov.info",
+        F::Cobertura => "cobertura.xml",
+        F::Jacoco => "jacoco.xml",
+        F::None => "coverage",
+    }
+    .to_string()
 }
 
 fn get_map(v: &Value, key: &str) -> Value {
@@ -864,7 +903,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                         on_failure: get_str(s, "on_failure")
                             .map(|v| StageFailureAction::parse(&v))
                             .unwrap_or(StageFailureAction::Escalate),
-                        blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                        blocking: get(s, "blocking")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     })
                 })
                 .collect()
@@ -874,11 +915,38 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     if pipeline_enabled && pipeline_stages.is_empty() {
         return Err(ConfigError::EmptyPipelineStages);
     }
+    let test_raw = get(pipeline_raw, "test");
+    let test_cfg = test_raw.map(|t| {
+        let commands = get_map(t, "commands")
+            .as_mapping()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let coverage_raw = get(t, "coverage");
+        let coverage = coverage_raw.and_then(|c| {
+            let command = get_str(c, "command")?;
+            let format =
+                crate::quality::CoverageFormat::parse(&get_str(c, "format").unwrap_or_default());
+            let path = get_str(c, "path").unwrap_or_else(|| default_coverage_path(format));
+            Some(CoverageConfig {
+                command,
+                format,
+                min_line_percent: get(c, "min_line_percent").and_then(|v| v.as_f64()),
+                path,
+            })
+        });
+        TestConfig { commands, coverage }
+    });
+
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
         blocked_state: get_str(pipeline_raw, "blocked_state")
             .unwrap_or_else(|| "blocked".to_string()),
+        test: test_cfg,
     };
 
     let cfg = EffectiveConfig {
@@ -2137,5 +2205,69 @@ mod tests {
         assert_eq!(second.max_turns, 3);
         assert_eq!(second.on_failure, StageFailureAction::Skip);
         assert!(second.blocking);
+    }
+
+    #[test]
+    fn pipeline_test_absent_resolves_to_none() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.pipeline.test.is_none());
+    }
+
+    #[test]
+    fn pipeline_test_parses_commands_and_coverage() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    \
+             commands:\n      unit: cargo test\n      integration: ./scripts/it.sh\n    \
+             coverage:\n      command: cargo llvm-cov --json --output-path coverage.json\n      \
+             format: llvm-cov\n      min_line_percent: 70\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let test = cfg.pipeline.test.expect("pipeline.test should be Some");
+        assert_eq!(test.commands.len(), 2);
+        assert!(
+            test.commands
+                .contains(&("unit".to_string(), "cargo test".to_string()))
+        );
+        assert!(
+            test.commands
+                .contains(&("integration".to_string(), "./scripts/it.sh".to_string()))
+        );
+        let coverage = test.coverage.expect("coverage should be Some");
+        assert_eq!(
+            coverage.command,
+            "cargo llvm-cov --json --output-path coverage.json"
+        );
+        assert_eq!(coverage.format, crate::quality::CoverageFormat::LlvmCov);
+        assert_eq!(coverage.min_line_percent, Some(70.0));
+        // Default path derived from format when `path:` isn't given.
+        assert_eq!(coverage.path, "coverage.json");
+    }
+
+    #[test]
+    fn pipeline_test_coverage_format_none_degrades_without_min_percent() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    \
+             commands:\n      unit: cargo test\n    \
+             coverage:\n      command: echo skip\n      format: none\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let coverage = cfg.pipeline.test.unwrap().coverage.unwrap();
+        assert_eq!(coverage.format, crate::quality::CoverageFormat::None);
+        assert_eq!(coverage.min_line_percent, None);
+    }
+
+    #[test]
+    fn pipeline_test_without_coverage_block_is_none() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    commands:\n      unit: cargo test\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let test = cfg.pipeline.test.unwrap();
+        assert_eq!(
+            test.commands,
+            vec![("unit".to_string(), "cargo test".to_string())]
+        );
+        assert!(test.coverage.is_none());
     }
 }

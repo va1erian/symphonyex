@@ -134,6 +134,92 @@ pub async fn run_hook_maybe_containerized(
     }
 }
 
+/// Full output of a captured command, regardless of exit status -- used by test
+/// execution (AIR-6), which needs pass/fail counts and output text as *data*, not just
+/// a success/failure signal.
+#[derive(Debug, Clone)]
+pub struct HookOutput {
+    /// `None` only if the process was killed by a signal rather than exiting.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Like `run_hook`, but a non-zero exit is returned as data (`HookOutput::exit_code`)
+/// rather than `HookError::NonZeroExit`. Still errors on a genuine spawn/timeout
+/// failure -- those really do mean "couldn't get an answer at all".
+pub async fn run_hook_capture(
+    name: &str,
+    script: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+) -> Result<HookOutput, HookError> {
+    tracing::debug!(hook = name, %timeout_ms, "starting captured workspace command");
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-l")
+        .arg("-s")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| HookError::Spawn(e.to_string()))?;
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let script_owned = script.to_string();
+    let write_task = tokio::spawn(async move {
+        let _ = stdin.write_all(script_owned.as_bytes()).await;
+    });
+
+    let wait = child.wait_with_output();
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await;
+    let _ = write_task.await;
+
+    match result {
+        Ok(Ok(output)) => Ok(HookOutput {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }),
+        Ok(Err(e)) => Err(HookError::Spawn(e.to_string())),
+        Err(_) => {
+            tracing::warn!(hook = name, %timeout_ms, "captured command timed out");
+            Err(HookError::Timeout(timeout_ms))
+        }
+    }
+}
+
+/// Container-aware counterpart to `run_hook_capture`, mirroring
+/// `run_hook_maybe_containerized`'s host/Docker split.
+pub async fn run_hook_capture_maybe_containerized(
+    name: &str,
+    script: &str,
+    host_root: &std::path::Path,
+    host_cwd: &Path,
+    timeout_ms: u64,
+    container: Option<&crate::container::ContainerHandle>,
+) -> Result<HookOutput, HookError> {
+    match container {
+        None => run_hook_capture(name, script, host_cwd, timeout_ms).await,
+        Some(c) => {
+            let container_cwd = c.to_container_path(host_root, host_cwd);
+            crate::container::exec_capture_script(c, &container_cwd, script, timeout_ms)
+                .await
+                .map(|o| HookOutput {
+                    exit_code: o.exit_code,
+                    stdout: o.stdout,
+                    stderr: o.stderr,
+                })
+                .map_err(|e| match e {
+                    crate::container::ContainerError::Timeout(ms) => HookError::Timeout(ms),
+                    other => HookError::Spawn(other.to_string()),
+                })
+        }
+    }
+}
+
 fn truncate(s: &str) -> String {
     if s.len() > MAX_LOGGED_OUTPUT {
         format!("{}... [truncated]", &s[..MAX_LOGGED_OUTPUT])
@@ -166,6 +252,24 @@ mod tests {
     async fn timeout_is_enforced() {
         let dir = tempdir().unwrap();
         let res = run_hook("test", "sleep 5", dir.path(), 100).await;
+        assert!(matches!(res, Err(HookError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn run_hook_capture_returns_exit_code_and_output_without_erroring() {
+        let dir = tempdir().unwrap();
+        let res = run_hook_capture("test", "echo out; echo err 1>&2; exit 3", dir.path(), 5000)
+            .await
+            .unwrap();
+        assert_eq!(res.exit_code, Some(3));
+        assert!(res.stdout.contains("out"));
+        assert!(res.stderr.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn run_hook_capture_still_errors_on_timeout() {
+        let dir = tempdir().unwrap();
+        let res = run_hook_capture("test", "sleep 5", dir.path(), 100).await;
         assert!(matches!(res, Err(HookError::Timeout(_))));
     }
 

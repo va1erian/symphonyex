@@ -17,6 +17,7 @@
 //! no `Arc<Mutex<Connection>>`, matching "keep it basic."
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -287,6 +288,34 @@ pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
     )
 }
 
+/// Latest `message` for each `issue_id` having at least one event of `event_type` --
+/// used by `/usage` (AIR-6) to show the most recent test/coverage summary per issue
+/// without the per-issue usage query (which tracks *last event overall*, not last event
+/// *of a given type*) ever needing to know about test-specific event types.
+pub fn latest_message_by_type(
+    db_path: &Path,
+    event_type: &str,
+) -> rusqlite::Result<HashMap<String, String>> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT issue_id, message FROM events e1 \
+         WHERE event_type = ?1 AND id = (\
+            SELECT MAX(id) FROM events e2 WHERE e2.issue_id = e1.issue_id AND e2.event_type = ?1\
+         )",
+    )?;
+    let rows = stmt.query_map([event_type], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (issue_id, message) = row?;
+        if let Some(m) = message {
+            out.insert(issue_id, m);
+        }
+    }
+    Ok(out)
+}
+
 pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
@@ -462,6 +491,46 @@ mod tests {
         assert_eq!(summary.input_tokens, 100);
         assert_eq!(summary.output_tokens, 50);
         assert_eq!(summary.total_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn latest_message_by_type_returns_the_most_recent_message_per_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("1 passed".to_string()),
+                ..new_event("1", "test_summary")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("2 passed".to_string()),
+                ..new_event("1", "test_summary")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("90%".to_string()),
+                ..new_event("2", "coverage_summary")
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let tests = latest_message_by_type(&db, "test_summary").unwrap();
+        assert_eq!(tests.get("1").map(String::as_str), Some("2 passed"));
+        assert!(!tests.contains_key("2"));
+
+        let coverage = latest_message_by_type(&db, "coverage_summary").unwrap();
+        assert_eq!(coverage.get("2").map(String::as_str), Some("90%"));
+        assert!(!coverage.contains_key("1"));
     }
 
     #[tokio::test]

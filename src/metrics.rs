@@ -50,6 +50,13 @@ pub struct IssueMetrics {
     pub output_tokens: u64,
     pub seconds_running: f64,
     pub last_outcome: Option<String>,
+    /// One-line pass/fail/skip + requirement-gap/regression summary from the most
+    /// recent test stage run (AIR-6), e.g. "12 passed, 1 failed, 0 skipped · 1
+    /// requirement gap(s)". `None` until a test stage has run at least once.
+    pub last_test_summary: Option<String>,
+    /// Most recent measured line-coverage percentage as a display string (e.g.
+    /// "82.3%"), or "not measured" -- `None` until a test stage has run at least once.
+    pub last_coverage: Option<String>,
 }
 
 impl Metrics {
@@ -95,14 +102,15 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
     };
 
     let issue_rows: String = if m.issues.is_empty() {
-        "<tr><td colspan=\"8\" class=\"empty\">No issues dispatched.</td></tr>".to_string()
+        "<tr><td colspan=\"10\" class=\"empty\">No issues dispatched.</td></tr>".to_string()
     } else {
         m.issues
             .iter()
             .map(|(identifier, im)| {
                 format!(
                     "<tr><td>{identifier}</td><td>{title}</td><td>{dispatches}</td><td>{turns}</td>\
-                     <td>{tool_calls}</td><td>{tokens}</td><td>{seconds:.1}s</td><td>{outcome}</td></tr>",
+                     <td>{tool_calls}</td><td>{tokens}</td><td>{seconds:.1}s</td><td>{outcome}</td>\
+                     <td>{tests}</td><td>{coverage}</td></tr>",
                     identifier = escape(identifier),
                     title = escape(&im.title),
                     dispatches = im.dispatch_count,
@@ -111,6 +119,8 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
                     tokens = im.input_tokens + im.output_tokens,
                     seconds = im.seconds_running,
                     outcome = escape(im.last_outcome.as_deref().unwrap_or("running / pending")),
+                    tests = escape(im.last_test_summary.as_deref().unwrap_or("—")),
+                    coverage = escape(im.last_coverage.as_deref().unwrap_or("—")),
                 )
             })
             .collect()
@@ -147,7 +157,7 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
 <h3>Per-issue breakdown</h3>
 <div class="table-wrap">
 <table>
-<thead><tr><th data-sort>Issue</th><th data-sort>Title</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Tokens</th><th data-sort>Runtime</th><th>Last outcome</th></tr></thead>
+<thead><tr><th data-sort>Issue</th><th data-sort>Title</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Tokens</th><th data-sort>Runtime</th><th>Last outcome</th><th>Tests</th><th>Coverage</th></tr></thead>
 <tbody>{issue_rows}</tbody>
 </table>
 </div>
@@ -222,6 +232,26 @@ mod tests {
         assert!(html.contains("Scaffold"));
         assert!(html.contains("Bash"));
         assert!(html.contains("done (normal)"));
+    }
+
+    #[test]
+    fn report_shows_test_and_coverage_columns_when_present() {
+        let mut m = Metrics::default();
+        let entry = m.issue_entry("AR-1", "Scaffold");
+        entry.last_test_summary = Some("3 passed, 1 failed, 0 skipped".to_string());
+        entry.last_coverage = Some("82.3%".to_string());
+
+        let html = render(Path::new("WORKFLOW.md"), &m);
+        assert!(html.contains("3 passed, 1 failed, 0 skipped"));
+        assert!(html.contains("82.3%"));
+    }
+
+    #[test]
+    fn report_shows_placeholder_when_no_test_stage_has_run() {
+        let mut m = Metrics::default();
+        m.issue_entry("AR-1", "Scaffold");
+        let html = render(Path::new("WORKFLOW.md"), &m);
+        assert!(html.contains(">\u{2014}<"), "{html}");
     }
 
     #[test]

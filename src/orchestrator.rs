@@ -1249,13 +1249,36 @@ async fn handle_msg(
             let is_tool_call = event.event == "tool_call";
             let tool_name = event.message.clone().unwrap_or_default();
 
+            // `test_report`/`coverage`'s `message` is the full JSON blob (AIR-6) --
+            // worth persisting (below) and browsing on `/events`, but not worth
+            // clobbering the running card's "last event" line with; the one-line
+            // `test_summary`/`coverage_summary` companions carry the human-readable
+            // version of the same data and update it normally.
+            let is_full_report = matches!(event.event.as_str(), "test_report" | "coverage");
+
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.last_event = Some(event.event.clone());
-                e.last_event_at = Some(Instant::now());
-                if let Some(m) = &event.message {
-                    e.last_message = Some(m.clone());
+                if !is_full_report {
+                    e.last_event = Some(event.event.clone());
+                    e.last_event_at = Some(Instant::now());
+                    if let Some(m) = &event.message {
+                        e.last_message = Some(m.clone());
+                    }
                 }
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+
+                match event.event.as_str() {
+                    "test_summary" => {
+                        state
+                            .metrics
+                            .issue_entry(&identifier, &title)
+                            .last_test_summary = event.message.clone();
+                    }
+                    "coverage_summary" => {
+                        state.metrics.issue_entry(&identifier, &title).last_coverage =
+                            event.message.clone();
+                    }
+                    _ => {}
+                }
 
                 if let Some(u) = &event.usage {
                     e.tokens.input_tokens += u.input_tokens;
@@ -1344,7 +1367,8 @@ async fn handle_msg(
                     };
                     let delay = if rate_limited {
                         state.rate_limited_until = Some(
-                            Instant::now() + Duration::from_millis(shared.config.rate_limit_pause_ms),
+                            Instant::now()
+                                + Duration::from_millis(shared.config.rate_limit_pause_ms),
                         );
                         shared.config.rate_limit_pause_ms
                     } else {
@@ -1538,7 +1562,17 @@ async fn run_attempt_body(
     });
 
     let exit = if cfg.pipeline.enabled {
-        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+        run_pipeline(
+            issue_id,
+            &mut issue,
+            attempt,
+            session.as_mut(),
+            workspace_path,
+            container,
+            snapshot,
+            tx,
+        )
+        .await
     } else {
         match run_turn_loop(
             session.as_mut(),
@@ -1597,11 +1631,11 @@ async fn run_turn_loop(
 ) -> LoopExit {
     let mut turn_number: u32 = 1;
     loop {
-        let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
-        {
-            Ok(p) => p,
-            Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
-        };
+        let prompt =
+            match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns) {
+                Ok(p) => p,
+                Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
+            };
 
         let _ = tx.send(OrchMsg::TurnStarted {
             issue_id: issue_id.to_string(),
@@ -1615,7 +1649,10 @@ async fn run_turn_loop(
             Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
         }
 
-        let refreshed = match tracker.fetch_issues_by_ids(std::slice::from_ref(&issue.id)).await {
+        let refreshed = match tracker
+            .fetch_issues_by_ids(std::slice::from_ref(&issue.id))
+            .await
+        {
             Ok(r) => r,
             Err(e) => return LoopExit::Error(format!("issue state refresh error: {e}")),
         };
@@ -1643,17 +1680,46 @@ async fn run_turn_loop(
 /// a workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
 /// `StageStarted`/`StageFinished` bracket it so `/events` shows per-stage progress
 /// regardless of how the stage (or the whole cycle) ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     issue_id: &str,
     issue: &mut Issue,
     attempt: Option<u32>,
     session: &mut dyn AgentSession,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
     snapshot: &DispatchSnapshot,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
 
     for stage in &cfg.pipeline.stages {
+        // The test stage (AIR-6) is identified by convention (`id: test` plus a
+        // configured `pipeline.test` block), the same way every other stage's `role`
+        // is just a string until AIR-2 gives roles their own resolved behavior --
+        // no new "stage kind" concept, just a naming convention two config keys agree
+        // on. "Before touching anything" (the ticket's own words for the baseline run)
+        // means literally before this stage's agent turns start writing tests.
+        let is_test_stage = stage.id.eq_ignore_ascii_case("test") && cfg.pipeline.test.is_some();
+        let baseline = if is_test_stage {
+            match (&cfg.pipeline.test, &cfg.repo) {
+                (Some(test_cfg), Some(repo)) => {
+                    crate::quality::collect_baseline(
+                        test_cfg,
+                        &cfg.workflow_dir,
+                        workspace_path,
+                        &repo.default_branch,
+                        cfg.hook_timeout_ms,
+                        container,
+                    )
+                    .await
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let _ = tx.send(OrchMsg::StageStarted {
             issue_id: issue_id.to_string(),
             stage_id: stage.id.clone(),
@@ -1690,6 +1756,47 @@ async fn run_pipeline(
                 tx,
             )
             .await;
+        }
+
+        // Run the configured suites/coverage for real once the agent's own turns are
+        // done writing tests (skipped if the stage's turns errored out -- that failure
+        // is handled by the normal `on_failure` path below, running tests against a
+        // possibly half-written change adds nothing). A blocking coverage-gate miss is
+        // handled exactly like a blocking stage failure: park the issue and stop, same
+        // `block_issue` path `on_failure: escalate` already uses.
+        if is_test_stage && !matches!(outcome, LoopExit::Error(_)) {
+            let test_cfg = cfg
+                .pipeline
+                .test
+                .as_ref()
+                .expect("is_test_stage implies Some");
+            let stage_outcome = crate::quality::run_test_stage(
+                test_cfg,
+                &cfg.workflow_dir,
+                workspace_path,
+                cfg.hook_timeout_ms,
+                container,
+                baseline.as_deref(),
+                stage.blocking,
+            )
+            .await;
+            emit_test_stage_events(tx, issue_id, &stage_outcome);
+
+            if let crate::quality::CoverageGate::Blocking {
+                percent,
+                min_percent,
+            } = stage_outcome.gate
+            {
+                let _ = tx.send(OrchMsg::StageFinished {
+                    issue_id: issue_id.to_string(),
+                    stage_id: stage.id.clone(),
+                    outcome: format!(
+                        "blocked: coverage {percent:.1}% below required {min_percent:.1}%"
+                    ),
+                });
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                return ExitReason::Normal;
+            }
         }
 
         let outcome_label = match &outcome {
@@ -1740,13 +1847,64 @@ async fn run_pipeline(
 /// the cycle outright -- the cycle still stops via `ExitReason::Normal` either way,
 /// this only affects whether the tracker's own state reflects why.
 async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state: &str) {
-    if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
+    if let Err(e) = snapshot
+        .tracker
+        .set_issue_state(issue_id, blocked_state)
+        .await
+    {
         tracing::warn!(
             issue_id = %issue_id,
             blocked_state = %blocked_state,
             error = %e,
             "failed to park issue in pipeline.blocked_state after a blocking stage failure"
         );
+    }
+}
+
+/// Feeds the test stage's results into the same `OrchMsg::AgentEvent` pipe every other
+/// agent event flows through (`run_one_turn`'s forwarder above) -- no new persistence
+/// or dashboard-refresh mechanism: `handle_msg` already records every `AgentEvent` to
+/// the event log and republishes the live status snapshot, and `/events` already lets
+/// an operator browse by `event_type`. Three events, cheapest-to-richest: a one-line
+/// summary for the dashboard/report column, then the full `test_report` and `coverage`
+/// JSON for anyone who clicks through to see the per-suite/per-AC evidence.
+fn emit_test_stage_events(
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+    issue_id: &str,
+    outcome: &crate::quality::TestStageOutcome,
+) {
+    let mut summary = AgentEvent::new("test_summary");
+    summary.message = Some(outcome.report.summary_line());
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: summary,
+    });
+
+    let mut coverage_summary = AgentEvent::new("coverage_summary");
+    coverage_summary.message = Some(match outcome.coverage.line_percent() {
+        Some(p) => format!("{p:.1}%"),
+        None => "not measured".to_string(),
+    });
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: coverage_summary,
+    });
+
+    if let Ok(report_json) = serde_json::to_string(&outcome.report) {
+        let mut ev = AgentEvent::new("test_report");
+        ev.message = Some(report_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
+    }
+    if let Ok(coverage_json) = serde_json::to_string(&outcome.coverage) {
+        let mut ev = AgentEvent::new("coverage");
+        ev.message = Some(coverage_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
     }
 }
 
@@ -2044,7 +2202,17 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            Path::new("."),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2060,6 +2228,119 @@ mod tests {
                 ("finished", "implement"),
             ]
         );
+    }
+
+    /// End-to-end AIR-6 wiring test: a `pipeline.test` stage actually runs the
+    /// configured suite/coverage commands against `workspace_path` (not just the
+    /// agent's own turns), emits `test_report`/`coverage` evidence, and -- since the
+    /// stage is `blocking: true` and coverage is below `min_line_percent` -- parks the
+    /// issue exactly like any other blocking stage failure.
+    #[tokio::test]
+    async fn test_stage_runs_suites_and_blocks_on_coverage_gate_when_stage_is_blocking() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "T-1");
+        let workspace_dir = tempdir().unwrap();
+        std::fs::write(
+            workspace_dir.path().join("coverage.json"),
+            r#"{"data":[{"files":[{"filename":"a.rs","summary":{"lines":{"count":10,"covered":1}}}]}]}"#,
+        )
+        .unwrap();
+
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n    \
+             - id: test\n      role: test\n      max_turns: 1\n      blocking: true\n  \
+             test:\n    commands:\n      unit: exit 0\n    coverage:\n      command: \"true\"\n      \
+             format: llvm-cov\n      min_line_percent: 90\n",
+        )
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        let snapshot = DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(ScriptedBackend {
+                calls: Arc::new(Mutex::new(0)),
+                failures: HashMap::new(),
+            }),
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        };
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            workspace_dir.path(),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let msgs = drain(rx).await;
+        let event_types: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::AgentEvent { event, .. } => Some(event.event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            event_types.contains(&"test_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"test_report".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage".to_string()),
+            "{event_types:?}"
+        );
+
+        let outcomes: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::StageFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outcomes.iter().any(|o| o.starts_with("blocked: coverage")),
+            "{outcomes:?}"
+        );
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(refreshed.normalized_state(), "blocked");
     }
 
     #[tokio::test]
@@ -2090,7 +2371,17 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            Path::new("."),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2103,11 +2394,9 @@ mod tests {
         assert_eq!(refreshed[0].state, "blocked");
 
         let msgs = drain(rx).await;
-        assert!(
-            msgs.iter().any(
-                |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
-            )
-        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
+        ));
     }
 
     #[tokio::test]
@@ -2139,7 +2428,17 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            Path::new("."),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2186,9 +2485,23 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            Path::new("."),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
-        assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "the failed turn plus one retry turn"
+        );
 
         let msgs = drain(rx).await;
         assert!(msgs.iter().any(
@@ -2225,13 +2538,26 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            Path::new("."),
+            None,
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
         let stages = stage_events(&msgs);
         // The second stage never starts -- default `escalate` stops the whole cycle.
-        assert_eq!(stages, vec![("started", "implement"), ("finished", "implement")]);
+        assert_eq!(
+            stages,
+            vec![("started", "implement"), ("finished", "implement")]
+        );
     }
 
     #[test]
@@ -2257,7 +2583,9 @@ mod tests {
         assert!(is_plan_rate_limited(
             "stage 'implement' failed: agent turn error: You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
         ));
-        assert!(is_plan_rate_limited("You've hit your usage limit for today"));
+        assert!(is_plan_rate_limited(
+            "You've hit your usage limit for today"
+        ));
     }
 
     #[test]
@@ -2271,11 +2599,7 @@ mod tests {
     async fn rate_limited_worker_exit_pauses_dispatch_without_escalating_attempt() {
         let root = tempdir().unwrap();
         let tracker_dir = tempdir().unwrap();
-        let shared = test_shared(
-            "true",
-            root.path().to_path_buf(),
-            tracker_dir.path(),
-        );
+        let shared = test_shared("true", root.path().to_path_buf(), tracker_dir.path());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = OrchestratorState::default();
 
@@ -2353,9 +2677,10 @@ mod tests {
         )
         .unwrap();
 
-        let cfg_yaml: serde_yaml::Value =
-            serde_yaml::from_str("tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n")
-                .unwrap();
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n",
+        )
+        .unwrap();
         let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
         cfg.workspace_root = root.path().to_path_buf();
 
