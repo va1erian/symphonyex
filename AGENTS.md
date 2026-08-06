@@ -759,8 +759,8 @@ pipeline:
                                # terminal_states so a parked issue is never redispatched
   stages:
     - id: requirements
-      role: requirements       # not yet resolved to a distinct prompt/backend --
-      max_turns: 4             # see "not yet implemented" below
+      role: requirements       # resolves to a role -- see "Roles" below
+      max_turns: 4
       on_failure: escalate     # escalate (default) | retry | skip
     - id: implement
       role: developer
@@ -776,14 +776,14 @@ pipeline:
 feature existed — `orchestrator::run_attempt_body` runs its original single loop over
 `agent.max_turns`, no stage events, no config validation for a block that isn't there.
 
-**What a stage is, today.** Each stage runs the project's one `WORKFLOW.md` prompt for
-up to its own `max_turns`, exactly the same per-turn loop (render prompt, run turn,
-refresh tracker state, check still-active/routable) the legacy single-stage path always
-ran — factored into `orchestrator::run_turn_loop` so both paths share it. A stage
-"succeeds" when it exhausts its own turn budget without an agent-turn error; it "ends
-the whole cycle" if the issue leaves the active/routable tracker state mid-stage (e.g.
-the agent called `update_issue_state` to a terminal state) -- exactly what ended the
-legacy single-stage run.
+**What a stage is, today.** Each stage resolves its `role` (see "Roles" below) to a
+prompt, and runs it for up to its own `max_turns` — the same per-turn loop (render
+prompt, run turn, refresh tracker state, check still-active/routable) the legacy
+single-stage path always ran, factored into `orchestrator::run_turn_loop` so both paths
+share it. A stage "succeeds" when it exhausts its own turn budget without an agent-turn
+error; it "ends the whole cycle" if the issue leaves the active/routable tracker state
+mid-stage (e.g. the agent called `update_issue_state` to a terminal state) -- exactly
+what ended the legacy single-stage run.
 
 **`on_failure`** governs what happens when a turn inside a stage errors out:
 - `escalate` (default): stop the cycle. A `blocking: true` stage parks the issue in
@@ -801,19 +801,82 @@ AIR-13's durable cycle state), so the next dispatch of that issue re-runs the pi
 from its first stage, same as a legacy single-stage attempt always retried the whole
 attempt on error.
 
-**Not yet implemented** (later AIR tickets, see `issues/AI-ROADMAP-PLAN.md`): per-stage
-roles resolving to distinct prompts/backends/models and backend-native tool
-restrictions (AIR-2), a structured artifact store so one stage's output feeds the next
-(AIR-3), and the actual Requirements/Planner/Test/Reviewer/Security/Release/
-Observability agents themselves (AIR-4 … AIR-10) — today every stage runs the same
-prompt and the only failure signal is a turn erroring out, not a judgement about
-whether the work actually meets any exit criteria.
+**Not yet implemented** (later AIR tickets, see `issues/AI-ROADMAP-PLAN.md`): a
+structured artifact store so one stage's output actually feeds the next as
+`cycle.artifacts` (AIR-3, currently always an empty object -- see "Roles" below), the
+eight roadmap agents' *real* task-specific behavior beyond their built-in prompt
+(AIR-4 … AIR-10), and exit-criteria evaluation -- the only failure signal today is a
+turn erroring out, not a judgement about whether the work actually meets any
+requirement.
 
 **Observability.** Per-stage progress is always visible without extra config: the
-live dashboard's running card shows the current stage (`status::RunningRow::stage`),
-and every stage boundary is a `stage_started`/`stage_finished` event on `/events`,
-filterable by issue like any other event — no new page, reusing the existing
-dashboard exactly as it already works for turns and tool calls.
+live dashboard's running card shows the current stage and resolved role
+(`status::RunningRow::stage`, e.g. `review — reviewer` or, for a role that overrides
+`agent.backend`, `review — reviewer (opencode/fireworks/kimi)`), and every stage
+boundary is a `stage_started`/`stage_finished` event on `/events`, filterable by issue
+like any other event — no new page, reusing the existing dashboard exactly as it
+already works for turns and tool calls.
+
+## Roles (AI Roadmap 2026, Step 1 -- AIR-2)
+
+Each `pipeline.stages[].role` resolves to a **role**: a prompt, an optional
+backend/model override, and a tool policy — generalized from what was originally
+SweBot's own hardcoded "deny file-mutating tools" construction (see `agent::ToolPolicy`
+and "SweBot" above). A stage naming a role that's neither built in nor defined under
+`roles:` fails config resolution with a clear error, at load time, not mid-cycle.
+
+**Eight built-in roles** ship with sensible default prompts (`src/roles/builtin/*.md`,
+embedded into the binary), matching the roadmap's agent pool: `requirements`,
+`planner`, `developer`, `test`, `reviewer`, `security`, `release`, `observability`. A
+project can enable the pipeline with `role: reviewer` and no prompt file at all.
+
+**`roles:`** overrides any subset of a built-in role's fields (or defines a wholly new,
+project-specific role name a stage can reference):
+
+```yaml
+roles:
+  reviewer:
+    prompt_file: ./prompts/reviewer.md   # overrides the built-in; or inline `prompt:` --
+                                          # prompt_file wins if both are set
+    backend: opencode                    # defaults to agent.backend
+    model: fireworks/<model-id>          # backend-specific, optional
+    max_turns: 6                         # currently informational; a stage's own
+                                          # max_turns is what run_turn_loop honors
+    tools:
+      allow_edits: false                 # maps to the backend-native deny mechanism
+      allow_commands: true                # both default to true (unrestricted)
+```
+
+**Prompt rendering** reuses `template.rs`'s strict renderer -- unknown variable/filter
+is a render error, same as the main `WORKFLOW.md` prompt. Every role prompt gets the
+same `issue.*` variables the main prompt has, plus a `cycle.*` namespace:
+- `cycle.id` -- `<issue_id>-<attempt>` for this delivery cycle.
+- `cycle.stage` -- the current stage's `id`.
+- `cycle.artifacts` -- always `{}` today; the per-cycle artifact index lands with AIR-3.
+- `cycle.previous_stage_summary` -- `"<stage id>: <outcome>"` for the immediately
+  prior stage (`completed` / `ended by issue state` / `failed[, skipped]: <reason>`),
+  or empty before the first stage.
+
+**Backend selection is per role.** A stage whose role doesn't override
+`backend`/`model` keeps running on the cycle's one shared session (same conversational
+continuity the legacy single-stage path always had). A stage whose role *does*
+override gets its own freshly-started session (same workspace/container, a fresh
+`AgentBackend` built from that role's backend/model) for just that stage, stopped once
+the stage finishes — see `roles::build_backend`/`orchestrator::run_pipeline`.
+
+**`ToolPolicy` translation.** `agent::ToolPolicy { allow_edits, allow_commands }` is
+the one restriction mechanism both SweBot and roles drive, translated per backend in
+`AgentBackend::start_session`:
+
+| Backend | `allow_edits: false` | `allow_commands: false` | Both allowed (default) |
+| --- | --- | --- | --- |
+| `claude` | `--disallowedTools Edit,Write,NotebookEdit` | adds `Bash` to that same flag | no extra flags |
+| `opencode` | `OPENCODE_PERMISSION={"edit":"deny"}` | adds `"bash":"deny"` to that JSON | env var unset |
+| `codex` | refuses to start (`AgentError::UnsupportedToolPolicy`) | refuses to start | starts normally |
+
+`codex` has no known native tool-denial mechanism, so a restricted role (or SweBot,
+which is unsupported on `codex` entirely — see "SweBot" above) fails cleanly at session
+startup rather than silently running unrestricted.
 
 ## Provider-native tracker tool (Section 10.5)
 

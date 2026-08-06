@@ -9,13 +9,14 @@
 //! daemon's existing container/volume/restart lifecycle -- not a second daemon to
 //! deploy and keep alive.
 //!
-//! All capabilities are read-only with respect to the repo's own code: SweBot's
-//! sessions run with file-mutating tools disallowed (see `build_restricted_backend` --
-//! `--disallowedTools` for the `claude` backend, an `{"edit":"deny"}` permission
-//! config for `opencode`) -- it answers, drafts, and reviews, but it never edits the
-//! repo directly. That stays the coding agent's job, gated by the normal ticket-dispatch
-//! flow. The backend SweBot runs on is `swebot.backend` when set, else `agent.backend`;
-//! `codex` is unsupported and refused rather than run unrestricted.
+//! All capabilities are read-only with respect to the repo's own code: every SweBot
+//! session is started under `ToolPolicy::SWEBOT` (AIR-2, see `agent::ToolPolicy`'s doc
+//! comment) -- file-mutating tools disallowed, translated into `--disallowedTools` for
+//! `claude` and an `{"edit":"deny"}` permission config for `opencode` -- so SweBot
+//! answers, drafts, and reviews, but never edits the repo directly. That stays the
+//! coding agent's job, gated by the normal ticket-dispatch flow. The backend SweBot
+//! runs on is `swebot.backend` when set, else `agent.backend`; `codex` is unsupported
+//! and refused rather than run unrestricted (see `build_restricted_backend`).
 //!
 //! Chat mode (`chat`) adds a unified Q&A + ticket-drafting conversation surface and
 //! browser chat UI; when it's enabled for a GitHub repo it owns that repo's
@@ -142,51 +143,40 @@ Be warm and direct: explain *why*, not just *what*, and never be condescending o
 sycophantic. Hold a genuinely high bar, especially on security and performance -- \
 answering, drafting, or approving something is a real signal, not a formality.";
 
-const DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit";
-
-/// opencode `permission` config for a restricted session, passed as
-/// `OPENCODE_PERMISSION` (see `agent::opencode::OpenCodeBackend::permission_config`):
-/// denies `edit`, the umbrella permission covering `edit`/`write`/`patch` -- the
-/// opencode-native equivalent of `Edit,Write,NotebookEdit` above. `opencode run
-/// --auto` approves everything *not* explicitly denied, so Bash/Read stay free:
-/// SweBot still needs them to explore the repo and run tests during review.
-const DISALLOWED_OPENCODE_PERMISSION: &str = r#"{"edit":"deny"}"#;
-
 /// A restricted `AgentBackend` for SweBot's sessions, built from whichever backend
 /// `cfg.swebot_backend()` resolves to (`swebot.backend` override, else `agent.backend`)
-/// -- same command/model/timeout as ticket dispatch but with file-mutating tools
-/// disallowed and no MCP tool wiring. SweBot's drivers parse each turn's text/JSON
-/// response themselves and act via `RepoHost`/`TrackerAdapter` directly, rather
-/// than routing through an agent-invoked tool call the way ticket dispatch's
-/// `update_issue_state` does (that plumbing exists for a long tool-using coding
-/// session; SweBot's turns are single-shot conversational exchanges, so parsing the
-/// final response is enough).
+/// -- same command/model/timeout as ticket dispatch, no MCP tool wiring. "Restricted"
+/// here means every session this backend starts must be started with
+/// `ToolPolicy::SWEBOT` (AIR-2: file-mutating tools denied, Bash/Read stay free) -- the
+/// backend itself no longer bakes that in (see `ToolPolicy`'s doc comment for why this
+/// moved: the same translation now also drives pipeline roles' `tools.allow_edits`).
+/// SweBot's drivers parse each turn's text/JSON response themselves and act via
+/// `RepoHost`/`TrackerAdapter` directly, rather than routing through an agent-invoked
+/// tool call the way ticket dispatch's `update_issue_state` does (that plumbing exists
+/// for a long tool-using coding session; SweBot's turns are single-shot conversational
+/// exchanges, so parsing the final response is enough).
 ///
 /// Returns `None` for `codex`, which SweBot doesn't support yet -- `swebot::run`
-/// refuses to start rather than silently running an unrestricted skeleton.
+/// refuses to start rather than silently running an unrestricted skeleton (`codex.rs`'s
+/// `start_session` would also refuse a `ToolPolicy::SWEBOT` session on its own, but
+/// failing at SweBot startup gives a clearer error than failing on the first poll).
 fn build_restricted_backend(cfg: &EffectiveConfig) -> Option<Box<dyn AgentBackend>> {
     Some(match cfg.swebot_backend() {
-        AgentBackendKind::Claude => {
-            let mut extra_args = cfg.claude.args.clone();
-            extra_args.push("--disallowedTools".to_string());
-            extra_args.push(DISALLOWED_TOOLS.to_string());
-            Box::new(ClaudeBackend {
-                command: cfg.claude.command.clone(),
-                extra_args,
-                model: cfg.claude.model.clone(),
-                permission_mode: cfg.claude.permission_mode.clone(),
-                turn_timeout_ms: cfg.claude.turn_timeout_ms,
-                mcp_wiring: None,
-                workflow_dir: cfg.workflow_dir.clone(),
-            })
-        }
+        AgentBackendKind::Claude => Box::new(ClaudeBackend {
+            command: cfg.claude.command.clone(),
+            extra_args: cfg.claude.args.clone(),
+            model: cfg.claude.model.clone(),
+            permission_mode: cfg.claude.permission_mode.clone(),
+            turn_timeout_ms: cfg.claude.turn_timeout_ms,
+            mcp_wiring: None,
+            workflow_dir: cfg.workflow_dir.clone(),
+        }),
         AgentBackendKind::OpenCode => Box::new(OpenCodeBackend {
             command: cfg.opencode.command.clone(),
             model: cfg.opencode.model.clone(),
             extra_args: cfg.opencode.args.clone(),
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
-            permission_config: Some(DISALLOWED_OPENCODE_PERMISSION.to_string()),
             mcp_wiring: None,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
@@ -377,7 +367,7 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
 /// construction, verdict routing) without spawning a real `claude` process.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::agent::{AgentBackend, AgentError, AgentEvent, AgentSession, TurnOutcome};
+    use crate::agent::{AgentBackend, AgentError, AgentEvent, AgentSession, ToolPolicy, TurnOutcome};
     use crate::container::ContainerHandle;
     use async_trait::async_trait;
     use std::path::Path;
@@ -411,6 +401,7 @@ pub(crate) mod test_support {
             _issue_id: &str,
             _title: &str,
             _container: Option<&ContainerHandle>,
+            _tool_policy: &ToolPolicy,
         ) -> Result<Box<dyn AgentSession>, AgentError> {
             Ok(Box::new(FakeSession {
                 response: self.response.clone(),
@@ -480,31 +471,33 @@ mod tests {
         assert_eq!(cfg.swebot_backend(), AgentBackendKind::Claude);
     }
 
+    /// The actual `--disallowedTools`/`OPENCODE_PERMISSION` translation moved to
+    /// `ToolPolicy` (AIR-2, see `agent::claude`/`agent::opencode`'s own unit tests for
+    /// that) -- `build_restricted_backend` itself is now just "construct the right
+    /// backend kind, no MCP wiring"; the restriction is applied by every SweBot call
+    /// site passing `&ToolPolicy::SWEBOT` to `start_session` (see `qa.rs`/`drafting.rs`/
+    /// `review.rs`/`chat::worker`).
     #[test]
-    fn restricted_backend_defaults_to_claude_with_edits_disallowed() {
+    fn restricted_backend_defaults_to_claude() {
         let cfg = backend_test_cfg("");
         let backend = build_restricted_backend(&cfg).unwrap();
         let cb = backend
             .as_any()
             .and_then(|a| a.downcast_ref::<ClaudeBackend>())
             .expect("default should build a ClaudeBackend");
-        let joined = cb.extra_args.join(" ");
-        assert!(joined.contains("--disallowedTools"));
-        assert!(joined.contains("Edit,Write,NotebookEdit"));
         assert!(cb.mcp_wiring.is_none());
     }
 
     #[test]
-    fn restricted_backend_opencode_overrides_deny_edits_via_permission_config() {
+    fn restricted_backend_opencode_override_builds_open_code_backend() {
         let cfg = backend_test_cfg("  backend: opencode\n");
         let backend = build_restricted_backend(&cfg).unwrap();
-        let oc = backend
-            .as_any()
-            .and_then(|a| a.downcast_ref::<OpenCodeBackend>())
-            .expect("swebot.backend: opencode should build an OpenCodeBackend");
-        assert_eq!(
-            oc.permission_config.as_deref(),
-            Some(DISALLOWED_OPENCODE_PERMISSION)
+        assert!(
+            backend
+                .as_any()
+                .and_then(|a| a.downcast_ref::<OpenCodeBackend>())
+                .is_some(),
+            "swebot.backend: opencode should build an OpenCodeBackend"
         );
     }
 

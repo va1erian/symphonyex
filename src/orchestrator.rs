@@ -1,4 +1,4 @@
-//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
+﻿//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
 //! (Section 7, 8, 16). One task owns all mutable scheduling state directly; worker
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
@@ -82,7 +82,7 @@ struct RunningEntry {
     /// The worker task's own `JoinHandle`, not just an `AbortHandle`: reconciliation
     /// needs to `.abort()` *and then await* it before touching the workspace itself
     /// (running `after_run`, deleting the directory), so the aborted task's `Drop`
-    /// (which `kill_on_drop`s the agent subprocess) has actually finished first —
+    /// (which `kill_on_drop`s the agent subprocess) has actually finished first â€”
     /// otherwise a hook/cleanup racing a not-yet-dead subprocess can silently lose
     /// work (see the `AR-8` incident this fixed: `after_run` never ran on
     /// reconciliation-triggered termination, so a fully-verified attempt's git commit
@@ -156,6 +156,13 @@ enum OrchMsg {
     StageStarted {
         issue_id: String,
         stage_id: String,
+        /// AIR-2: human-readable summary of the resolved role driving this stage --
+        /// `"<role>"` when it runs on `agent.backend` like everything else, or
+        /// `"<role> (opencode/fireworks/x)"` when the role overrides backend/model.
+        /// Surfaced on the dashboard (`status::RunningRow::stage`) so a human watching
+        /// a multi-stage cycle can see *which* role/backend is running, not just which
+        /// stage id.
+        role_summary: String,
     },
     /// A pipeline stage finished, however it finished (`outcome` is a short
     /// human-readable label: "completed", "ended by issue state", "failed", or
@@ -232,7 +239,6 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             extra_args: cfg.opencode.args.clone(),
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
-            permission_config: None,
             mcp_wiring,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
@@ -843,7 +849,7 @@ async fn terminate_running(
 }
 
 /// Abort a running worker and *wait for it to actually stop* (not just request
-/// cancellation) before touching its workspace, then run `after_run` if configured —
+/// cancellation) before touching its workspace, then run `after_run` if configured â€”
 /// Section 9.4 requires `after_run` to fire on cancellation, not just normal/error
 /// exit, and it can't safely run (or workspace cleanup safely proceed) while the
 /// aborted task's `Drop` (which `kill_on_drop`s the agent subprocess) might still be
@@ -1332,9 +1338,13 @@ async fn handle_msg(
         } => {
             handle_retry_fired(shared, state, tx, issue_id, generation).await;
         }
-        OrchMsg::StageStarted { issue_id, stage_id } => {
+        OrchMsg::StageStarted {
+            issue_id,
+            stage_id,
+            role_summary,
+        } => {
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.current_stage = Some(stage_id.clone());
+                e.current_stage = Some(role_summary);
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
                 let session_id = e.session_id.clone();
                 record_event(
@@ -1474,7 +1484,13 @@ async fn run_attempt_body(
     let title = format!("{}: {}", issue.identifier, issue.title);
     let mut session = match snapshot
         .agent_backend
-        .start_session(workspace_path, &issue.id, &title, container)
+        .start_session(
+            workspace_path,
+            &issue.id,
+            &title,
+            container,
+            &crate::agent::ToolPolicy::default(),
+        )
         .await
     {
         Ok(s) => s,
@@ -1487,7 +1503,17 @@ async fn run_attempt_body(
     });
 
     let exit = if cfg.pipeline.enabled {
-        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+        run_pipeline(
+            issue_id,
+            &mut issue,
+            attempt,
+            session.as_mut(),
+            snapshot,
+            workspace_path,
+            container,
+            tx,
+        )
+        .await
     } else {
         match run_turn_loop(
             session.as_mut(),
@@ -1499,6 +1525,7 @@ async fn run_attempt_body(
             attempt,
             cfg.max_turns,
             issue_id,
+            None,
             tx,
         )
         .await
@@ -1542,12 +1569,24 @@ async fn run_turn_loop(
     attempt: Option<u32>,
     max_turns: u32,
     issue_id: &str,
+    // AIR-2: the `cycle.*` template namespace (id/stage/artifacts/previous_stage_summary)
+    // for a pipeline stage's own role prompt. `None` for the legacy single-stage path,
+    // whose `WORKFLOW.md` prompt never references `cycle.*` -- `template::render`'s
+    // strict mode only errors on a *referenced* unknown variable, so omitting the key
+    // entirely is safe there.
+    cycle: Option<&serde_json::Value>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> LoopExit {
     let mut turn_number: u32 = 1;
     loop {
-        let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
-        {
+        let prompt = match render_turn_prompt(
+            prompt_template,
+            issue,
+            attempt,
+            turn_number,
+            max_turns,
+            cycle,
+        ) {
             Ok(p) => p,
             Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
         };
@@ -1588,36 +1627,102 @@ async fn run_turn_loop(
 }
 
 /// Drives one delivery cycle through `pipeline.stages` in order, within the one
-/// workspace/session `run_attempt_body` already set up (AIR-1: a stage boundary is not
-/// a workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
+/// workspace `run_attempt_body` already set up (AIR-1: a stage boundary is not a
+/// workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
 /// `StageStarted`/`StageFinished` bracket it so `/events` shows per-stage progress
 /// regardless of how the stage (or the whole cycle) ends.
+///
+/// AIR-2: each stage resolves its own role (`roles::resolve`) for its prompt, tool
+/// policy, and optionally a different backend/model than `agent.backend`. A stage whose
+/// role doesn't override backend/model keeps running on `session` -- the one shared
+/// session `run_attempt_body` started, preserving conversational continuity across
+/// stages exactly as before this ticket. A stage that *does* override gets its own
+/// freshly-started session (same workspace/container) for just that stage, stopped once
+/// the stage finishes.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     issue_id: &str,
     issue: &mut Issue,
     attempt: Option<u32>,
     session: &mut dyn AgentSession,
     snapshot: &DispatchSnapshot,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
+    let cycle_id = format!("{issue_id}-{}", attempt.unwrap_or(1));
+    let mut previous_stage_summary = String::new();
 
     for stage in &cfg.pipeline.stages {
+        let role = match crate::roles::resolve(&stage.role, cfg) {
+            Ok(r) => r,
+            Err(e) => return ExitReason::Error(format!("stage '{}' role error: {e}", stage.id)),
+        };
+        let role_summary = if role.overrides_backend {
+            format!(
+                "{} — {} ({}{})",
+                stage.id,
+                stage.role,
+                backend_label(role.backend),
+                role.model
+                    .as_ref()
+                    .map(|m| format!("/{m}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!("{} — {}", stage.id, stage.role)
+        };
         let _ = tx.send(OrchMsg::StageStarted {
             issue_id: issue_id.to_string(),
             stage_id: stage.id.clone(),
+            role_summary,
         });
 
+        // `cycle.artifacts` is a placeholder empty object until AIR-3 lands the
+        // per-cycle artifact index; the key must still exist so a built-in role
+        // prompt referencing `cycle.artifacts` renders under `template.rs`'s strict
+        // mode (an unknown-but-referenced variable is a render error).
+        let cycle_ctx = json!({
+            "id": cycle_id,
+            "stage": stage.id,
+            "artifacts": {},
+            "previous_stage_summary": previous_stage_summary,
+        });
+
+        let mut fresh_session: Option<Box<dyn AgentSession>> = None;
+        if role.overrides_backend {
+            let backend = crate::roles::build_backend(&role, cfg);
+            let title = format!("{}: {} [{}]", issue.identifier, issue.title, stage.id);
+            match backend
+                .start_session(workspace_path, issue_id, &title, container, &role.tool_policy)
+                .await
+            {
+                Ok(s) => fresh_session = Some(s),
+                Err(e) => {
+                    return ExitReason::Error(format!(
+                        "stage '{}' session startup error: {e}",
+                        stage.id
+                    ));
+                }
+            }
+        }
+        let active_session: &mut dyn AgentSession = match &mut fresh_session {
+            Some(s) => s.as_mut(),
+            None => &mut *session,
+        };
+
         let mut outcome = run_turn_loop(
-            session,
+            active_session,
             &snapshot.tracker,
             &cfg.active_states,
             &cfg.required_labels,
-            &snapshot.prompt_template,
+            &role.prompt,
             issue,
             attempt,
             stage.max_turns,
             issue_id,
+            Some(&cycle_ctx),
             tx,
         )
         .await;
@@ -1627,18 +1732,23 @@ async fn run_pipeline(
         // unbounded looping.
         if matches!(outcome, LoopExit::Error(_)) && stage.on_failure == StageFailureAction::Retry {
             outcome = run_turn_loop(
-                session,
+                active_session,
                 &snapshot.tracker,
                 &cfg.active_states,
                 &cfg.required_labels,
-                &snapshot.prompt_template,
+                &role.prompt,
                 issue,
                 attempt,
                 stage.max_turns,
                 issue_id,
+                Some(&cycle_ctx),
                 tx,
             )
             .await;
+        }
+
+        if let Some(s) = fresh_session {
+            s.stop().await;
         }
 
         let outcome_label = match &outcome {
@@ -1649,6 +1759,7 @@ async fn run_pipeline(
             }
             LoopExit::Error(reason) => format!("failed: {reason}"),
         };
+        previous_stage_summary = format!("{}: {outcome_label}", stage.id);
         let _ = tx.send(OrchMsg::StageFinished {
             issue_id: issue_id.to_string(),
             stage_id: stage.id.clone(),
@@ -1671,6 +1782,14 @@ async fn run_pipeline(
         }
     }
     ExitReason::Normal
+}
+
+fn backend_label(backend: AgentBackendKind) -> &'static str {
+    match backend {
+        AgentBackendKind::Claude => "claude",
+        AgentBackendKind::Codex => "codex",
+        AgentBackendKind::OpenCode => "opencode",
+    }
 }
 
 /// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure --
@@ -1719,12 +1838,16 @@ fn render_turn_prompt(
     attempt: Option<u32>,
     turn_number: u32,
     max_turns: u32,
+    cycle: Option<&serde_json::Value>,
 ) -> Result<String, template::TemplateError> {
     if turn_number == 1 {
-        let ctx = json!({
+        let mut ctx = json!({
             "issue": serde_json::to_value(issue).unwrap_or(serde_json::Value::Null),
             "attempt": attempt,
         });
+        if let Some(cycle) = cycle {
+            ctx["cycle"] = cycle.clone();
+        }
         template::render(template_str, &ctx)
     } else {
         Ok(format!(
@@ -1777,7 +1900,7 @@ mod tests {
 
     /// Regression test for the AR-8 incident: a running worker that gets aborted by
     /// reconciliation (terminal state, non-active state, or a stall timeout) must
-    /// still get its `after_run` hook run before its workspace is touched — not just
+    /// still get its `after_run` hook run before its workspace is touched â€” not just
     /// a worker that exits on its own via the normal WorkerExit message path.
     #[tokio::test]
     async fn abort_and_run_after_run_runs_the_hook_against_a_real_workspace() {
@@ -1857,6 +1980,7 @@ mod tests {
             _issue_id: &str,
             _title: &str,
             _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
         ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
             Ok(Box::new(ScriptedSession {
                 calls: self.calls.clone(),
@@ -1980,12 +2104,12 @@ mod tests {
 
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2001,6 +2125,60 @@ mod tests {
                 ("finished", "implement"),
             ]
         );
+    }
+
+    /// AIR-2: the dashboard shows *which role* is driving a running stage
+    /// (`status::RunningRow::stage`, fed by `OrchMsg::StageStarted::role_summary`), not
+    /// just the stage id -- this is the human-observability surface for role
+    /// resolution. A stage whose role doesn't override `agent.backend` gets a plain
+    /// "stage — role" summary; a stage that does gets the backend/model appended too
+    /// (covered by `roles::tests::build_backend_for_an_overriding_role_...` for the
+    /// backend-selection mechanics themselves).
+    #[tokio::test]
+    async fn stage_started_role_summary_names_the_resolved_role() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-3");
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: review\n    role: reviewer\n    max_turns: 1\n",
+            ScriptedBackend {
+                calls: Arc::new(Mutex::new(0)),
+                failures: HashMap::new(),
+            },
+        );
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            Path::new("."),
+            None,
+            &tx,
+        )
+        .await;
+
+        let msgs = drain(rx).await;
+        let role_summary = msgs
+            .iter()
+            .find_map(|m| match m {
+                OrchMsg::StageStarted { role_summary, .. } => Some(role_summary.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(role_summary, "review — reviewer");
     }
 
     #[tokio::test]
@@ -2026,12 +2204,12 @@ mod tests {
             .remove(0);
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2075,12 +2253,12 @@ mod tests {
             .remove(0);
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2122,12 +2300,12 @@ mod tests {
             .remove(0);
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
         assert!(matches!(exit, ExitReason::Normal));
         assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
 
@@ -2161,12 +2339,12 @@ mod tests {
             .remove(0);
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
