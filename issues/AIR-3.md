@@ -1,11 +1,16 @@
 ---
 identifier: AIR-3
 title: Cycle artifact store and the record_artifact agent tool
-state: todo
+state: done
 priority: 1
-labels: [phase-1, evidence, mcp]
+labels:
+- phase-1
+- evidence
+- mcp
 dispatchable: true
-depends_on: [AIR-1]
+depends_on:
+- AIR-1
+updated_at: 2026-08-06T18:35:09.445873500+00:00
 ---
 ## Context
 

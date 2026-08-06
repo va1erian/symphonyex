@@ -478,6 +478,17 @@ pub struct EffectiveConfig {
     pub max_concurrent_agents: u32,
     pub max_turns: u32,
     pub max_retry_backoff_ms: u64,
+    /// Retry delay used instead of the normal exponential backoff when a turn fails
+    /// because the account has hit its plan's own usage limit (e.g. Claude Code's "You've
+    /// hit your session limit" message) -- see `orchestrator::is_plan_rate_limited`.
+    /// Deliberately a fixed, much longer delay than `max_retry_backoff_ms`'s own cap:
+    /// the plan's reset window is measured in hours, not minutes, and the message that
+    /// reports it names a wall-clock local time in an arbitrary timezone, which isn't
+    /// reliably parseable into an exact instant without a timezone database this crate
+    /// doesn't otherwise need -- so this waits a fixed interval and re-checks, showing
+    /// the CLI's own latest (and most accurate) message each time, rather than trying to
+    /// compute the precise reset moment.
+    pub rate_limit_pause_ms: u64,
     pub max_concurrent_agents_by_state: HashMap<String, u32>,
     pub agent_backend: AgentBackendKind,
 
@@ -898,6 +909,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         max_concurrent_agents: get_u64(agent, "max_concurrent_agents", 10) as u32,
         max_turns: max_turns as u32,
         max_retry_backoff_ms: get_u64(agent, "max_retry_backoff_ms", 300_000),
+        rate_limit_pause_ms: get_u64(agent, "rate_limit_pause_ms", 1_800_000),
         max_concurrent_agents_by_state,
         agent_backend,
 
@@ -1097,6 +1109,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_agents, 10);
         assert_eq!(cfg.max_turns, 20);
         assert_eq!(cfg.max_retry_backoff_ms, 300_000);
+        assert_eq!(cfg.rate_limit_pause_ms, 1_800_000);
         assert_eq!(cfg.hook_timeout_ms, 60_000);
         assert_eq!(cfg.agent_backend, AgentBackendKind::Claude);
     }

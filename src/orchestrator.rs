@@ -114,6 +114,15 @@ struct OrchestratorState {
     completed: HashSet<String>,
     metrics: Metrics,
     retry_generation: HashMap<String, u64>,
+    /// Set when a turn failure was classified as a plan usage-limit hit
+    /// (`is_plan_rate_limited`); while `Instant::now()` is before this, `on_tick` skips
+    /// dispatching *new* candidates -- every concurrently running issue shares the same
+    /// account, so a fresh dispatch during the pause would just fail immediately too.
+    /// Already-scheduled retries aren't gated by this (they were rescheduled with the
+    /// same `rate_limit_pause_ms` delay when the pause was set, so they naturally land
+    /// around when it's expected to lift); this only stops *additional* new dispatch in
+    /// the meantime. Cleared automatically once the deadline passes.
+    rate_limited_until: Option<Instant>,
 }
 
 impl OrchestratorState {
@@ -588,6 +597,16 @@ async fn on_tick(
 ) {
     reconcile(shared, state, tx).await;
 
+    if let Some(until) = state.rate_limited_until {
+        if Instant::now() < until {
+            // Still paused after a plan usage-limit hit: skip dispatching *new*
+            // candidates this tick (already-scheduled retries are unaffected -- they
+            // carry their own `rate_limit_pause_ms` delay from when the pause was set).
+            return;
+        }
+        state.rate_limited_until = None;
+    }
+
     if let Err(e) = config::validate_for_dispatch(&shared.config, tracker::SUPPORTED_TRACKER_KINDS)
     {
         tracing::error!(error = %e, "dispatch preflight validation failed; skipping dispatch this tick");
@@ -780,6 +799,18 @@ async fn dispatch_issue(
 fn backoff_delay_ms(attempt: u32, max_backoff_ms: u64) -> u64 {
     let pow = 2u64.saturating_pow(attempt.saturating_sub(1).min(32));
     10_000u64.saturating_mul(pow).min(max_backoff_ms)
+}
+
+/// Recognizes the `claude` CLI's own plan/account usage-limit message (observed live,
+/// verbatim: `"You've hit your session limit · resets 12:30am (Europe/Paris)"`) so it
+/// can be handled as a coordinated, much-longer pause instead of the normal per-issue
+/// exponential backoff (see the `ExitReason::Error` handling in `handle_msg`). Matched
+/// on the stable phrases rather than the whole sentence (which varies by exact reset
+/// time/timezone) or a generic "rate limit" substring (which could also describe an
+/// unrelated transient 429 that *should* use the normal short backoff).
+fn is_plan_rate_limited(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("session limit") || lower.contains("usage limit")
 }
 
 fn schedule_retry(
@@ -1297,9 +1328,29 @@ async fn handle_msg(
                 }
                 ExitReason::Error(err) => {
                     finalize_issue_runtime(state, &entry, &format!("error: {err}"));
-                    let next_attempt = entry.retry_attempt.unwrap_or(0) + 1;
-                    let delay = backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms);
-                    tracing::warn!(issue_id = %issue_id, identifier = %entry.issue.identifier, error = %err, next_attempt, delay_ms = delay, "worker exited abnormally; scheduling retry");
+                    let rate_limited = is_plan_rate_limited(&err);
+                    // A plan usage-limit failure isn't the ticket's fault and won't
+                    // resolve itself on the normal few-minutes exponential curve --
+                    // don't escalate the attempt counter for it, and wait the fixed,
+                    // much longer `rate_limit_pause_ms` instead of `backoff_delay_ms`.
+                    // Also pause *new* dispatch account-wide (`rate_limited_until`,
+                    // checked in `on_tick`): every concurrently running issue shares the
+                    // same underlying account, so a fresh dispatch would just hit the
+                    // same wall immediately.
+                    let next_attempt = if rate_limited {
+                        entry.retry_attempt.unwrap_or(0).max(1)
+                    } else {
+                        entry.retry_attempt.unwrap_or(0) + 1
+                    };
+                    let delay = if rate_limited {
+                        state.rate_limited_until = Some(
+                            Instant::now() + Duration::from_millis(shared.config.rate_limit_pause_ms),
+                        );
+                        shared.config.rate_limit_pause_ms
+                    } else {
+                        backoff_delay_ms(next_attempt, shared.config.max_retry_backoff_ms)
+                    };
+                    tracing::warn!(issue_id = %issue_id, identifier = %entry.issue.identifier, error = %err, next_attempt, delay_ms = delay, rate_limited, "worker exited abnormally; scheduling retry");
                     record_event(
                         shared,
                         crate::eventlog::NewEvent {
@@ -1662,7 +1713,15 @@ async fn run_pipeline(
                 if stage.on_failure == StageFailureAction::Skip {
                     continue;
                 }
-                if stage.blocking {
+                // A plan usage-limit hit isn't a genuine exit-criteria failure -- it
+                // will very likely succeed on a later retry once the account's own
+                // limit resets, so a `blocking` stage must not park the issue over it
+                // (that's for real judged failures). Fall through to the same
+                // whole-attempt retry every non-blocking failure already takes;
+                // `handle_msg`'s `ExitReason::Error` handling recognizes the same
+                // phrase and schedules the long, coordinated pause instead of the
+                // normal short backoff.
+                if stage.blocking && !is_plan_rate_limited(&reason) {
                     block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
                     return ExitReason::Normal;
                 }
@@ -2182,5 +2241,166 @@ mod tests {
         let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
         assert!(!cfg.pipeline.enabled);
         assert!(cfg.pipeline.stages.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------
+    // BUG-3: plan usage-limit ("session limit") handling
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn is_plan_rate_limited_recognizes_the_real_captured_message() {
+        // Verbatim from a live dogfood run against the real `claude` CLI.
+        assert!(is_plan_rate_limited(
+            "You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
+        ));
+        // The pipeline wraps the reason with a stage-id prefix -- must still match.
+        assert!(is_plan_rate_limited(
+            "stage 'implement' failed: agent turn error: You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
+        ));
+        assert!(is_plan_rate_limited("You've hit your usage limit for today"));
+    }
+
+    #[test]
+    fn is_plan_rate_limited_does_not_misclassify_generic_errors() {
+        assert!(!is_plan_rate_limited("agent turn error: connection reset"));
+        assert!(!is_plan_rate_limited("prompt error: unknown variable 'x'"));
+        assert!(!is_plan_rate_limited("subprocess exited with code 1"));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_worker_exit_pauses_dispatch_without_escalating_attempt() {
+        let root = tempdir().unwrap();
+        let tracker_dir = tempdir().unwrap();
+        let shared = test_shared(
+            "true",
+            root.path().to_path_buf(),
+            tracker_dir.path(),
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = OrchestratorState::default();
+
+        let issue_id = "RL-1".to_string();
+        let handle = tokio::spawn(async {});
+        state.running.insert(
+            issue_id.clone(),
+            RunningEntry {
+                issue: Issue {
+                    id: issue_id.clone(),
+                    native_ref: None,
+                    identifier: "RL-1".to_string(),
+                    title: "Rate limit test".to_string(),
+                    description: None,
+                    priority: None,
+                    state: "todo".to_string(),
+                    branch_name: None,
+                    url: None,
+                    assignee_id: None,
+                    labels: Vec::new(),
+                    blocked_by: Vec::new(),
+                    dispatchable: true,
+                    created_at: None,
+                    updated_at: None,
+                },
+                started_at: Instant::now(),
+                session_id: String::new(),
+                last_event: None,
+                last_event_at: None,
+                last_message: None,
+                tokens: TokenUsage::default(),
+                turn_count: 0,
+                tool_call_count: 0,
+                handle,
+                retry_attempt: None,
+                current_stage: None,
+            },
+        );
+
+        handle_msg(
+            &shared,
+            &mut state,
+            &tx,
+            OrchMsg::WorkerExit {
+                issue_id: issue_id.clone(),
+                reason: ExitReason::Error(
+                    "You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
+                        .to_string(),
+                ),
+            },
+        )
+        .await;
+
+        assert!(
+            state.rate_limited_until.is_some(),
+            "a session-limit failure must set the account-wide pause"
+        );
+        let retry = state
+            .retry_attempts
+            .get(&issue_id)
+            .expect("a retry must still be scheduled for the affected issue");
+        assert_eq!(
+            retry.attempt, 1,
+            "attempt must not escalate for a rate-limit failure (not the ticket's fault)"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_tick_skips_new_dispatch_while_rate_limited_and_resumes_after() {
+        let root = tempdir().unwrap();
+        let tracker_dir = tempdir().unwrap();
+        std::fs::write(
+            tracker_dir.path().join("RL-2.md"),
+            "---\nidentifier: RL-2\ntitle: Candidate\nstate: todo\n---\nbody\n",
+        )
+        .unwrap();
+
+        let cfg_yaml: serde_yaml::Value =
+            serde_yaml::from_str("tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n")
+                .unwrap();
+        let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        cfg.workspace_root = root.path().to_path_buf();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let shared = Shared {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(claude::ClaudeBackend {
+                command: "claude".to_string(),
+                extra_args: Vec::new(),
+                model: None,
+                permission_mode: "bypassPermissions".to_string(),
+                turn_timeout_ms: 1000,
+                mcp_wiring: None,
+                workflow_dir: Path::new(".").to_path_buf(),
+            }),
+            workspace_mgr: Arc::new(WorkspaceManager::new(root.path().to_path_buf())),
+            event_tx,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = OrchestratorState {
+            rate_limited_until: Some(Instant::now() + Duration::from_secs(60)),
+            ..Default::default()
+        };
+
+        on_tick(&shared, &mut state, &tx).await;
+        assert!(
+            state.running.is_empty(),
+            "dispatch must be skipped while the account-wide pause is still in effect"
+        );
+        assert!(state.rate_limited_until.is_some());
+
+        state.rate_limited_until = Some(Instant::now() - Duration::from_secs(1));
+        on_tick(&shared, &mut state, &tx).await;
+        assert!(
+            !state.running.is_empty(),
+            "dispatch must resume once the pause deadline has passed"
+        );
+        assert!(
+            state.rate_limited_until.is_none(),
+            "an expired pause must be cleared"
+        );
     }
 }

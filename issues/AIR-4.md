@@ -1,11 +1,17 @@
 ---
 identifier: AIR-4
 title: Requirements agent — validated requirements, acceptance criteria and ambiguity stop
-state: todo
+state: done
 priority: 1
-labels: [phase-1, agent-role, requirements]
+labels:
+- phase-1
+- agent-role
+- requirements
 dispatchable: true
-depends_on: [AIR-2, AIR-3]
+depends_on:
+- AIR-2
+- AIR-3
+updated_at: 2026-08-06T19:04:30.552504500+00:00
 ---
 ## Context
 

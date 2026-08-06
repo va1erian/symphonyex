@@ -124,6 +124,38 @@ first, and `after_run` runs every time a running attempt ends, matching Section 
 bsky-archiver pipeline: a ticket showed `done` with fully verified work, but its
 branch never appeared upstream.
 
+## Plan usage-limit handling (`claude` backend)
+
+The Claude Code CLI reports its own plan/account usage limit as an ordinary turn
+failure — observed live, verbatim: `"You've hit your session limit · resets
+12:30am (Europe/Paris)"`. Treating that identically to a transient error (the normal
+exponential backoff, capped at `agent.max_retry_backoff_ms` — minutes) would spend the
+rest of the plan's multi-hour reset window relaunching the `claude` subprocess every
+few minutes, each attempt failing immediately.
+
+`orchestrator::is_plan_rate_limited` recognizes the phrase (`"session limit"` /
+`"usage limit"`, not a generic `"rate limit"` substring — that could also describe an
+unrelated transient 429 that should still use the normal short backoff) in a failed
+turn's error text. When matched:
+
+- The affected issue's retry is scheduled after a fixed `agent.rate_limit_pause_ms`
+  (default 30 minutes) instead of the exponential curve, and its attempt counter does
+  not escalate — this isn't the ticket's fault.
+- Every other issue's *new* dispatch is paused too (`on_tick` checks
+  `OrchestratorState::rate_limited_until`) for the same window, since all concurrently
+  running issues share one account and would hit the same wall immediately. Already-
+  running turns are left alone; only new dispatch is gated.
+- A `pipeline.stages[].blocking: true` stage does **not** park the issue over this
+  specific failure (see the `is_plan_rate_limited` check in `run_pipeline`) — a plan
+  limit isn't a judged exit-criteria failure, so it retries instead of blocking.
+
+Deliberately does **not** parse an exact reset instant out of the message: the CLI
+names a wall-clock local time in an arbitrary timezone, which isn't reliably
+convertible into an instant without a timezone database this crate doesn't otherwise
+need. Instead it waits the fixed interval and re-checks, surfacing the CLI's own
+(freshest) message each time via the existing retry-queue "Last error" column on the
+dashboard — no new UI needed for this.
+
 ## Docker mode
 
 Off by default; opt in per-project with `workspace.docker` in `WORKFLOW.md`:

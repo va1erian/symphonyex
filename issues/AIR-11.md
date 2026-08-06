@@ -4,7 +4,7 @@ title: Token and cost budgets with enforced stopping conditions
 state: todo
 priority: 1
 labels: [phase-1, cost, orchestrator]
-dispatchable: true
+dispatchable: false
 depends_on: [AIR-1]
 ---
 ## Context

@@ -1,11 +1,16 @@
 ---
 identifier: AIR-2
 title: Role definitions — per-role prompt, backend, model and tool restrictions
-state: todo
+state: done
 priority: 1
-labels: [phase-1, pipeline, config]
+labels:
+- phase-1
+- pipeline
+- config
 dispatchable: true
-depends_on: [AIR-1]
+depends_on:
+- AIR-1
+updated_at: 2026-08-06T18:38:07.861487400+00:00
 ---
 ## Context
 
