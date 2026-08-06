@@ -5,7 +5,7 @@
 use crate::agent::{
     AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex, opencode,
 };
-use crate::config::{self, AgentBackendKind, EffectiveConfig};
+use crate::config::{self, AgentBackendKind, EffectiveConfig, StageFailureAction};
 use crate::container::{self, ContainerHandle};
 use crate::domain::Issue;
 use crate::envsub;
@@ -89,6 +89,12 @@ struct RunningEntry {
     /// never happened before its workspace got deleted).
     handle: tokio::task::JoinHandle<()>,
     retry_attempt: Option<u32>,
+    /// Current pipeline stage id (`pipeline.stages[].id`), when `pipeline.enabled` --
+    /// `None` for the legacy single-stage path or before the first stage has started.
+    /// Surfaced on the dashboard (`status::RunningRow::stage`) the same way `last_event`
+    /// already is, so a human watching a multi-stage cycle can see which stage is
+    /// running without opening `/events`.
+    current_stage: Option<String>,
 }
 
 struct RetryEntry {
@@ -145,6 +151,21 @@ enum OrchMsg {
     RetryFired {
         issue_id: String,
         generation: u64,
+    },
+    /// A pipeline stage began running (`pipeline.enabled` only -- see `run_pipeline`).
+    StageStarted {
+        issue_id: String,
+        stage_id: String,
+    },
+    /// A pipeline stage finished, however it finished (`outcome` is a short
+    /// human-readable label: "completed", "ended by issue state", "failed", or
+    /// "failed, skipped"). Recorded as a `stage_finished` event regardless of outcome,
+    /// so the pipeline's progress is fully visible on `/events` even for a cycle that's
+    /// ultimately blocked or retried.
+    StageFinished {
+        issue_id: String,
+        stage_id: String,
+        outcome: String,
     },
 }
 
@@ -506,6 +527,7 @@ fn build_status_snapshot(state: &OrchestratorState) -> status::StatusSnapshot {
             tool_call_count: e.tool_call_count,
             last_event: e.last_event.clone(),
             last_message: e.last_message.clone(),
+            stage: e.current_stage.clone(),
         })
         .collect();
 
@@ -726,6 +748,7 @@ async fn dispatch_issue(
             tool_call_count: 0,
             handle,
             retry_attempt: attempt,
+            current_stage: None,
         },
     );
     state.claimed.insert(issue_id.clone());
@@ -1309,6 +1332,51 @@ async fn handle_msg(
         } => {
             handle_retry_fired(shared, state, tx, issue_id, generation).await;
         }
+        OrchMsg::StageStarted { issue_id, stage_id } => {
+            if let Some(e) = state.running.get_mut(&issue_id) {
+                e.current_stage = Some(stage_id.clone());
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "stage_started".to_string(),
+                        message: Some(stage_id),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::StageFinished {
+            issue_id,
+            stage_id,
+            outcome,
+        } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "stage_finished".to_string(),
+                        message: Some(format!("{stage_id}: {outcome}")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1418,78 +1486,209 @@ async fn run_attempt_body(
         session_id: session.session_id().to_string(),
     });
 
-    let max_turns = cfg.max_turns;
-    let mut turn_number: u32 = 1;
-    let exit: ExitReason;
-
-    loop {
-        let prompt = match render_turn_prompt(
+    let exit = if cfg.pipeline.enabled {
+        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+    } else {
+        match run_turn_loop(
+            session.as_mut(),
+            &snapshot.tracker,
+            &cfg.active_states,
+            &cfg.required_labels,
             &snapshot.prompt_template,
-            &issue,
+            &mut issue,
             attempt,
-            turn_number,
-            max_turns,
-        ) {
+            cfg.max_turns,
+            issue_id,
+            tx,
+        )
+        .await
+        {
+            LoopExit::Completed | LoopExit::EndedByIssueState => ExitReason::Normal,
+            LoopExit::Error(e) => ExitReason::Error(e),
+        }
+    };
+
+    session.stop().await;
+    exit
+}
+
+/// How a fixed-turn-budget run of `run_turn_loop` ended. `Completed` and
+/// `EndedByIssueState` both meant `ExitReason::Normal` in the pre-pipeline single-stage
+/// path (see `run_attempt_body`'s non-pipeline branch above, unchanged); the pipeline
+/// path (`run_pipeline` below) distinguishes them because only `EndedByIssueState`
+/// (the issue itself left the active/routable state -- e.g. the agent called
+/// `update_issue_state` to a terminal state) means the whole cycle is done, whereas
+/// `Completed` (the stage simply ran out its own turn budget) means "move on to the
+/// next stage."
+enum LoopExit {
+    Completed,
+    EndedByIssueState,
+    Error(String),
+}
+
+/// Runs 1..=`max_turns` turns of `session` against `issue`, refreshing tracker state
+/// after each turn and stopping early if the issue leaves the active/routable state --
+/// exactly the loop `run_attempt_body` always ran (Section 16.5), generalized so it can
+/// be invoked once per pipeline stage (each with its own turn budget) as well as once
+/// for a whole attempt (the legacy, and still default, single-stage behavior).
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_loop(
+    session: &mut dyn AgentSession,
+    tracker: &Arc<dyn TrackerAdapter>,
+    active_states: &[String],
+    required_labels: &[String],
+    prompt_template: &str,
+    issue: &mut Issue,
+    attempt: Option<u32>,
+    max_turns: u32,
+    issue_id: &str,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) -> LoopExit {
+    let mut turn_number: u32 = 1;
+    loop {
+        let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
+        {
             Ok(p) => p,
-            Err(e) => {
-                exit = ExitReason::Error(format!("prompt error: {e}"));
-                break;
-            }
+            Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
         };
 
         let _ = tx.send(OrchMsg::TurnStarted {
             issue_id: issue_id.to_string(),
         });
 
-        let turn_result = run_one_turn(session.as_mut(), &prompt, issue_id, tx).await;
-
-        match turn_result {
+        match run_one_turn(session, &prompt, issue_id, tx).await {
             Ok(TurnOutcome::Completed { .. }) => {}
             Ok(TurnOutcome::Failed { reason }) => {
-                exit = ExitReason::Error(format!("agent turn error: {reason}"));
-                break;
+                return LoopExit::Error(format!("agent turn error: {reason}"));
             }
-            Err(e) => {
-                exit = ExitReason::Error(format!("agent turn error: {e}"));
-                break;
-            }
+            Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
         }
 
-        let refreshed = match snapshot
-            .tracker
-            .fetch_issues_by_ids(&[issue.id.clone()])
-            .await
-        {
+        let refreshed = match tracker.fetch_issues_by_ids(std::slice::from_ref(&issue.id)).await {
             Ok(r) => r,
-            Err(e) => {
-                exit = ExitReason::Error(format!("issue state refresh error: {e}"));
-                break;
-            }
+            Err(e) => return LoopExit::Error(format!("issue state refresh error: {e}")),
         };
         let Some(next_issue) = refreshed.into_iter().next() else {
-            exit = ExitReason::Normal;
-            break;
+            return LoopExit::EndedByIssueState;
         };
-        issue = next_issue;
+        *issue = next_issue;
 
         let normalized = issue.normalized_state();
-        let active = cfg
-            .active_states
+        let active = active_states
             .iter()
             .any(|s| s.trim().to_lowercase() == normalized);
-        if !active || !issue.is_routable(&cfg.required_labels) {
-            exit = ExitReason::Normal;
-            break;
+        if !active || !issue.is_routable(required_labels) {
+            return LoopExit::EndedByIssueState;
         }
         if turn_number >= max_turns {
-            exit = ExitReason::Normal;
-            break;
+            return LoopExit::Completed;
         }
         turn_number += 1;
     }
+}
 
-    session.stop().await;
-    exit
+/// Drives one delivery cycle through `pipeline.stages` in order, within the one
+/// workspace/session `run_attempt_body` already set up (AIR-1: a stage boundary is not
+/// a workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
+/// `StageStarted`/`StageFinished` bracket it so `/events` shows per-stage progress
+/// regardless of how the stage (or the whole cycle) ends.
+async fn run_pipeline(
+    issue_id: &str,
+    issue: &mut Issue,
+    attempt: Option<u32>,
+    session: &mut dyn AgentSession,
+    snapshot: &DispatchSnapshot,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) -> ExitReason {
+    let cfg = &snapshot.config;
+
+    for stage in &cfg.pipeline.stages {
+        let _ = tx.send(OrchMsg::StageStarted {
+            issue_id: issue_id.to_string(),
+            stage_id: stage.id.clone(),
+        });
+
+        let mut outcome = run_turn_loop(
+            session,
+            &snapshot.tracker,
+            &cfg.active_states,
+            &cfg.required_labels,
+            &snapshot.prompt_template,
+            issue,
+            attempt,
+            stage.max_turns,
+            issue_id,
+            tx,
+        )
+        .await;
+
+        // `retry` gets exactly one extra attempt at the same stage before falling
+        // through to the same handling `escalate` gets -- a bounded retry, not
+        // unbounded looping.
+        if matches!(outcome, LoopExit::Error(_)) && stage.on_failure == StageFailureAction::Retry {
+            outcome = run_turn_loop(
+                session,
+                &snapshot.tracker,
+                &cfg.active_states,
+                &cfg.required_labels,
+                &snapshot.prompt_template,
+                issue,
+                attempt,
+                stage.max_turns,
+                issue_id,
+                tx,
+            )
+            .await;
+        }
+
+        let outcome_label = match &outcome {
+            LoopExit::Completed => "completed".to_string(),
+            LoopExit::EndedByIssueState => "ended by issue state".to_string(),
+            LoopExit::Error(reason) if stage.on_failure == StageFailureAction::Skip => {
+                format!("failed, skipped: {reason}")
+            }
+            LoopExit::Error(reason) => format!("failed: {reason}"),
+        };
+        let _ = tx.send(OrchMsg::StageFinished {
+            issue_id: issue_id.to_string(),
+            stage_id: stage.id.clone(),
+            outcome: outcome_label,
+        });
+
+        match outcome {
+            LoopExit::Completed => continue,
+            LoopExit::EndedByIssueState => return ExitReason::Normal,
+            LoopExit::Error(reason) => {
+                if stage.on_failure == StageFailureAction::Skip {
+                    continue;
+                }
+                if stage.blocking {
+                    block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                    return ExitReason::Normal;
+                }
+                return ExitReason::Error(format!("stage '{}' failed: {reason}", stage.id));
+            }
+        }
+    }
+    ExitReason::Normal
+}
+
+/// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure --
+/// deliberately host-side (`TrackerAdapter::set_issue_state`, not the agent-facing
+/// `update_issue_state` tool): the decision to stop the cycle is the orchestrator's,
+/// not something to ask the (just-failed) agent to report on its own behalf. A tracker
+/// adapter that doesn't support this (the default) logs a warning rather than failing
+/// the cycle outright -- the cycle still stops via `ExitReason::Normal` either way,
+/// this only affects whether the tracker's own state reflects why.
+async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state: &str) {
+    if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
+        tracing::warn!(
+            issue_id = %issue_id,
+            blocked_state = %blocked_state,
+            error = %e,
+            "failed to park issue in pipeline.blocked_state after a blocking stage failure"
+        );
+    }
 }
 
 async fn run_one_turn(
@@ -1631,5 +1830,357 @@ mod tests {
         abort_and_run_after_run(&shared, handle, identifier).await;
 
         assert!(!workspace.join("marker.txt").exists());
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-1: delivery pipeline (`run_pipeline`/`run_turn_loop`)
+    // -----------------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A canned-outcome `AgentBackend`/`AgentSession` pair for pipeline tests: every
+    /// turn across the whole attempt (however many stages it spans) increments one
+    /// shared counter, so a test can script "fail on the Nth turn" and assert on
+    /// exactly how many turns ran in total -- the thing that distinguishes "two stages
+    /// ran in order in one session" from "only one ran."
+    struct ScriptedBackend {
+        calls: Arc<Mutex<u32>>,
+        failures: HashMap<u32, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ScriptedBackend {
+        async fn start_session(
+            &self,
+            _workspace: &Path,
+            _issue_id: &str,
+            _title: &str,
+            _container: Option<&ContainerHandle>,
+        ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
+            Ok(Box::new(ScriptedSession {
+                calls: self.calls.clone(),
+                failures: self.failures.clone(),
+            }))
+        }
+    }
+
+    struct ScriptedSession {
+        calls: Arc<Mutex<u32>>,
+        failures: HashMap<u32, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for ScriptedSession {
+        fn session_id(&self) -> &str {
+            "scripted-session"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            let n = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            let _ = events.send(AgentEvent::new("turn_completed"));
+            match self.failures.get(&n) {
+                Some(reason) => Ok(TurnOutcome::Failed {
+                    reason: reason.clone(),
+                }),
+                None => Ok(TurnOutcome::Completed { usage: None }),
+            }
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    fn write_pipeline_issue(dir: &Path, identifier: &str) {
+        std::fs::write(
+            dir.join(format!("{identifier}.md")),
+            format!("---\nidentifier: {identifier}\ntitle: Test issue\nstate: todo\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    /// Builds a `DispatchSnapshot` wired to a real `LocalTrackerAdapter` (so blocking
+    /// failures' `set_issue_state` calls are observable) and the given `ScriptedBackend`,
+    /// with `pipeline.enabled: true` and the supplied stage config appended as raw YAML.
+    fn pipeline_snapshot(
+        tracker_dir: &Path,
+        stages_yaml: &str,
+        backend: ScriptedBackend,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n{stages_yaml}"
+        ))
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(backend),
+            // Never touched by these tests (`run_pipeline` doesn't create workspaces
+            // itself -- that's `run_agent_attempt`'s job), so an unused placeholder
+            // path is fine; `WorkspaceManager::new` does no I/O at construction.
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    async fn drain(mut rx: mpsc::UnboundedReceiver<OrchMsg>) -> Vec<OrchMsg> {
+        rx.close();
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    fn stage_events(msgs: &[OrchMsg]) -> Vec<(&str, &str)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                OrchMsg::StageStarted { stage_id, .. } => Some(("started", stage_id.as_str())),
+                OrchMsg::StageFinished { stage_id, .. } => Some(("finished", stage_id.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pipeline_runs_stages_in_order_within_one_session() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 2\n",
+            ScriptedBackend {
+                calls: calls.clone(),
+                failures: HashMap::new(),
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        assert!(matches!(exit, ExitReason::Normal));
+        // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
+        assert_eq!(*calls.lock().unwrap(), 3);
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_stage_failure_parks_the_issue_in_blocked_state() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-2");
+        let mut failures = HashMap::new();
+        failures.insert(1, "boom".to_string()); // the only stage's only turn fails
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: review\n    role: reviewer\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend {
+                calls: Arc::new(Mutex::new(0)),
+                failures,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-2".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        // Blocking failure ends the cycle cleanly (not an attempt-level error) --
+        // the issue's own state is what now says it stopped, and why.
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "blocked");
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn on_failure_skip_continues_to_the_next_stage() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-3");
+        let mut failures = HashMap::new();
+        failures.insert(1, "boom".to_string()); // first stage's only turn fails
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n    on_failure: skip\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ScriptedBackend {
+                calls: Arc::new(Mutex::new(0)),
+                failures,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        // Both stages ran even though the first failed -- `skip` moved on.
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn on_failure_retry_gives_one_extra_attempt_before_giving_up() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-4");
+        let mut failures = HashMap::new();
+        failures.insert(1, "boom".to_string()); // first attempt at the stage fails...
+        // ...second attempt (turn 2) is left unscripted, so it succeeds.
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: implement\n    role: developer\n    max_turns: 1\n    on_failure: retry\n",
+            ScriptedBackend {
+                calls: calls.clone(),
+                failures,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-4".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        assert!(matches!(exit, ExitReason::Normal));
+        assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
+
+        let msgs = drain(rx).await;
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome == "completed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn on_failure_escalate_stops_a_non_blocking_stage_with_an_error() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-5");
+        let mut failures = HashMap::new();
+        failures.insert(1, "boom".to_string());
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: implement\n    role: developer\n    max_turns: 1\n\
+             \x20\x20- id: review\n    role: reviewer\n    max_turns: 1\n",
+            ScriptedBackend {
+                calls: Arc::new(Mutex::new(0)),
+                failures,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-5".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(Path::new("."), &issue.id, "t", None)
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        assert!(matches!(exit, ExitReason::Error(_)));
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        // The second stage never starts -- default `escalate` stops the whole cycle.
+        assert_eq!(stages, vec![("started", "implement"), ("finished", "implement")]);
+    }
+
+    #[test]
+    fn pipeline_absent_resolves_disabled_with_no_stages() {
+        let cfg_yaml: serde_yaml::Value =
+            serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.pipeline.enabled);
+        assert!(cfg.pipeline.stages.is_empty());
     }
 }

@@ -277,6 +277,11 @@ impl TrackerAdapter for LocalTrackerAdapter {
             Err(e) => ToolResult::error(e),
         }
     }
+
+    async fn set_issue_state(&self, issue_id: &str, state: &str) -> Result<(), TrackerError> {
+        self.update_issue_state(issue_id, state)
+            .map_err(TrackerError::Request)
+    }
 }
 
 fn parse_issue_file(path: &Path) -> Result<RawIssue, String> {

@@ -745,6 +745,76 @@ container/volume naming is keyed off a single project's workflow directory, whic
 doesn't apply to a service managing many repos at once. A plain `docker run --restart
 unless-stopped` gets the same "keeps running, survives crashes" property directly.
 
+## Delivery pipeline (AI Roadmap 2026, Step 1 -- AIR-1)
+
+Off by default. `pipeline.enabled: true` in `WORKFLOW.md` turns a ticket's single
+undifferentiated agent run into an ordered sequence of stages executed within the
+*same* per-issue workspace and agent session (a stage boundary is not a workspace
+boundary):
+
+```yaml
+pipeline:
+  enabled: true
+  blocked_state: blocked      # default; must sit outside both active_states and
+                               # terminal_states so a parked issue is never redispatched
+  stages:
+    - id: requirements
+      role: requirements       # not yet resolved to a distinct prompt/backend --
+      max_turns: 4             # see "not yet implemented" below
+      on_failure: escalate     # escalate (default) | retry | skip
+    - id: implement
+      role: developer
+      max_turns: 20
+    - id: review
+      role: reviewer
+      max_turns: 6
+      blocking: true           # a failed exit criterion parks the issue instead of
+                                # falling back to the normal whole-attempt retry
+```
+
+`pipeline:` absent (the default) leaves every code path byte-identical to before this
+feature existed — `orchestrator::run_attempt_body` runs its original single loop over
+`agent.max_turns`, no stage events, no config validation for a block that isn't there.
+
+**What a stage is, today.** Each stage runs the project's one `WORKFLOW.md` prompt for
+up to its own `max_turns`, exactly the same per-turn loop (render prompt, run turn,
+refresh tracker state, check still-active/routable) the legacy single-stage path always
+ran — factored into `orchestrator::run_turn_loop` so both paths share it. A stage
+"succeeds" when it exhausts its own turn budget without an agent-turn error; it "ends
+the whole cycle" if the issue leaves the active/routable tracker state mid-stage (e.g.
+the agent called `update_issue_state` to a terminal state) -- exactly what ended the
+legacy single-stage run.
+
+**`on_failure`** governs what happens when a turn inside a stage errors out:
+- `escalate` (default): stop the cycle. A `blocking: true` stage parks the issue in
+  `pipeline.blocked_state` (via `TrackerAdapter::set_issue_state`, host-side — the
+  orchestrator's own decision, not something asked of the just-failed agent); a
+  non-blocking stage falls back to the orchestrator's existing whole-attempt retry
+  backoff, the same path any turn failure already took before pipelines existed.
+- `retry`: re-run the stage's own turn budget once more before falling back to
+  `escalate`'s handling — a bounded retry, not unbounded looping.
+- `skip`: record the failure and move on to the next stage anyway.
+
+**A non-blocking `escalate`/exhausted-`retry` failure falls back to the whole-attempt
+retry the legacy path already had** -- there is no per-stage checkpoint yet (that's
+AIR-13's durable cycle state), so the next dispatch of that issue re-runs the pipeline
+from its first stage, same as a legacy single-stage attempt always retried the whole
+attempt on error.
+
+**Not yet implemented** (later AIR tickets, see `issues/AI-ROADMAP-PLAN.md`): per-stage
+roles resolving to distinct prompts/backends/models and backend-native tool
+restrictions (AIR-2), a structured artifact store so one stage's output feeds the next
+(AIR-3), and the actual Requirements/Planner/Test/Reviewer/Security/Release/
+Observability agents themselves (AIR-4 … AIR-10) — today every stage runs the same
+prompt and the only failure signal is a turn erroring out, not a judgement about
+whether the work actually meets any exit criteria.
+
+**Observability.** Per-stage progress is always visible without extra config: the
+live dashboard's running card shows the current stage (`status::RunningRow::stage`),
+and every stage boundary is a `stage_started`/`stage_finished` event on `/events`,
+filterable by issue like any other event — no new page, reusing the existing
+dashboard exactly as it already works for turns and tool calls.
+
 ## Provider-native tracker tool (Section 10.5)
 
 The coding agent only ever runs inside the per-issue workspace — it has no visibility

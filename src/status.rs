@@ -56,6 +56,10 @@ pub struct RunningRow {
     pub tool_call_count: u32,
     pub last_event: Option<String>,
     pub last_message: Option<String>,
+    /// Current pipeline stage id (`pipeline.stages[].id`), when the AI Roadmap delivery
+    /// pipeline (`pipeline.enabled`) is on for this project. `None` for the legacy
+    /// single-stage path, or before the first stage has started.
+    pub stage: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -309,12 +313,18 @@ fn running_card(r: &RunningRow, base: &str) -> String {
     } else {
         ""
     };
+    let stage_row = r
+        .stage
+        .as_deref()
+        .map(|s| format!(r#"<div class="row"><b>stage</b> {}</div>"#, escape(s)))
+        .unwrap_or_default();
     format!(
         r#"<div class="card" id="run-{id_attr}">
   <h2><a href="{base}/events?issue={issue_link}">{identifier}</a></h2>
   <div class="row">{title}</div>
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
+  {stage_row}
   <div class="row"><b>last event</b> {event}</div>
   <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
@@ -327,6 +337,7 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         elapsed = r.started_secs_ago,
         turn = r.turn_count,
         tools = r.tool_call_count,
+        stage_row = stage_row,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
         message = escape(message),
     )
@@ -765,6 +776,7 @@ mod tests {
                 tool_call_count: 0,
                 last_event: None,
                 last_message: None,
+                stage: None,
             }],
             retrying: vec![],
         })
@@ -799,6 +811,7 @@ mod tests {
             tool_call_count: 0,
             last_event: None,
             last_message: None,
+            stage: None,
         };
         let html = running_card(&row, "");
         assert!(!html.contains("<script>alert"));
@@ -817,6 +830,7 @@ mod tests {
             tool_call_count: 0,
             last_event: None,
             last_message: None,
+            stage: None,
         };
         let html = running_card(&row, "/projects/p1");
         assert!(html.contains(r#"<a href="/projects/p1/events?issue=issue-42">AR-1</a>"#));

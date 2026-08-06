@@ -105,6 +105,18 @@ pub trait TrackerAdapter: Send + Sync {
     ) -> ToolResult {
         ToolResult::error(format!("unsupported tool '{name}'"))
     }
+
+    /// Directly set an issue's tracker state, host-side -- not through the agent-tool
+    /// round trip `execute_agent_tool("update_issue_state", ...)` uses. Used by the
+    /// delivery pipeline (`orchestrator::run_pipeline`) to park an issue in
+    /// `pipeline.blocked_state` when a blocking stage fails: that's the orchestrator's
+    /// own decision, not the agent's, so it goes through this instead of asking the
+    /// agent to call a tool on its own behalf. Default: unsupported, like `create_issue`.
+    async fn set_issue_state(&self, _issue_id: &str, _state: &str) -> Result<(), TrackerError> {
+        Err(TrackerError::Request(
+            "set_issue_state is not supported by this tracker adapter".to_string(),
+        ))
+    }
 }
 
 /// Construct the configured tracker adapter. Returns `UnsupportedTrackerKind` for any

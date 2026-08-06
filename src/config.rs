@@ -85,6 +85,12 @@ pub enum ConfigError {
         "invalid_config: swebot.chat.connectors lists '{0}', which is not a known connector (known: {1})"
     )]
     UnknownChatConnector(String, String),
+    #[error("invalid_config: pipeline.enabled is true but pipeline.stages is empty")]
+    EmptyPipelineStages,
+    #[error(
+        "invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field"
+    )]
+    InvalidPipelineStage(usize),
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -377,6 +383,67 @@ pub struct SwebotChatConfig {
     pub first_text_deadline_ms: u64,
 }
 
+/// Extension: the AI Roadmap 2026 delivery pipeline (AIR-1) -- run a ticket through an
+/// ordered sequence of stages within one workspace instead of a single undifferentiated
+/// agent run. Off by default (`enabled: false`, the zero value `Default` produces):
+/// `orchestrator::run_attempt_body` then runs its pre-existing single-stage loop exactly
+/// as it always has, byte-identical to before this extension existed.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineConfig {
+    pub enabled: bool,
+    pub stages: Vec<StageConfig>,
+    /// Tracker state a blocking stage's failure parks the issue in -- deliberately
+    /// outside both `active_states` and `terminal_states` (a project's own
+    /// responsibility to arrange, same convention `repo.pull_request`'s "in review"
+    /// state already documents), so the orchestrator's existing eligibility checks
+    /// simply stop selecting it for dispatch rather than needing new logic of their own.
+    pub blocked_state: String,
+}
+
+/// What a stage's failure (a turn erroring out, not a judgement about work quality --
+/// no exit-criteria evaluation exists yet, that lands with roles/artifacts in AIR-2/AIR-3)
+/// does to the rest of the cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageFailureAction {
+    /// Stop the cycle. A `blocking` stage parks the issue in `pipeline.blocked_state`;
+    /// a non-blocking one falls back to the orchestrator's existing whole-attempt retry
+    /// backoff, the same path any turn failure already takes today.
+    Escalate,
+    /// Re-run the stage's own turn budget once more before falling back to `Escalate`'s
+    /// behavior -- a bounded retry, not unbounded looping.
+    Retry,
+    /// Record the failure and move on to the next stage anyway.
+    Skip,
+}
+
+impl StageFailureAction {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "retry" => StageFailureAction::Retry,
+            "skip" => StageFailureAction::Skip,
+            _ => StageFailureAction::Escalate,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StageConfig {
+    pub id: String,
+    /// A stage's role identity. Not yet resolved to a distinct prompt/backend/tool
+    /// policy (that's AIR-2) -- every stage today runs the project's one `WORKFLOW.md`
+    /// prompt template. Kept as a plain string now so `pipeline.stages[].role` in
+    /// `WORKFLOW.md` doesn't need to change shape once AIR-2 lands. Parsed and
+    /// validated (non-empty) today; not read anywhere beyond that until AIR-2 gives it
+    /// something to select.
+    #[allow(dead_code)]
+    pub role: String,
+    pub max_turns: u32,
+    pub on_failure: StageFailureAction,
+    /// Whether this stage's failure parks the issue in `pipeline.blocked_state` rather
+    /// than falling back to the whole-attempt retry backoff.
+    pub blocking: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker_kind: String,
@@ -400,6 +467,7 @@ pub struct EffectiveConfig {
     #[allow(dead_code)]
     pub repo: Option<RepoConfig>,
     pub swebot: SwebotConfig,
+    pub pipeline: PipelineConfig,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -762,6 +830,46 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .transpose()?,
     };
 
+    let pipeline_raw = get(config, "pipeline").unwrap_or(&empty);
+    let pipeline_enabled = get(pipeline_raw, "enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let pipeline_stages = get(pipeline_raw, "stages")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| -> Result<Vec<StageConfig>, ConfigError> {
+            seq.iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let id = get_str(s, "id")
+                        .filter(|v| !v.trim().is_empty())
+                        .ok_or(ConfigError::InvalidPipelineStage(i))?;
+                    let role = get_str(s, "role")
+                        .filter(|v| !v.trim().is_empty())
+                        .ok_or(ConfigError::InvalidPipelineStage(i))?;
+                    Ok(StageConfig {
+                        id,
+                        role,
+                        max_turns: (get_u64(s, "max_turns", max_turns) as u32).max(1),
+                        on_failure: get_str(s, "on_failure")
+                            .map(|v| StageFailureAction::parse(&v))
+                            .unwrap_or(StageFailureAction::Escalate),
+                        blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if pipeline_enabled && pipeline_stages.is_empty() {
+        return Err(ConfigError::EmptyPipelineStages);
+    }
+    let pipeline_cfg = PipelineConfig {
+        enabled: pipeline_enabled,
+        stages: pipeline_stages,
+        blocked_state: get_str(pipeline_raw, "blocked_state")
+            .unwrap_or_else(|| "blocked".to_string()),
+    };
+
     let cfg = EffectiveConfig {
         tracker_kind,
         tracker_provider: get_map(tracker, "provider"),
@@ -779,6 +887,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         docker: docker_cfg,
         repo: repo_cfg,
         swebot: swebot_cfg,
+        pipeline: pipeline_cfg,
 
         hook_after_create,
         hook_before_run,
@@ -1958,5 +2067,62 @@ mod tests {
             validate_for_dispatch(&cfg, &["local"]),
             Err(ConfigError::MissingAgentCommand { backend }) if backend == "opencode"
         ));
+    }
+
+    #[test]
+    fn pipeline_absent_resolves_disabled_with_default_blocked_state() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.pipeline.enabled);
+        assert!(cfg.pipeline.stages.is_empty());
+        assert_eq!(cfg.pipeline.blocked_state, "blocked");
+    }
+
+    #[test]
+    fn pipeline_enabled_with_no_stages_errors() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\npipeline:\n  enabled: true\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::EmptyPipelineStages)
+        ));
+    }
+
+    #[test]
+    fn pipeline_stage_missing_id_or_role_errors() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - role: developer\n      max_turns: 5\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidPipelineStage(0))
+        ));
+    }
+
+    #[test]
+    fn pipeline_stage_parses_fields_and_defaults() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nagent:\n  max_turns: 8\npipeline:\n  enabled: true\n  \
+             blocked_state: parked\n  stages:\n    \
+             - id: requirements\n      role: requirements\n    \
+             - id: review\n      role: reviewer\n      max_turns: 3\n      \
+             on_failure: skip\n      blocking: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.pipeline.enabled);
+        assert_eq!(cfg.pipeline.blocked_state, "parked");
+        assert_eq!(cfg.pipeline.stages.len(), 2);
+
+        let first = &cfg.pipeline.stages[0];
+        assert_eq!(first.id, "requirements");
+        // Falls back to agent.max_turns (8) when a stage doesn't set its own.
+        assert_eq!(first.max_turns, 8);
+        assert_eq!(first.on_failure, StageFailureAction::Escalate);
+        assert!(!first.blocking);
+
+        let second = &cfg.pipeline.stages[1];
+        assert_eq!(second.max_turns, 3);
+        assert_eq!(second.on_failure, StageFailureAction::Skip);
+        assert!(second.blocking);
     }
 }
