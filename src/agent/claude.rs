@@ -359,7 +359,19 @@ impl ClaudeSession {
                 if let Some(text) = extract_text(v) {
                     let _ = events.send(AgentEvent::new("notification").with_message(text));
                 }
-                for tool_name in extract_tool_uses(v) {
+                for (tool_name, input) in extract_tool_uses(v) {
+                    // `raise_clarification` (AIR-4) is the one provider-native tool whose
+                    // arguments the orchestrator itself must see, not just the coding
+                    // agent: a `blocking: true` call has to stop the cycle promptly
+                    // rather than run out the stage's turn budget first. Surfaced as its
+                    // own event (alongside the generic `tool_call`) so `run_turn_loop`
+                    // can detect it without every other tool call needing this.
+                    if tool_name.ends_with("raise_clarification") {
+                        let _ = events.send(
+                            AgentEvent::new("clarification_raised")
+                                .with_message(input.to_string()),
+                        );
+                    }
                     let _ = events.send(AgentEvent::new("tool_call").with_message(tool_name));
                 }
                 None
@@ -417,10 +429,12 @@ fn extract_text(v: &Value) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Names of every `tool_use` content block in an assistant message (Section 10.4's
-/// event vocabulary doesn't name tool calls explicitly; we surface them as our own
-/// `tool_call` event for usage metrics).
-fn extract_tool_uses(v: &Value) -> Vec<String> {
+/// `(name, input)` of every `tool_use` content block in an assistant message (Section
+/// 10.4's event vocabulary doesn't name tool calls explicitly; we surface them as our
+/// own `tool_call` event for usage metrics, plus `input` so a handful of tools whose
+/// arguments matter to the orchestrator itself -- currently just `raise_clarification`,
+/// AIR-4 -- can be inspected without a second parse pass).
+fn extract_tool_uses(v: &Value) -> Vec<(String, Value)> {
     let Some(content) = v
         .get("message")
         .and_then(|m| m.get("content"))
@@ -431,7 +445,11 @@ fn extract_tool_uses(v: &Value) -> Vec<String> {
     content
         .iter()
         .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-        .filter_map(|block| block.get("name").and_then(|n| n.as_str()).map(String::from))
+        .filter_map(|block| {
+            let name = block.get("name").and_then(|n| n.as_str())?.to_string();
+            let input = block.get("input").cloned().unwrap_or(json!({}));
+            Some((name, input))
+        })
         .collect()
 }
 
@@ -486,7 +504,10 @@ mod tests {
         let v = json!({"message": {"content": [
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
         ]}});
-        assert_eq!(extract_tool_uses(&v), vec!["Bash".to_string()]);
+        assert_eq!(
+            extract_tool_uses(&v),
+            vec![("Bash".to_string(), json!({"command": "ls"}))]
+        );
         assert_eq!(extract_text(&v), None);
     }
 
@@ -501,9 +522,45 @@ mod tests {
         assert_eq!(
             extract_tool_uses(&v),
             vec![
-                "Read".to_string(),
-                "mcp__symphony__update_issue_state".to_string()
+                ("Read".to_string(), json!({})),
+                (
+                    "mcp__symphony__update_issue_state".to_string(),
+                    json!({"state": "done"})
+                )
             ]
+        );
+    }
+
+    #[test]
+    fn raise_clarification_tool_call_also_emits_clarification_raised_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let v = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__symphony__raise_clarification",
+             "input": {"question": "which auth scheme?", "blocking": true}}
+        ]}});
+        let mut session = ClaudeSession {
+            command: "claude".to_string(),
+            extra_args: Vec::new(),
+            model: None,
+            permission_mode: "default".to_string(),
+            turn_timeout_ms: 1000,
+            workspace: PathBuf::from("."),
+            container: None,
+            container_workspace_path: None,
+            mcp_config_path: None,
+            session_id: None,
+        };
+        session.handle_message(&v, &tx);
+        drop(tx);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| e.event == "clarification_raised"
+            && e.message.as_deref()
+                == Some(r#"{"blocking":true,"question":"which auth scheme?"}"#)));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event == "tool_call"
+                    && e.message.as_deref() == Some("mcp__symphony__raise_clarification"))
         );
     }
 

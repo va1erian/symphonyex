@@ -126,6 +126,29 @@ impl LocalTrackerAdapter {
         };
         std::fs::write(&path, new_contents).map_err(|e| e.to_string())
     }
+
+    /// Finds the issue file matching `issue_id` and appends `text` to its Markdown
+    /// body, preserving front matter verbatim. Shared by `post_comment`.
+    fn append_to_body(&self, issue_id: &str, text: &str) -> Result<(), String> {
+        let all = self.read_all().map_err(|e| e.to_string())?;
+        let path = all
+            .into_iter()
+            .find_map(|(key, parsed)| match parsed {
+                Ok(issue) if issue.id == issue_id => Some(self.dir.join(format!("{key}.md"))),
+                _ => None,
+            })
+            .ok_or_else(|| format!("no issue file found for id '{issue_id}'"))?;
+
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let (fm, body) = frontmatter::split(&raw).map_err(|e| e.to_string())?;
+        let yaml = serde_yaml::to_string(&fm).map_err(|e| e.to_string())?;
+        let new_body = if body.is_empty() {
+            text.to_string()
+        } else {
+            format!("{body}\n\n{text}")
+        };
+        std::fs::write(&path, format!("---\n{yaml}---\n{new_body}\n")).map_err(|e| e.to_string())
+    }
 }
 
 #[async_trait]
@@ -280,6 +303,15 @@ impl TrackerAdapter for LocalTrackerAdapter {
 
     async fn set_issue_state(&self, issue_id: &str, state: &str) -> Result<(), TrackerError> {
         self.update_issue_state(issue_id, state)
+            .map_err(TrackerError::Request)
+    }
+
+    /// Appends `body` to the issue file's Markdown body -- this adapter has no
+    /// separate comment thread, so "a comment on the tracker issue" (AIR-4) means the
+    /// question becomes part of the same body the agent reads every turn. A human
+    /// answers by editing the file directly, same as they'd flip `state:` by hand.
+    async fn post_comment(&self, issue_id: &str, body: &str) -> Result<(), TrackerError> {
+        self.append_to_body(issue_id, body)
             .map_err(TrackerError::Request)
     }
 }

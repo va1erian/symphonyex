@@ -442,6 +442,12 @@ pub struct StageConfig {
     /// Whether this stage's failure parks the issue in `pipeline.blocked_state` rather
     /// than falling back to the whole-attempt retry backoff.
     pub blocking: bool,
+    /// Lets a project skip this stage per-issue by labeling the issue
+    /// `skip-<stage id>` (e.g. `skip-requirements`), for tickets already written as
+    /// specs (AIR-4) that don't need the requirements stage to re-derive anything.
+    /// `false` (the default) means the stage always runs, matching AIR-1's original
+    /// pre-`optional` behavior exactly.
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -854,6 +860,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                             .map(|v| StageFailureAction::parse(&v))
                             .unwrap_or(StageFailureAction::Escalate),
                         blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                        optional: get(s, "optional").and_then(|v| v.as_bool()).unwrap_or(false),
                     })
                 })
                 .collect()
@@ -2124,5 +2131,19 @@ mod tests {
         assert_eq!(second.max_turns, 3);
         assert_eq!(second.on_failure, StageFailureAction::Skip);
         assert!(second.blocking);
+        assert!(!first.optional);
+        assert!(!second.optional);
+    }
+
+    #[test]
+    fn pipeline_stage_optional_flag_parses_and_defaults_false() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: requirements\n      role: requirements\n      optional: true\n    \
+             - id: implement\n      role: developer\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.pipeline.stages[0].optional);
+        assert!(!cfg.pipeline.stages[1].optional);
     }
 }

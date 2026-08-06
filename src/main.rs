@@ -12,6 +12,7 @@ mod metrics;
 mod orchestrator;
 mod registry;
 mod repo_host;
+mod roles;
 mod service;
 mod status;
 mod swebot;
@@ -276,7 +277,25 @@ async fn run_mcp_tool_server(
         },
         None => None,
     };
-    match mcp::run_stdio_server(adapter, repo_host, issue_id, workspace_dir).await {
+    // `pipeline.enabled` gates the delivery pipeline's own tools (AIR-4:
+    // `record_requirements`/`record_acceptance_criteria`/`raise_clarification`) the
+    // same way `repo_pr_json`'s presence gates `open_pull_request` above -- re-resolve
+    // WORKFLOW.md here rather than adding another CLI flag, since `workflow_dir` (and
+    // hence the file) is already available to this subprocess.
+    let pipeline = match workflow::load(&workflow_dir.join("WORKFLOW.md"))
+        .map_err(|e| e.to_string())
+        .and_then(|def| config::resolve(&def.config, workflow_dir).map_err(|e| e.to_string()))
+    {
+        Ok(cfg) if cfg.pipeline.enabled => Some(mcp::PipelineToolCtx {
+            db_path: workflow_dir.join(eventlog::DB_FILENAME),
+        }),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp tool server: failed to resolve WORKFLOW.md for pipeline tool gating; pipeline tools disabled for this session");
+            None
+        }
+    };
+    match mcp::run_stdio_server(adapter, repo_host, pipeline, issue_id, workspace_dir).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");

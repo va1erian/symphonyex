@@ -16,7 +16,7 @@
 //! mode handles concurrent readers fine at this traffic volume) -- no connection pool,
 //! no `Arc<Mutex<Connection>>`, matching "keep it basic."
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_importance ON events(importance);
+CREATE TABLE IF NOT EXISTS artifacts (
+    issue_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (issue_id, kind)
+);
 ";
 
 fn open(path: &Path) -> rusqlite::Result<Connection> {
@@ -323,6 +330,57 @@ pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
     rows.collect()
 }
 
+/// A pipeline stage's durable output (AIR-4's `requirements`/`acceptance_criteria`,
+/// and generic enough for later stages -- AIR-6's tests, AIR-7's review, AIR-9's
+/// traceability manifest -- to reuse rather than inventing their own table).
+/// `content` is caller-defined (JSON in every AIR-4 use), stored as opaque text; one
+/// row per `(issue_id, kind)`, so recording again replaces the previous snapshot
+/// rather than accumulating history (an agent re-running the stage always intends to
+/// hand over its current, complete view of the artifact, not a diff against the last
+/// one). Callers already know which `issue_id`/`kind` they asked for (both are lookup
+/// keys, not payload), so only what the row actually adds is returned.
+#[derive(Debug, Clone)]
+pub struct ArtifactRow {
+    pub content: String,
+    pub created_at: String,
+}
+
+pub fn put_artifact(
+    db_path: &Path,
+    issue_id: &str,
+    kind: &str,
+    content: &str,
+) -> rusqlite::Result<()> {
+    let conn = open(db_path)?;
+    conn.execute(
+        "INSERT INTO artifacts (issue_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(issue_id, kind) DO UPDATE SET content = excluded.content, \
+         created_at = excluded.created_at",
+        rusqlite::params![issue_id, kind, content, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Feeds the dashboard's per-issue requirements panel (`status.rs`).
+pub fn get_artifact(
+    db_path: &Path,
+    issue_id: &str,
+    kind: &str,
+) -> rusqlite::Result<Option<ArtifactRow>> {
+    let conn = open(db_path)?;
+    conn.query_row(
+        "SELECT content, created_at FROM artifacts WHERE issue_id = ?1 AND kind = ?2",
+        rusqlite::params![issue_id, kind],
+        |row| {
+            Ok(ArtifactRow {
+                content: row.get(0)?,
+                created_at: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +537,50 @@ mod tests {
         let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
         assert_eq!(issue1.dispatch_count, 1);
         assert_eq!(issue1.turn_count, 1);
+    }
+
+    #[test]
+    fn put_artifact_then_get_artifact_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
+        let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
+        assert_eq!(row.content, "[{\"id\":\"R1\"}]");
+        assert!(get_artifact(&db, "1", "acceptance_criteria").unwrap().is_none());
+    }
+
+    #[test]
+    fn put_artifact_replaces_prior_snapshot_for_same_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
+        put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"},{\"id\":\"R2\"}]").unwrap();
+        let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
+        assert_eq!(row.content, "[{\"id\":\"R1\"},{\"id\":\"R2\"}]");
+    }
+
+    #[test]
+    fn put_artifact_is_scoped_to_its_own_issue_and_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        put_artifact(&db, "1", "requirements", "[\"r\"]").unwrap();
+        put_artifact(&db, "1", "acceptance_criteria", "[\"ac\"]").unwrap();
+        put_artifact(&db, "2", "requirements", "[\"other\"]").unwrap();
+
+        assert_eq!(
+            get_artifact(&db, "1", "requirements").unwrap().unwrap().content,
+            "[\"r\"]"
+        );
+        assert_eq!(
+            get_artifact(&db, "1", "acceptance_criteria")
+                .unwrap()
+                .unwrap()
+                .content,
+            "[\"ac\"]"
+        );
+        assert_eq!(
+            get_artifact(&db, "2", "requirements").unwrap().unwrap().content,
+            "[\"other\"]"
+        );
     }
 }
