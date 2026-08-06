@@ -19,16 +19,18 @@
 //! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 
+use crate::approvals;
 use crate::eventlog;
 use crate::web::{escape, urlencode};
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::extract::{Form, Path as PathParam, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
@@ -133,6 +135,8 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/approvals", get(approvals_page))
+        .route("/approvals/{id}/decide", post(approvals_decide))
         .with_state(state)
 }
 
@@ -222,8 +226,10 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
   incoming.innerHTML = e.data;
   const runningCount = incoming.querySelector('#running-count');
   const retryingCount = incoming.querySelector('#retrying-count');
+  const approvalsBanner = incoming.querySelector('#approvals-banner');
   if (runningCount) document.getElementById('running-count').textContent = runningCount.textContent;
   if (retryingCount) document.getElementById('retrying-count').textContent = retryingCount.textContent;
+  if (approvalsBanner) document.getElementById('approvals-banner').innerHTML = approvalsBanner.innerHTML;
   diffChildren(document.getElementById('running-grid'), incoming.querySelector('#running-grid'));
   diffChildren(document.getElementById('retry-tbody'), incoming.querySelector('#retry-tbody'));
 }};
@@ -234,7 +240,7 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
         r#"<div class="meta">generated {generated} &middot; live-updates in place, pushed as they happen (no page reload, no polling)</div>
 <div id="symphony-fragment" aria-live="polite" role="status">{fragment}</div>"#,
         generated = escape(&snapshot.generated_at),
-        fragment = render_fragment(&snapshot, &state.base_path),
+        fragment = render_fragment(&snapshot, &state.base_path, &state.eventlog_db_path()),
     );
     Html(page_shell(
         "live status",
@@ -247,7 +253,11 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
 
 async fn fragment(State(state): State<AppState>) -> Html<String> {
     let snapshot = state.status_rx.borrow().clone();
-    Html(render_fragment(&snapshot, &state.base_path))
+    Html(render_fragment(
+        &snapshot,
+        &state.base_path,
+        &state.eventlog_db_path(),
+    ))
 }
 
 /// Server-Sent Events push of the same fragment `/fragment` renders on demand, but
@@ -261,12 +271,14 @@ async fn fragment_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let base = state.base_path.clone();
-    let stream = WatchStream::new(state.status_rx.clone())
-        .map(move |snapshot| Ok(Event::default().data(render_fragment(&snapshot, &base))));
+    let db_path = state.eventlog_db_path();
+    let stream = WatchStream::new(state.status_rx.clone()).map(move |snapshot| {
+        Ok(Event::default().data(render_fragment(&snapshot, &base, &db_path)))
+    });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn render_fragment(s: &StatusSnapshot, base: &str) -> String {
+fn render_fragment(s: &StatusSnapshot, base: &str, eventlog_db_path: &Path) -> String {
     let running_cards: String = if s.running.is_empty() {
         "<p class=\"empty\">No agents running.</p>".to_string()
     } else {
@@ -279,8 +291,27 @@ fn render_fragment(s: &StatusSnapshot, base: &str) -> String {
         s.retrying.iter().map(retry_row).collect()
     };
 
+    // AIR-5: a fresh read every render (this function is called both by the plain
+    // `/fragment` GET and by every `/fragment-stream` push), same "no cache, just
+    // re-query" posture `/events`/`/usage` already take -- pending approvals live in
+    // SQLite, not `StatusSnapshot`, so this is how a human sees "N awaiting approval"
+    // update live without a page reload rather than only on the next full `/approvals`
+    // visit.
+    let pending_approvals = crate::approvals::list_pending(eventlog_db_path).unwrap_or_default();
+    let approvals_banner_inner = if pending_approvals.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<section>
+<p class="meta"><a href="{base}/approvals"><span class="badge">{count}</span> awaiting approval &rarr;</a></p>
+</section>"#,
+            count = pending_approvals.len(),
+        )
+    };
+    let approvals_banner = format!(r#"<div id="approvals-banner">{approvals_banner_inner}</div>"#);
+
     format!(
-        r#"<section>
+        r#"{approvals_banner}<section>
 <h3>Running <span class="badge" id="running-count">{running}</span></h3>
 <div class="grid" id="running-grid">
 {running_cards}
@@ -296,6 +327,7 @@ fn render_fragment(s: &StatusSnapshot, base: &str) -> String {
 </tbody>
 </table>
 </section>"#,
+        approvals_banner = approvals_banner,
         running = s.running.len(),
         retrying = s.retrying.len(),
         running_cards = running_cards,
@@ -734,6 +766,190 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     )
 }
 
+// --------------------------------------------------------------------------------
+// /approvals -- AIR-5's human approval gate: pending requests + decision history,
+// Approve/Request changes/Reject as admin-token-gated POST forms.
+// --------------------------------------------------------------------------------
+
+/// Whether `SYMPHONY_ADMIN_TOKEN` (unset means "no gate" -- matches this dashboard's
+/// existing open-by-default posture for everything else) is present in either the
+/// `Authorization: Bearer` header or the `symphony_admin` cookie `service.rs`'s own
+/// `/login` sets. Deliberately its own small check rather than importing `service.rs`'s
+/// private `require_admin` -- this router is mounted both standalone (`serve_composite`,
+/// no service.rs involved at all) and nested read-only under `symphony serve` (where
+/// `service.rs` leaves nested project routes unguarded, see its `require_admin` doc
+/// comment): the browser still carries the same `symphony_admin` cookie either way
+/// (`Path=/`), so reading it here is what actually gates this one mutating route.
+fn admin_token_ok(headers: &HeaderMap) -> bool {
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.trim().is_empty() {
+        return true;
+    }
+    extract_admin_token(headers).as_deref() == Some(expected.as_str())
+}
+
+fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get(header::AUTHORIZATION)
+        && let Ok(s) = auth.to_str()
+        && let Some(token) = s.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
+    }
+    if let Some(cookie_header) = headers.get(header::COOKIE)
+        && let Ok(s) = cookie_header.to_str()
+    {
+        for part in s.split(';') {
+            if let Some(v) = part.trim().strip_prefix("symphony_admin=") {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn approvals_page(State(state): State<AppState>) -> Html<String> {
+    let db_path = state.eventlog_db_path();
+    let pending = approvals::list_pending(&db_path).unwrap_or_default();
+    let recent = approvals::list_recent(&db_path, 50).unwrap_or_default();
+    let base = state.base_path.as_str();
+
+    let pending_html: String = if pending.is_empty() {
+        "<p class=\"empty\">No approvals pending.</p>".to_string()
+    } else {
+        pending
+            .iter()
+            .map(|r| pending_approval_card(r, base))
+            .collect()
+    };
+    let history_rows: String = if recent.is_empty() {
+        "<tr><td colspan=\"6\" class=\"empty\">No decisions recorded yet.</td></tr>".to_string()
+    } else {
+        recent
+            .iter()
+            .map(|r| approval_history_row(r, base))
+            .collect()
+    };
+
+    let body = format!(
+        r#"<section>
+<h3>Pending <span class="badge">{pending_count}</span></h3>
+{pending_html}
+</section>
+
+<section>
+<h3>Decision history</h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th data-sort>Issue</th><th data-sort>Stage</th><th data-sort>Decision</th><th data-sort>Actor</th><th>Comment</th><th data-sort>Decided at</th></tr></thead>
+<tbody>
+{history_rows}
+</tbody>
+</table>
+</div>
+</section>"#,
+        pending_count = pending.len(),
+        pending_html = pending_html,
+        history_rows = history_rows,
+    );
+    Html(page_shell("approvals", "/approvals", &body, "", base))
+}
+
+/// One pending request: the requesting stage's own output (the "why" -- roadmap §4's
+/// decision-traceability bar applies to what a human is asked to approve, not just to
+/// the eventual decision) plus the three real actions as admin-token-gated POST forms,
+/// never a state-changing GET link.
+fn pending_approval_card(r: &approvals::ApprovalRow, base: &str) -> String {
+    let plan_html = match (&r.plan_json, &r.plan_text) {
+        (Some(json), _) => format!(r#"<pre class="msg">{}</pre>"#, escape(json)),
+        (None, Some(text)) => format!(r#"<pre class="msg">{}</pre>"#, escape(text)),
+        (None, None) => "<p class=\"empty\">No output was captured for this stage.</p>".to_string(),
+    };
+    format!(
+        r#"<div class="card" id="approval-{id}">
+  <h2><a href="{base}/events?issue={issue_link}">{identifier}</a> &mdash; stage &quot;{stage}&quot;</h2>
+  <div class="row">{title}</div>
+  <div class="row"><b>requested</b> {requested_at}</div>
+  {plan_html}
+  <form method="post" action="{base}/approvals/{id}/decide" class="filters">
+    <label for="comment-{id}">Comment <span class="empty">(required for "request changes"/"reject")</span></label>
+    <input type="text" id="comment-{id}" name="comment" placeholder="reason">
+    <button type="submit" name="decision" value="approve">Approve</button>
+    <button type="submit" name="decision" value="changes">Request changes</button>
+    <button type="submit" name="decision" value="reject">Reject</button>
+  </form>
+</div>"#,
+        id = r.id,
+        base = base,
+        issue_link = urlencode(&r.issue_id),
+        identifier = escape(&r.identifier),
+        stage = escape(&r.stage_id),
+        title = escape(&r.title),
+        requested_at = escape(&r.requested_at),
+        plan_html = plan_html,
+    )
+}
+
+fn approval_history_row(r: &approvals::ApprovalRow, base: &str) -> String {
+    format!(
+        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a></td><td>{stage}</td><td>{decision}</td><td>{actor}</td><td>{comment}</td><td>{resolved_at}</td></tr>",
+        base = base,
+        issue_link = urlencode(&r.issue_id),
+        identifier = escape(&r.identifier),
+        stage = escape(&r.stage_id),
+        decision = escape(r.decision.as_deref().unwrap_or("-")),
+        actor = escape(r.actor.as_deref().unwrap_or("-")),
+        comment = escape(r.comment.as_deref().unwrap_or("-")),
+        resolved_at = escape(r.resolved_at.as_deref().unwrap_or("-")),
+    )
+}
+
+#[derive(Deserialize)]
+struct DecideForm {
+    decision: String,
+    comment: Option<String>,
+}
+
+/// Only *records* the decision (`approvals::resolve`) -- applying it to tracker state
+/// and the event log happens on the orchestrator's own tick
+/// (`orchestrator::apply_resolved_approvals`), the one place with standing authority
+/// to mutate tracker state. See `approvals.rs`'s module doc comment for why this
+/// handler doesn't do that directly.
+async fn approvals_decide(
+    State(state): State<AppState>,
+    PathParam(id): PathParam<i64>,
+    headers: HeaderMap,
+    Form(form): Form<DecideForm>,
+) -> Response {
+    if !admin_token_ok(&headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response();
+    }
+    let Some(decision) = approvals::Decision::parse(&form.decision) else {
+        return (StatusCode::BAD_REQUEST, "unknown decision").into_response();
+    };
+    let comment = form.comment.filter(|c| !c.trim().is_empty());
+    if matches!(
+        decision,
+        approvals::Decision::RequestChanges | approvals::Decision::Reject
+    ) && comment.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a comment is required for \"request changes\" and \"reject\"",
+        )
+            .into_response();
+    }
+    let db_path = state.eventlog_db_path();
+    if let Err(e) = approvals::resolve(&db_path, id, decision, "dashboard", comment.as_deref()) {
+        tracing::warn!(approval_id = id, error = %e, "failed to record dashboard approval decision");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record decision",
+        )
+            .into_response();
+    }
+    Redirect::to(&format!("{}/approvals", state.base_path)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,9 +1010,179 @@ mod tests {
     #[test]
     fn render_fragment_shows_empty_states() {
         let snapshot = StatusSnapshot::default();
-        let html = render_fragment(&snapshot, "");
+        let dir = tempfile::tempdir().unwrap();
+        let html = render_fragment(&snapshot, "", &dir.path().join("symphony.db"));
         assert!(html.contains("No agents running"));
         assert!(html.contains("Retry queue is empty"));
+    }
+
+    #[test]
+    fn render_fragment_surfaces_a_live_pending_approvals_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(eventlog::DB_FILENAME);
+        approvals::create_pending(
+            &db_path,
+            &approvals::NewApproval {
+                issue_id: "I-1".to_string(),
+                identifier: "I-1".to_string(),
+                title: "T".to_string(),
+                stage_id: "plan".to_string(),
+                next_stage_id: None,
+                plan_text: None,
+                plan_json: None,
+            },
+        )
+        .unwrap();
+
+        let html = render_fragment(&StatusSnapshot::default(), "", &db_path);
+        assert!(html.contains("awaiting approval"), "{html}");
+        assert!(html.contains("/approvals"), "{html}");
+    }
+
+    async fn spawn_router(dir: &std::path::Path) -> String {
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn approval_fixture(issue_id: &str, next_stage_id: Option<&str>) -> approvals::NewApproval {
+        approvals::NewApproval {
+            issue_id: issue_id.to_string(),
+            identifier: issue_id.to_string(),
+            title: format!("Issue {issue_id}"),
+            stage_id: "plan".to_string(),
+            next_stage_id: next_stage_id.map(str::to_string),
+            plan_text: Some("design summary here".to_string()),
+            plan_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approvals_page_lists_pending_requests_and_decision_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(eventlog::DB_FILENAME);
+        approvals::create_pending(&db_path, &approval_fixture("I-1", Some("implement"))).unwrap();
+        let resolved_id =
+            approvals::create_pending(&db_path, &approval_fixture("I-2", None)).unwrap();
+        approvals::resolve(
+            &db_path,
+            resolved_id,
+            approvals::Decision::Approve,
+            "alice",
+            None,
+        )
+        .unwrap();
+
+        let base = spawn_router(dir.path()).await;
+        let body = reqwest::get(format!("{base}/approvals"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("I-1"), "{body}");
+        assert!(body.contains("design summary here"), "{body}");
+        assert!(body.contains("I-2"), "{body}");
+        assert!(body.contains("alice"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn approvals_decide_approve_records_the_decision_and_redirects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(eventlog::DB_FILENAME);
+        let id = approvals::create_pending(&db_path, &approval_fixture("I-3", Some("implement")))
+            .unwrap();
+
+        let base = spawn_router(dir.path()).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = client
+            .post(format!("{base}/approvals/{id}/decide"))
+            .form(&[("decision", "approve")])
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_redirection(), "{}", resp.status());
+
+        let row = approvals::get(&db_path, id).unwrap().unwrap();
+        assert_eq!(row.decision.as_deref(), Some("approve"));
+        assert_eq!(row.actor.as_deref(), Some("dashboard"));
+        assert!(!row.is_pending());
+    }
+
+    #[tokio::test]
+    async fn approvals_decide_requires_a_comment_for_changes_and_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(eventlog::DB_FILENAME);
+        let id = approvals::create_pending(&db_path, &approval_fixture("I-4", Some("implement")))
+            .unwrap();
+
+        let base = spawn_router(dir.path()).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/approvals/{id}/decide"))
+            .form(&[("decision", "changes")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let row = approvals::get(&db_path, id).unwrap().unwrap();
+        assert!(
+            row.is_pending(),
+            "a rejected-for-missing-comment submission must not resolve the row"
+        );
+    }
+
+    // `admin_token_ok` reads the process-global `SYMPHONY_ADMIN_TOKEN` env var, so its
+    // gating behavior is covered as a pure function here rather than via a live
+    // `SYMPHONY_ADMIN_TOKEN`-mutating HTTP test -- `cargo test` runs this binary's
+    // tests concurrently in one process, and every other `/approvals` HTTP test above
+    // depends on the token being unset (the default, open-dashboard posture).
+    #[test]
+    fn admin_token_ok_allows_open_by_default_and_gates_once_a_token_is_supplied() {
+        let expected = "test-admin-token-air5-unit";
+        assert!(
+            extract_admin_token(&HeaderMap::new()).is_none(),
+            "sanity: no headers means no token"
+        );
+        // No test in this module ever sets `SYMPHONY_ADMIN_TOKEN` (see the comment
+        // above), so the dashboard's default open-by-default posture is safe to assert
+        // here too.
+        assert!(admin_token_ok(&HeaderMap::new()));
+
+        // "no SYMPHONY_ADMIN_TOKEN configured" is exercised by every other test in
+        // this module already (none of them set it); here we exercise the gated path
+        // directly against `extract_admin_token`'s own matching, without touching the
+        // shared env var.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert_ne!(extract_admin_token(&headers).as_deref(), Some(expected));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {expected}").parse().unwrap(),
+        );
+        assert_eq!(extract_admin_token(&headers).as_deref(), Some(expected));
+
+        let mut cookie_headers = HeaderMap::new();
+        cookie_headers.insert(
+            header::COOKIE,
+            format!("other=x; symphony_admin={expected}; more=y")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_admin_token(&cookie_headers).as_deref(),
+            Some(expected)
+        );
     }
 
     #[test]

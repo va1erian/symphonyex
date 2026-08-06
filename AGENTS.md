@@ -847,6 +847,72 @@ and every stage boundary is a `stage_started`/`stage_finished` event on `/events
 filterable by issue like any other event — no new page, reusing the existing
 dashboard exactly as it already works for turns and tool calls.
 
+## The human approval gate (AI Roadmap 2026, Step 1 -- AIR-5)
+
+Roadmap §3: "Human approval is required for architectural, business-critical and
+high-risk decisions." Any pipeline stage can require one:
+
+```yaml
+pipeline:
+  enabled: true
+  blocked_state: blocked
+  awaiting_approval_state: awaiting approval   # default; same "outside active/terminal
+                                                # states" convention as blocked_state
+  approval:
+    auto_approve_when:            # absent (the default) -- never auto-approve
+      risk: low                   # must match the stage's own reported `risk`
+      impacted_components: [src/status.rs, src/web.rs]   # allowlist; every reported
+                                                           # component must be in it
+      estimate_turns_max: 4       # reported `estimate_turns` must be <= this
+  stages:
+    - id: plan
+      role: planner
+      max_turns: 6
+      requires_approval: true
+    - id: implement
+      role: developer
+      max_turns: 20
+```
+
+When a `requires_approval: true` stage completes successfully, `orchestrator::
+handle_stage_approval` looks for a fenced ` ```json ` block in the stage's last turn
+message (the same convention `swebot`'s `qa`/`drafting`/`review` drivers already use to
+get structured output from free text — reused via `swebot::extract_json_block`) and
+evaluates `pipeline.approval.auto_approve_when` against it. A match moves straight to
+the next stage, no human involved, and records an `approval_auto_approved` event. No
+match (including no structured output at all — missing information never satisfies a
+configured condition) parks the cycle exactly like a `blocking` stage's failure does:
+the issue moves to `pipeline.awaiting_approval_state` (host-side, via
+`TrackerAdapter::set_issue_state`) and a pending row is recorded in `symphony.db`
+(`src/approvals.rs`) — SQLite, so it survives a daemon restart.
+
+**Two channels resolve a pending approval**, both ending up as a call to
+`approvals::resolve` (which only *records* the decision — see below for why):
+
+- **Dashboard** — `/approvals` (`status.rs`) lists every pending request with its
+  stage's captured output and Approve / Request changes / Reject buttons, each a POST
+  form gated by the same `SYMPHONY_ADMIN_TOKEN` (Bearer header or the
+  `symphony_admin` cookie `symphony serve`'s own `/login` sets) `symphony serve` already
+  uses — never a state-changing GET link.
+- **Issue comment** — `orchestrator::poll_approval_comments`, run every tick alongside
+  dispatch, scans every pending approval's issue thread (`TrackerAdapter::
+  fetch_issue_comments`, implemented for `local`/`github`; unsupported adapters just
+  never surface a comment) for `/approve`, `/changes <reason>` or `/reject [reason]`
+  past whatever was already scanned.
+
+**Applying a decision is the orchestrator's job alone** (`orchestrator::
+apply_resolved_approvals`, called every tick): the one thing with standing authority to
+mutate tracker state moves the issue to `active_states[0]` (approve/changes) or
+`pipeline.blocked_state` (reject), records an `approval_decided` event (actor,
+timestamp, outcome, comment — the roadmap §4 "decision traceability" bar), and leaves a
+resume point. `run_pipeline` consumes that resume point (`approvals::take_resume`,
+handed out at most once) at the start of its next cycle: "approve" resumes at the
+stage *after* the approved one; "request changes" re-runs the *same* stage with the
+reviewer's comment appended to its first prompt.
+
+Neither the dashboard handler nor the comment poller mutates tracker state directly —
+see `approvals.rs`'s module doc comment for why that split exists.
+
 ## Provider-native tracker tool (Section 10.5)
 
 The coding agent only ever runs inside the per-issue workspace — it has no visibility
