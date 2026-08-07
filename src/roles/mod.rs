@@ -57,7 +57,13 @@ pub fn resolve(role_name: &str, cfg: &EffectiveConfig) -> Result<ResolvedRole, S
     let model_override = project.and_then(|r| r.model.clone());
     let backend = backend_override.unwrap_or(cfg.agent_backend);
     let model = model_override.clone().or_else(|| default_model_for(backend, cfg));
-    let tool_policy = project.map(|r| r.tool_policy).unwrap_or_default();
+    // AIR-7: a project's `roles.<name>.tools` always wins when set; absent one, a
+    // built-in role gets its own default posture (the Reviewer's is `ToolPolicy::SWEBOT`
+    // -- "a Reviewer that can edit files is not a reviewer", roadmap §4 -- same as
+    // SweBot's own restricted sessions) rather than blanket-unrestricted.
+    let tool_policy = project
+        .map(|r| r.tool_policy)
+        .unwrap_or_else(|| builtin::default_tool_policy(&key));
     let max_turns = project.and_then(|r| r.max_turns);
 
     Ok(ResolvedRole {
@@ -133,6 +139,16 @@ mod tests {
         assert!(role.prompt.contains("Reviewer agent"));
         assert_eq!(role.backend, AgentBackendKind::Claude); // cfg.agent_backend default
         assert!(!role.overrides_backend);
+        // AIR-7: the built-in Reviewer role defaults to a restricted tool policy (no
+        // `roles.reviewer` override needed) -- "a Reviewer that can edit files is not
+        // a reviewer."
+        assert_eq!(role.tool_policy, ToolPolicy::SWEBOT);
+    }
+
+    #[test]
+    fn built_in_developer_role_still_defaults_to_an_unrestricted_tool_policy() {
+        let cfg = test_cfg("");
+        let role = resolve("developer", &cfg).unwrap();
         assert_eq!(role.tool_policy, ToolPolicy::default());
     }
 

@@ -285,6 +285,71 @@ pub fn distinct_event_types(db_path: &Path) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
+/// AIR-7: one row per Reviewer-stage `request_changes` rework round, reusing the
+/// `events` table (`event_type = "rework_round"`) rather than a new table -- a round is
+/// just another event, keyed by `issue_id` like everything else here, browsable on
+/// `/events` for free and queryable by `count_rework_rounds` below for
+/// `orchestrator::run_pipeline`'s `pipeline.review.max_rework_rounds` check.
+/// `message` carries `{"stage", "recommendation", "summary", "escalated"}` as JSON so
+/// both `/events` and the dedicated `/reviews` dashboard panel can read it back.
+/// Returns the round number this insert became (1-indexed: the `COUNT(*)` including
+/// the row just inserted), synchronous (not routed through `spawn_writer`'s channel)
+/// so the caller can make an escalate-vs-rework decision against a number it knows is
+/// accurate, not a best-effort async write that might not have landed yet.
+pub fn record_rework_round(
+    db_path: &Path,
+    issue_id: &str,
+    identifier: &str,
+    title: &str,
+    stage_id: &str,
+    recommendation: &str,
+    summary: &str,
+    escalated: bool,
+) -> rusqlite::Result<i64> {
+    let conn = open(db_path)?;
+    let message = serde_json::json!({
+        "stage": stage_id,
+        "recommendation": recommendation,
+        "summary": summary,
+        "escalated": escalated,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO events (issue_id, identifier, title, session_id, event_type, \
+         importance, message, input_tokens, output_tokens, total_tokens, created_at) \
+         VALUES (?1, ?2, ?3, NULL, 'rework_round', 'normal', ?4, NULL, NULL, NULL, ?5)",
+        rusqlite::params![
+            issue_id,
+            identifier,
+            title,
+            message,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    count_rework_rounds(&conn, issue_id)
+}
+
+fn count_rework_rounds(conn: &Connection, issue_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE issue_id = ?1 AND event_type = 'rework_round'",
+        rusqlite::params![issue_id],
+        |r| r.get(0),
+    )
+}
+
+/// Rework rounds recorded for `issue_id` so far, most-recent-first -- backs the
+/// `/reviews` dashboard panel's history view.
+pub fn rework_rounds_for_issue(db_path: &Path, issue_id: &str) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, importance, \
+         message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events WHERE issue_id = ?1 AND event_type = 'rework_round' ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![issue_id], row_from)?;
+    rows.collect()
+}
+
 pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
     let conn = open(db_path)?;
     conn.query_row(

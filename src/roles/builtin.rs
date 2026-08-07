@@ -45,6 +45,19 @@ pub fn is_known(role_name: &str) -> bool {
     ROLE_NAMES.contains(&role_name)
 }
 
+/// A built-in role's own default `ToolPolicy`, used by `roles::resolve` when a project
+/// hasn't set `roles.<name>.tools` itself. Every role but Reviewer keeps the
+/// unrestricted default every backend already starts with; Reviewer gets
+/// `ToolPolicy::SWEBOT` (AIR-7: file-mutating tools denied, same restriction SweBot's
+/// own PR review already runs under) -- a review stage that can edit files isn't a
+/// review, and a project shouldn't have to remember to configure that by hand.
+pub fn default_tool_policy(role_name: &str) -> crate::agent::ToolPolicy {
+    match role_name {
+        "reviewer" => crate::agent::ToolPolicy::SWEBOT,
+        _ => crate::agent::ToolPolicy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

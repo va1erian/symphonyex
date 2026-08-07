@@ -405,6 +405,23 @@ pub struct PipelineConfig {
     /// state already documents), so the orchestrator's existing eligibility checks
     /// simply stop selecting it for dispatch rather than needing new logic of their own.
     pub blocked_state: String,
+    pub review: ReviewConfig,
+}
+
+/// AIR-7: bounds the Reviewer stage's rework loop (`orchestrator::run_pipeline`) -- a
+/// `request_changes` recommendation sends the cycle back to the Developer stage rather
+/// than failing it outright, but only up to `max_rework_rounds` times before escalating
+/// to a human. The roadmap treats rework as a measured quantity (§11), so every round
+/// is recorded (`eventlog::record_rework_round`), not just counted in memory.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewConfig {
+    pub max_rework_rounds: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self { max_rework_rounds: 2 }
+    }
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -910,11 +927,15 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     if pipeline_enabled && pipeline_stages.is_empty() {
         return Err(ConfigError::EmptyPipelineStages);
     }
+    let review_raw = get(pipeline_raw, "review").unwrap_or(&empty);
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
         blocked_state: get_str(pipeline_raw, "blocked_state")
             .unwrap_or_else(|| "blocked".to_string()),
+        review: ReviewConfig {
+            max_rework_rounds: (get_u64(review_raw, "max_rework_rounds", 2) as u32).max(1),
+        },
     };
 
     let roles_raw = get(config, "roles").unwrap_or(&empty);

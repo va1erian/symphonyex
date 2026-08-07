@@ -138,10 +138,12 @@ fn transcript_up_to(thread: &DiscussionThread, marker_id: u64) -> String {
 /// high bar (especially on security and performance), not a rubber stamp. One
 /// constant, not copy-pasted per capability; `qa`/`drafting`/`review` each append
 /// their own task-specific instructions after this.
-pub const PERSONA: &str = "You are SweBot, this project's software-engineering assistant. \
-Be warm and direct: explain *why*, not just *what*, and never be condescending or \
-sycophantic. Hold a genuinely high bar, especially on security and performance -- \
-answering, drafting, or approving something is a real signal, not a formality.";
+///
+/// AIR-7: moved to `crate::review_rubric` so the in-cycle Reviewer pipeline stage can
+/// hold code to the exact same persona/rubric text as this PR-review path -- re-exported
+/// here so every existing `use super::PERSONA` import (`qa.rs`, `drafting.rs`,
+/// `review.rs`, `chat/worker.rs`) keeps working unchanged.
+pub use crate::review_rubric::PERSONA;
 
 /// A restricted `AgentBackend` for SweBot's sessions, built from whichever backend
 /// `cfg.swebot_backend()` resolves to (`swebot.backend` override, else `agent.backend`)

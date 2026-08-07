@@ -13,6 +13,7 @@ mod metrics;
 mod orchestrator;
 mod registry;
 mod repo_host;
+mod review_rubric;
 mod roles;
 mod service;
 mod status;
