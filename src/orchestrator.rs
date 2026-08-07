@@ -2038,8 +2038,15 @@ async fn run_pipeline(
         .unwrap_or(0);
     let resume_comment = resume.and_then(|r| r.reviewer_comment);
 
-    for (idx, stage) in cfg.pipeline.stages.iter().enumerate().skip(start_idx) {
-        let resume_note = if idx == start_idx {
+    // AIR-7: an index, not a `for`-loop over `&cfg.pipeline.stages`, so a Reviewer
+    // stage's `request_changes` can rewind to an earlier Developer stage instead of
+    // simply advancing (see the rework handling in the `LoopExit::Completed` arm
+    // below) -- and so AIR-5's approval resume above can start mid-pipeline the same
+    // way the old `.skip(start_idx)` did.
+    let mut stage_idx: usize = start_idx;
+    while stage_idx < cfg.pipeline.stages.len() {
+        let stage = &cfg.pipeline.stages[stage_idx];
+        let resume_note = if stage_idx == start_idx {
             resume_comment.as_deref()
         } else {
             None
@@ -2091,6 +2098,7 @@ async fn run_pipeline(
                 stage_id: stage.id.clone(),
                 outcome: format!("skipped: issue labeled 'skip-{}'", stage.id),
             });
+            stage_idx += 1;
             continue;
         }
 
@@ -2098,6 +2106,7 @@ async fn run_pipeline(
             Ok(r) => r,
             Err(e) => return ExitReason::Error(format!("stage '{}' role error: {e}", stage.id)),
         };
+        let role_key = stage.role.trim().to_lowercase();
         let role_summary = if role.overrides_backend {
             format!(
                 "{} — {} ({}{})",
@@ -2131,11 +2140,23 @@ async fn run_pipeline(
             &stage.id,
         );
         let cycle_artifacts = crate::artifacts::list_index(&artifacts_db_path, issue_id);
+        // AIR-7: the Reviewer stage needs the working diff, but must not itself be
+        // able to write files (`ToolPolicy::SWEBOT`) -- computed here, host-side, via
+        // the hook plumbing (works identically against a plain host checkout or a
+        // containerized one) and handed over as a workspace-relative path, the same
+        // write-then-reference convention `swebot::review` already uses for the same
+        // "a real diff can exceed the command line" reason.
+        let diff_path = if role_key == "reviewer" {
+            write_review_diff(cfg, workspace_path, container).await
+        } else {
+            None
+        };
         let cycle_ctx = json!({
             "id": cycle_id,
             "stage": stage.id,
             "artifacts": cycle_artifacts,
             "previous_stage_summary": previous_stage_summary,
+            "diff_path": diff_path.unwrap_or_default(),
         });
 
         let mut fresh_session: Option<Box<dyn AgentSession>> = None;
@@ -2263,7 +2284,7 @@ async fn run_pipeline(
         match outcome {
             LoopExit::Completed => {
                 if stage.requires_approval {
-                    let next_stage_id = cfg.pipeline.stages.get(idx + 1).map(|s| s.id.clone());
+                    let next_stage_id = cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
                     let auto_approved = handle_stage_approval(
                         issue_id,
                         issue,
@@ -2275,10 +2296,83 @@ async fn run_pipeline(
                     )
                     .await;
                     if auto_approved {
+                        stage_idx += 1;
                         continue;
                     }
                     return ExitReason::Normal; // parked awaiting approval
                 }
+                // AIR-7: a Reviewer stage's `request_changes` recommendation sends the
+                // cycle back to the nearest earlier Developer stage instead of simply
+                // advancing -- a measured rework loop (roadmap §11: rework is a
+                // recorded quantity, not silent looping), bounded by
+                // `pipeline.review.max_rework_rounds`.
+                if role_key == "reviewer"
+                    && let Some((recommendation, summary)) = latest_review_recommendation(
+                        &cfg.workflow_dir,
+                        &artifacts_db_path,
+                        issue_id,
+                        &stage.id,
+                    )
+                    && recommendation == "request_changes"
+                {
+                    let round = crate::eventlog::record_rework_round(
+                        &artifacts_db_path,
+                        &crate::eventlog::NewReworkRound {
+                            issue_id,
+                            identifier: &issue.identifier,
+                            title: &issue.title,
+                            stage_id: &stage.id,
+                            recommendation: &recommendation,
+                            summary: &summary,
+                            escalated: round_exceeds_limit(
+                                &artifacts_db_path,
+                                issue_id,
+                                cfg.pipeline.review.max_rework_rounds,
+                            ),
+                        },
+                    )
+                    .unwrap_or(1);
+                    if round > cfg.pipeline.review.max_rework_rounds as i64 {
+                        block_issue(
+                            snapshot,
+                            issue_id,
+                            &cfg.pipeline.blocked_state,
+                            Some(&format!(
+                                "Reviewer stage '{}' requested changes {round} times, exceeding \
+                                 pipeline.review.max_rework_rounds ({}) -- escalating instead of \
+                                 reworking again. Last review: {summary}",
+                                stage.id, cfg.pipeline.review.max_rework_rounds
+                            )),
+                        )
+                        .await;
+                        return ExitReason::Normal;
+                    }
+                    match developer_stage_index(&cfg.pipeline.stages, stage_idx) {
+                        Some(dev_idx) => {
+                            previous_stage_summary = format!(
+                                "{}: request_changes (rework round {round}) — {summary}",
+                                stage.id
+                            );
+                            stage_idx = dev_idx;
+                            continue;
+                        }
+                        None => {
+                            block_issue(
+                                snapshot,
+                                issue_id,
+                                &cfg.pipeline.blocked_state,
+                                Some(&format!(
+                                    "Reviewer stage '{}' requested changes but no earlier \
+                                     'developer'-role stage exists to rework: {summary}",
+                                    stage.id
+                                )),
+                            )
+                            .await;
+                            return ExitReason::Normal;
+                        }
+                    }
+                }
+                stage_idx += 1;
                 continue;
             }
             LoopExit::EndedByIssueState => return ExitReason::Normal,
@@ -2291,6 +2385,7 @@ async fn run_pipeline(
             }
             LoopExit::Error(reason) => {
                 if stage.on_failure == StageFailureAction::Skip {
+                    stage_idx += 1;
                     continue;
                 }
                 // A plan usage-limit hit isn't a genuine exit-criteria failure -- it
@@ -2310,6 +2405,93 @@ async fn run_pipeline(
         }
     }
     ExitReason::Normal
+}
+
+/// `git diff <merge-base>..HEAD` in `workspace_path`, written to
+/// `.symphony/review.diff` and returned as that workspace-relative path (AIR-7) --
+/// run through the hook plumbing (`hooks::run_hook_maybe_containerized`) so it works
+/// identically against a plain host checkout or a containerized one, rather than a
+/// direct `Command::new("git")` that would only ever see the host side. `None` if the
+/// script itself couldn't be launched at all; a missing/empty diff (no `repo:`
+/// configured, nothing to diff against) still writes an empty file rather than
+/// failing, since a Reviewer stage should still run -- just with less to go on.
+async fn write_review_diff(
+    cfg: &EffectiveConfig,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
+) -> Option<String> {
+    let default_branch = cfg
+        .repo
+        .as_ref()
+        .map(|r| r.default_branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let script = format!(
+        "mkdir -p .symphony\n\
+         base=\"{default_branch}\"\n\
+         git rev-parse --verify \"$base\" >/dev/null 2>&1 || base=\"origin/{default_branch}\"\n\
+         merge_base=$(git merge-base HEAD \"$base\" 2>/dev/null || echo \"$base\")\n\
+         git diff \"$merge_base\"..HEAD > .symphony/review.diff 2>/dev/null || true\n"
+    );
+    match hooks::run_hook_maybe_containerized(
+        "review_diff",
+        &script,
+        &cfg.workflow_dir,
+        workspace_path,
+        cfg.hook_timeout_ms,
+        container,
+    )
+    .await
+    {
+        Ok(()) => Some(".symphony/review.diff".to_string()),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to compute the working diff for the reviewer stage (it will run without one)");
+            None
+        }
+    }
+}
+
+/// Index of the nearest `role: developer` stage at or before `before_idx` -- AIR-7's
+/// rework loop resends the cycle to the Developer stage that most recently fed this
+/// Reviewer run, not always the pipeline's first one (a later hardening pass could
+/// also be `role: developer`).
+fn developer_stage_index(stages: &[config::StageConfig], before_idx: usize) -> Option<usize> {
+    stages[..before_idx]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| s.role.trim().to_lowercase() == "developer")
+        .map(|(i, _)| i)
+}
+
+/// Whether recording one more rework round for `issue_id` would exceed
+/// `max_rework_rounds` -- computed *before* the round is actually recorded so
+/// `eventlog::record_rework_round`'s stored `escalated` flag reflects the outcome this
+/// round produced, for the `/reviews` dashboard's explanation surface.
+fn round_exceeds_limit(db_path: &Path, issue_id: &str, max_rework_rounds: u32) -> bool {
+    let already = crate::eventlog::rework_rounds_for_issue(db_path, issue_id)
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    (already as u32 + 1) > max_rework_rounds
+}
+
+/// The most recent `review_findings` artifact `stage_id` recorded this cycle, if any:
+/// `(recommendation, summary)`. `summary` is the artifact's own human-readable
+/// one-liner (`record_artifact`'s `summary` argument) rather than something re-derived
+/// from the findings array -- already exactly what a human/the next Developer turn
+/// needs, no second summarization step.
+fn latest_review_recommendation(
+    workflow_dir: &Path,
+    db_path: &Path,
+    issue_id: &str,
+    stage_id: &str,
+) -> Option<(String, String)> {
+    let row = crate::artifacts::list_for_cycle(db_path, issue_id)
+        .into_iter()
+        .rfind(|r| r.kind == "review_findings" && r.stage_id.as_deref() == Some(stage_id))?;
+    let bytes = crate::artifacts::read_content(workflow_dir, &row).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let recommendation = value.get("recommendation")?.as_str()?.to_string();
+    Some((recommendation, row.summary))
 }
 
 fn backend_label(backend: AgentBackendKind) -> &'static str {
@@ -2613,6 +2795,15 @@ fn render_turn_prompt(
         let mut ctx = json!({
             "issue": serde_json::to_value(issue).unwrap_or(serde_json::Value::Null),
             "attempt": attempt,
+            // AIR-7: always present (like `cycle.artifacts`), not just for the
+            // Reviewer role -- the same persona/checklist text `swebot::review` holds
+            // its PR reviews to (`crate::review_rubric`), so a project that overrides
+            // `roles.reviewer.prompt` can still reference `{{ rubric.* }}` and get the
+            // same quality bar rather than having to copy-paste it.
+            "rubric": {
+                "persona": crate::review_rubric::PERSONA,
+                "checklist": crate::review_rubric::CHECKLIST,
+            },
         });
         if let Some(cycle) = cycle {
             ctx["cycle"] = cycle.clone();
@@ -3559,12 +3750,14 @@ mod tests {
 
     // -----------------------------------------------------------------------------
     // AIR-4: raise_clarification (blocking/non-blocking), optional stage skip, and
-    // the requirements stage picking up its builtin role prompt.
+    // the requirements stage picking up its builtin role prompt (`roles::resolve`,
+    // AIR-3/AIR-2's role machinery -- AIR-4's own now-removed `builtin_prompt` helper
+    // did the same lookup before roles were generalized).
     // -----------------------------------------------------------------------------
 
     /// Like `ScriptedBackend`, but additionally records every prompt it's given (to
     /// prove a stage with a matching `role` actually runs the builtin role prompt
-    /// instead of the project's own template -- `roles::builtin_prompt`) and can be
+    /// instead of the project's own template -- via `roles::resolve`) and can be
     /// scripted to report a `raise_clarification` call (as the real agent event
     /// stream would: a `clarification_raised` event alongside `turn_completed`,
     /// exactly what `agent/claude.rs::handle_message` emits) on a given turn.
@@ -3910,20 +4103,19 @@ mod tests {
 
         let prompts = prompts.lock().unwrap();
         assert_eq!(prompts.len(), 2);
-        // The `requirements` stage got its builtin role prompt (mentions the tools
+        // The `requirements` stage got the builtin role prompt (mentions the tools
         // it's meant to call)...
         assert!(prompts[0].contains("record_requirements"));
         assert!(prompts[0].contains("raise_clarification"));
-        // ...and `implement` (role "developer") got *its own* distinct builtin role
-        // prompt (AIR-2 ships one for every one of the eight roadmap roles, not just
-        // "requirements") -- proven by it being non-empty and different from
-        // `requirements`'s, not by falling back to the project's own template.
-        assert_ne!(prompts[1], "");
-        assert_ne!(prompts[1], prompts[0]);
+        // ...while `implement` (role "developer") got *its own* built-in role prompt
+        // (AIR-2/AIR-3's `roles::resolve` -- "developer" is one of the eight roadmap
+        // roles, not a fallback to the project's own `WORKFLOW.md` template).
+        assert!(prompts[1].contains("Developer agent"));
+        assert_ne!(prompts[0], prompts[1]);
     }
 
     /// AIR-4 acceptance criterion: "Requirements with `depends_on` blockers list them
-    /// under `dependency`." The requirements stage's prompt (`roles::builtin_prompt`)
+    /// under `dependency`." The requirements stage's prompt (`roles::resolve`)
     /// is the thing that has to make the blocker visible to the agent so it can put it
     /// in the `dependency` field it hands to `record_requirements` -- this proves
     /// `issue.blocked_by` (populated by `depends_on` resolution, `tracker::depends_on`)
@@ -4661,5 +4853,113 @@ mod tests {
         let json = extract_plan_json(text).unwrap();
         assert!(json.contains("\"risk\""));
         assert!(extract_plan_json("just prose, no JSON here").is_none());
+    }
+
+    fn stage(id: &str, role: &str) -> config::StageConfig {
+        config::StageConfig {
+            id: id.to_string(),
+            role: role.to_string(),
+            max_turns: 1,
+            on_failure: StageFailureAction::Retry,
+            blocking: false,
+            optional: false,
+            requires_approval: false,
+        }
+    }
+
+    /// AIR-7: the rework loop resends to the *nearest* earlier `role: developer`
+    /// stage, not always the pipeline's first one.
+    #[test]
+    fn developer_stage_index_finds_the_nearest_earlier_developer_stage() {
+        let stages = vec![
+            stage("implement", "developer"),
+            stage("harden", "developer"),
+            stage("review", "reviewer"),
+        ];
+        assert_eq!(developer_stage_index(&stages, 2), Some(1));
+    }
+
+    #[test]
+    fn developer_stage_index_is_none_when_no_earlier_developer_stage_exists() {
+        let stages = vec![stage("review", "reviewer")];
+        assert_eq!(developer_stage_index(&stages, 0), None);
+    }
+
+    /// AIR-7 acceptance criterion: exceeding `pipeline.review.max_rework_rounds`
+    /// escalates instead of looping.
+    #[test]
+    fn round_exceeds_limit_flips_once_the_next_round_would_pass_the_cap() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("symphony.db");
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 1 of 2 is within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 1",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 2 of 2 is still within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 2",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(round_exceeds_limit(&db, "1", 2), "round 3 of 2 exceeds the cap");
+    }
+
+    /// AIR-7 acceptance criterion: the stage produces a schema-valid `review_findings`
+    /// artifact that the rework loop can read a recommendation back out of.
+    #[tokio::test]
+    async fn latest_review_recommendation_reads_the_recorded_artifact_back() {
+        let dir = tempdir().unwrap();
+        let workflow_dir = dir.path().to_path_buf();
+        let db = workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".symphony")).unwrap();
+        std::fs::write(workspace.join(".symphony/current-stage"), "review").unwrap();
+
+        let content = json!({
+            "schema_version": 1,
+            "recommendation": "request_changes",
+            "findings": [],
+            "unmet_acceptance_criteria": ["AC3"],
+            "over_implementation": []
+        })
+        .to_string();
+        let result = crate::artifacts::execute_tool(
+            &db,
+            &workflow_dir,
+            &workspace,
+            "issue-1",
+            "issue-1",
+            json!({
+                "kind": "review_findings",
+                "content_type": "application/json",
+                "content": content,
+                "summary": "requests changes: AC3 unmet"
+            }),
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
+
+        let (recommendation, summary) =
+            latest_review_recommendation(&workflow_dir, &db, "issue-1", "review").unwrap();
+        assert_eq!(recommendation, "request_changes");
+        assert_eq!(summary, "requests changes: AC3 unmet");
     }
 }

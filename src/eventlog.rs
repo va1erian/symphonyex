@@ -301,6 +301,72 @@ pub fn distinct_event_types(db_path: &Path) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
+/// AIR-7: one row per Reviewer-stage `request_changes` rework round, reusing the
+/// `events` table (`event_type = "rework_round"`) rather than a new table -- a round is
+/// just another event, keyed by `issue_id` like everything else here, browsable on
+/// `/events` for free and queryable by `count_rework_rounds` below for
+/// `orchestrator::run_pipeline`'s `pipeline.review.max_rework_rounds` check.
+/// `message` carries `{"stage", "recommendation", "summary", "escalated"}` as JSON so
+/// both `/events` and the dedicated `/reviews` dashboard panel can read it back.
+/// Returns the round number this insert became (1-indexed: the `COUNT(*)` including
+/// the row just inserted), synchronous (not routed through `spawn_writer`'s channel)
+/// so the caller can make an escalate-vs-rework decision against a number it knows is
+/// accurate, not a best-effort async write that might not have landed yet.
+pub struct NewReworkRound<'a> {
+    pub issue_id: &'a str,
+    pub identifier: &'a str,
+    pub title: &'a str,
+    pub stage_id: &'a str,
+    pub recommendation: &'a str,
+    pub summary: &'a str,
+    pub escalated: bool,
+}
+
+pub fn record_rework_round(db_path: &Path, round: &NewReworkRound) -> rusqlite::Result<i64> {
+    let conn = open(db_path)?;
+    let message = serde_json::json!({
+        "stage": round.stage_id,
+        "recommendation": round.recommendation,
+        "summary": round.summary,
+        "escalated": round.escalated,
+    })
+    .to_string();
+    conn.execute(
+        "INSERT INTO events (issue_id, identifier, title, session_id, event_type, \
+         importance, message, input_tokens, output_tokens, total_tokens, created_at) \
+         VALUES (?1, ?2, ?3, NULL, 'rework_round', 'normal', ?4, NULL, NULL, NULL, ?5)",
+        rusqlite::params![
+            round.issue_id,
+            round.identifier,
+            round.title,
+            message,
+            chrono::Utc::now().to_rfc3339(),
+        ],
+    )?;
+    count_rework_rounds(&conn, round.issue_id)
+}
+
+fn count_rework_rounds(conn: &Connection, issue_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE issue_id = ?1 AND event_type = 'rework_round'",
+        rusqlite::params![issue_id],
+        |r| r.get(0),
+    )
+}
+
+/// Rework rounds recorded for `issue_id` so far, most-recent-first -- backs the
+/// `/reviews` dashboard panel's history view.
+pub fn rework_rounds_for_issue(db_path: &Path, issue_id: &str) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, importance, \
+         message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events WHERE issue_id = ?1 AND event_type = 'rework_round' ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![issue_id], row_from)?;
+    rows.collect()
+}
+
 pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
     let conn = open(db_path)?;
     conn.query_row(
@@ -726,5 +792,99 @@ mod tests {
             get_artifact(&db, "2", "requirements").unwrap().unwrap().content,
             "[\"other\"]"
         );
+    }
+
+    /// AIR-7: `record_rework_round` returns the 1-indexed round number for this issue,
+    /// distinct from another issue's own count (each cycle's rework loop is bounded
+    /// independently).
+    #[test]
+    fn record_rework_round_returns_the_running_count_for_that_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let round1 = record_rework_round(
+            &db,
+            &NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "Reviewer stage",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "missing tests",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(round1, 1);
+        let round2 = record_rework_round(
+            &db,
+            &NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "Reviewer stage",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "still missing a test",
+                escalated: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(round2, 2);
+        let other_issue_round = record_rework_round(
+            &db,
+            &NewReworkRound {
+                issue_id: "2",
+                identifier: "AIR-8",
+                title: "Other issue",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "unrelated",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(other_issue_round, 1);
+    }
+
+    #[test]
+    fn rework_rounds_for_issue_returns_most_recent_first_with_the_recorded_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        record_rework_round(
+            &db,
+            &NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "first pass",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        record_rework_round(
+            &db,
+            &NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "second pass",
+                escalated: true,
+            },
+        )
+        .unwrap();
+
+        let rows = rework_rounds_for_issue(&db, "1").unwrap();
+        assert_eq!(rows.len(), 2);
+        let latest: serde_json::Value =
+            serde_json::from_str(rows[0].message.as_deref().unwrap()).unwrap();
+        assert_eq!(latest["summary"], "second pass");
+        assert_eq!(latest["escalated"], true);
+        let earliest: serde_json::Value =
+            serde_json::from_str(rows[1].message.as_deref().unwrap()).unwrap();
+        assert_eq!(earliest["summary"], "first pass");
+        assert_eq!(earliest["escalated"], false);
     }
 }

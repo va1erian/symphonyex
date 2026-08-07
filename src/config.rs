@@ -438,6 +438,7 @@ pub struct PipelineConfig {
     /// configured, in which case a stage identified as `id: test` runs these suites
     /// through the hook plumbing instead of (in addition to) the agent's own turns.
     pub test: Option<TestConfig>,
+    pub review: ReviewConfig,
 }
 
 /// `pipeline.test` (AIR-6): the project declares how its own suites and coverage tool
@@ -460,6 +461,22 @@ pub struct CoverageConfig {
     /// Where the coverage command writes its report, relative to the workspace root.
     /// Defaults to a sensible filename per `format` when not given explicitly.
     pub path: String,
+}
+
+/// AIR-7: bounds the Reviewer stage's rework loop (`orchestrator::run_pipeline`) -- a
+/// `request_changes` recommendation sends the cycle back to the Developer stage rather
+/// than failing it outright, but only up to `max_rework_rounds` times before escalating
+/// to a human. The roadmap treats rework as a measured quantity (§11), so every round
+/// is recorded (`eventlog::record_rework_round`), not just counted in memory.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewConfig {
+    pub max_rework_rounds: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self { max_rework_rounds: 2 }
+    }
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -1028,6 +1045,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         TestConfig { commands, coverage }
     });
 
+    let review_raw = get(pipeline_raw, "review").unwrap_or(&empty);
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
@@ -1037,6 +1055,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             .unwrap_or_else(|| "awaiting approval".to_string()),
         approval: ApprovalConfig { auto_approve_when },
         test: test_cfg,
+        review: ReviewConfig {
+            max_rework_rounds: (get_u64(review_raw, "max_rework_rounds", 2) as u32).max(1),
+        },
     };
 
     let roles_raw = get(config, "roles").unwrap_or(&empty);

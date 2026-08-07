@@ -16,6 +16,7 @@
 //! provider-specific error text.
 
 use super::{PERSONA, extract_json_block, git, run_turn_collect_text};
+use crate::review_rubric::CHECKLIST;
 use crate::agent::{AgentBackend, ToolPolicy};
 use crate::config::EffectiveConfig;
 use crate::repo_host::{RepoHost, ReviewVerdict, extract_closes_issue_number};
@@ -79,12 +80,7 @@ pub async fn poll_once(
              wasn't inlined here since a large diff can exceed the command-line length this \
              prompt is passed with). You also have Bash access to run tests/lints in this \
              checkout at {} -- judge the code, don't fix it (file-editing tools are disabled \
-             for this session). Check: correctness against the original ticket's acceptance \
-             criteria, security (input handling, secrets, auth/authz boundaries), \
-             performance (obvious inefficiency, unbounded loops/queries), and whether it \
-             matches this project's own conventions and includes tests. \
-             request_changes means something genuinely fails one of these; approve means \
-             \"I'd merge this,\" not \"nothing's obviously on fire.\"\n\n\
+             for this session). {CHECKLIST}\n\n\
              End your response with exactly one fenced ```json block: \
              {{\"verdict\": \"approve\"|\"request_changes\"|\"comment\", \
              \"summary\": \"<your reasoning, written for the human who'll read this review>\"}}.",
