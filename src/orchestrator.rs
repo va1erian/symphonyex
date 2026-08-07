@@ -356,6 +356,9 @@ pub struct ProjectHandles {
     /// when `web_enabled` is set (the single-project status server serves it at
     /// `/chat` on the same condition).
     pub chat: Option<crate::swebot::chat::ChatHandles>,
+    /// Backs the nested `/observability` page's "rescan now" action -- see
+    /// `status::ObservabilityHandle`.
+    pub observability: status::ObservabilityHandle,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -444,6 +447,12 @@ async fn run_inner(
     // HTTP surface is gated on a port).
     let chat = crate::swebot::chat::start(shared.config.clone(), shared.tracker.clone());
 
+    // Backs `/observability`'s "rescan now" action -- see `status::ObservabilityHandle`.
+    let observability_handle = status::ObservabilityHandle {
+        repo: shared.config.repo.clone(),
+        event_tx: shared.event_tx.clone(),
+    };
+
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
@@ -458,6 +467,7 @@ async fn run_inner(
             .as_ref()
             .filter(|handles| handles.web_enabled)
             .map(|handles| crate::swebot::chat::web::router(handles.store.clone(), "/chat"));
+        let observability_for_serve = observability_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = status::serve_composite(
                 port,
@@ -465,6 +475,7 @@ async fn run_inner(
                 status_rx_for_serve,
                 workflow_dir_for_serve,
                 chat_router,
+                Some(observability_for_serve),
             )
             .await
             {
@@ -477,6 +488,7 @@ async fn run_inner(
             status_rx: status_rx.clone(),
             workflow_dir: workflow_dir.clone(),
             chat,
+            observability: observability_handle,
         });
     }
 
@@ -488,6 +500,25 @@ async fn run_inner(
         let swebot_tracker = shared.tracker.clone();
         tokio::spawn(async move {
             crate::swebot::run(swebot_cfg, swebot_tracker).await;
+        });
+    }
+
+    // AIR-10 Observability Agent: both halves are gated on `observability.backend`
+    // not being `none` (the default) -- see `observability::pre_merge::run`'s doc
+    // comment for why the pre-merge scan (which needs no backend of its own) is
+    // gated the same way as post-deploy validation (which does).
+    if shared.config.observability.backend != crate::config::ObservabilityBackendKind::None {
+        let pre_merge_cfg = shared.config.clone();
+        let pre_merge_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::pre_merge::run(pre_merge_cfg, pre_merge_events).await;
+        });
+
+        let validation_cfg = shared.config.clone();
+        let validation_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::production_validation::run(validation_cfg, validation_events)
+                .await;
         });
     }
 
@@ -1344,7 +1375,8 @@ async fn handle_msg(
                     };
                     let delay = if rate_limited {
                         state.rate_limited_until = Some(
-                            Instant::now() + Duration::from_millis(shared.config.rate_limit_pause_ms),
+                            Instant::now()
+                                + Duration::from_millis(shared.config.rate_limit_pause_ms),
                         );
                         shared.config.rate_limit_pause_ms
                     } else {
@@ -1538,7 +1570,15 @@ async fn run_attempt_body(
     });
 
     let exit = if cfg.pipeline.enabled {
-        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+        run_pipeline(
+            issue_id,
+            &mut issue,
+            attempt,
+            session.as_mut(),
+            snapshot,
+            tx,
+        )
+        .await
     } else {
         match run_turn_loop(
             session.as_mut(),
@@ -1597,11 +1637,11 @@ async fn run_turn_loop(
 ) -> LoopExit {
     let mut turn_number: u32 = 1;
     loop {
-        let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
-        {
-            Ok(p) => p,
-            Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
-        };
+        let prompt =
+            match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns) {
+                Ok(p) => p,
+                Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
+            };
 
         let _ = tx.send(OrchMsg::TurnStarted {
             issue_id: issue_id.to_string(),
@@ -1615,7 +1655,10 @@ async fn run_turn_loop(
             Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
         }
 
-        let refreshed = match tracker.fetch_issues_by_ids(std::slice::from_ref(&issue.id)).await {
+        let refreshed = match tracker
+            .fetch_issues_by_ids(std::slice::from_ref(&issue.id))
+            .await
+        {
             Ok(r) => r,
             Err(e) => return LoopExit::Error(format!("issue state refresh error: {e}")),
         };
@@ -1740,7 +1783,11 @@ async fn run_pipeline(
 /// the cycle outright -- the cycle still stops via `ExitReason::Normal` either way,
 /// this only affects whether the tracker's own state reflects why.
 async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state: &str) {
-    if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
+    if let Err(e) = snapshot
+        .tracker
+        .set_issue_state(issue_id, blocked_state)
+        .await
+    {
         tracing::warn!(
             issue_id = %issue_id,
             blocked_state = %blocked_state,
@@ -2044,7 +2091,15 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2090,7 +2145,15 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2103,11 +2166,9 @@ mod tests {
         assert_eq!(refreshed[0].state, "blocked");
 
         let msgs = drain(rx).await;
-        assert!(
-            msgs.iter().any(
-                |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
-            )
-        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
+        ));
     }
 
     #[tokio::test]
@@ -2139,7 +2200,15 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2186,9 +2255,21 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
-        assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "the failed turn plus one retry turn"
+        );
 
         let msgs = drain(rx).await;
         assert!(msgs.iter().any(
@@ -2225,13 +2306,24 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
         let stages = stage_events(&msgs);
         // The second stage never starts -- default `escalate` stops the whole cycle.
-        assert_eq!(stages, vec![("started", "implement"), ("finished", "implement")]);
+        assert_eq!(
+            stages,
+            vec![("started", "implement"), ("finished", "implement")]
+        );
     }
 
     #[test]
@@ -2257,7 +2349,9 @@ mod tests {
         assert!(is_plan_rate_limited(
             "stage 'implement' failed: agent turn error: You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
         ));
-        assert!(is_plan_rate_limited("You've hit your usage limit for today"));
+        assert!(is_plan_rate_limited(
+            "You've hit your usage limit for today"
+        ));
     }
 
     #[test]
@@ -2271,11 +2365,7 @@ mod tests {
     async fn rate_limited_worker_exit_pauses_dispatch_without_escalating_attempt() {
         let root = tempdir().unwrap();
         let tracker_dir = tempdir().unwrap();
-        let shared = test_shared(
-            "true",
-            root.path().to_path_buf(),
-            tracker_dir.path(),
-        );
+        let shared = test_shared("true", root.path().to_path_buf(), tracker_dir.path());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = OrchestratorState::default();
 
@@ -2353,9 +2443,10 @@ mod tests {
         )
         .unwrap();
 
-        let cfg_yaml: serde_yaml::Value =
-            serde_yaml::from_str("tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n")
-                .unwrap();
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n",
+        )
+        .unwrap();
         let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
         cfg.workspace_root = root.path().to_path_buf();
 

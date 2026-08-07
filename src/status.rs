@@ -23,9 +23,9 @@ use crate::eventlog;
 use crate::web::{escape, urlencode};
 use axum::Router;
 use axum::extract::{Query, State};
-use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -85,6 +85,20 @@ struct AppState {
     /// still lands within the same mount point -- without it, a nested dashboard's
     /// own links would silently escape to the service's top-level routes instead.
     base_path: String,
+    /// Present only when the caller has a `repo:`/event-log writer to hand over --
+    /// backs the `/observability` page's "rescan now" action (AIR-10). `None` (e.g.
+    /// SweBot chat's own test router, or a project with no `repo:` configured) simply
+    /// hides that control rather than erroring.
+    observability: Option<ObservabilityHandle>,
+}
+
+/// What `/observability`'s "rescan now" button needs to run one pre-merge scan
+/// on-demand (`observability::pre_merge::poll_once`), outside that scan's own
+/// background poll loop.
+#[derive(Clone)]
+pub struct ObservabilityHandle {
+    pub repo: Option<crate::config::RepoConfig>,
+    pub event_tx: tokio::sync::mpsc::UnboundedSender<eventlog::NewEvent>,
 }
 
 impl AppState {
@@ -113,19 +127,23 @@ impl AppState {
 /// callers keep the router-rendering concern in `swebot::chat::web` and this stays
 /// purely "bind what I was handed and serve it."
 ///
-/// The dashboard/fragment/events/usage routes on their own, with no bind/serve
-/// attached -- lets a caller that already owns an axum server (`src/service.rs`'s
-/// multi-project web UI) `.nest()` one of these per registered project instead of
-/// duplicating any of this module's HTML/handler code.
-pub fn router(
+/// Mounts the dashboard/fragment/events/usage/observability routes, with no
+/// bind/serve attached -- lets a caller that already owns an axum server
+/// (`src/service.rs`'s multi-project web UI) `.nest()` one of these per registered
+/// project instead of duplicating any of this module's HTML/handler code.
+/// `observability: None` still mounts `/observability` (read-only history, no
+/// "rescan now" button) rather than omitting the route.
+pub fn router_with_observability(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
     base_path: &str,
+    observability: Option<ObservabilityHandle>,
 ) -> Router {
     let state = AppState {
         status_rx,
         workflow_dir,
         base_path: base_path.to_string(),
+        observability,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -133,6 +151,8 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/observability", get(observability_page))
+        .route("/observability/rescan", post(observability_rescan))
         .with_state(state)
 }
 
@@ -142,8 +162,9 @@ pub async fn serve_composite(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
     chat: Option<Router>,
+    observability: Option<ObservabilityHandle>,
 ) -> anyhow::Result<()> {
-    let mut app = router(status_rx, workflow_dir, "");
+    let mut app = router_with_observability(status_rx, workflow_dir, "", observability);
     if let Some(chat) = chat {
         app = app.nest("/chat", chat);
     }
@@ -734,6 +755,212 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     )
 }
 
+// --------------------------------------------------------------------------------
+// /observability -- pre-merge telemetry evidence + post-deploy production
+// validation (AIR-10), from eventlog::recent_events_of_types
+// --------------------------------------------------------------------------------
+
+async fn observability_page(State(state): State<AppState>) -> Html<String> {
+    let rows = eventlog::recent_events_of_types(
+        &state.eventlog_db_path(),
+        &["telemetry_evidence", "production_validation"],
+        100,
+    )
+    .unwrap_or_default();
+    let base = state.base_path.as_str();
+
+    let can_rescan = state
+        .observability
+        .as_ref()
+        .is_some_and(|o| o.repo.is_some());
+    let rescan_form = if can_rescan {
+        format!(
+            r#"<form method="post" action="{base}/observability/rescan">
+<button type="submit" class="btn">Rescan open PRs now</button></form>"#
+        )
+    } else {
+        String::new()
+    };
+
+    let listing: String = if rows.is_empty() {
+        "<p class=\"empty\">No observability evidence recorded yet.</p>".to_string()
+    } else {
+        rows.iter().map(observability_row).collect()
+    };
+
+    let body = format!(
+        r#"<div class="meta">Pre-merge telemetry evidence and post-deploy production
+validation verdicts (AIR-10). "unknown" means the backend was unreachable or
+returned no data -- never treated as healthy.</div>
+{rescan_form}
+<div class="grid">
+{listing}
+</div>"#
+    );
+    Html(page_shell(
+        "observability",
+        "/observability",
+        &body,
+        "",
+        base,
+    ))
+}
+
+/// One card per event: `production_validation` shows the verdict badge, each check's
+/// pass/fail against its threshold, and the recorded reason (the "why" constraint 2
+/// asks for); `telemetry_evidence` shows every detected signal and any secret/PII
+/// findings.
+fn observability_row(r: &eventlog::EventRow) -> String {
+    let value: serde_json::Value = r
+        .message
+        .as_deref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    match r.event_type.as_str() {
+        "production_validation" => {
+            let verdict = value
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let checks_html: String = value
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .map(|c| {
+                            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                            let val = c
+                                .get("value")
+                                .and_then(|v| v.as_f64())
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "no data".to_string());
+                            let max = c.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let passed = c.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                            format!(
+                                r#"<li class="{cls}">{name}: {val} (max {max}) &mdash; {status}</li>"#,
+                                cls = if passed { "ok" } else { "bad" },
+                                name = escape(name),
+                                val = escape(&val),
+                                max = max,
+                                status = if passed { "pass" } else { "fail" },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="card">
+  <h2><span class="badge verdict-{verdict_class}">{verdict}</span> {identifier}</h2>
+  <div class="row">{reason}</div>
+  <ul>{checks_html}</ul>
+  <div class="row"><b>when</b> {created}</div>
+</div>"#,
+                verdict_class = escape(verdict),
+                verdict = escape(verdict),
+                identifier = escape(&r.identifier),
+                reason = escape(reason),
+                checks_html = checks_html,
+                created = escape(&r.created_at),
+            )
+        }
+        "telemetry_evidence" => {
+            let signals_html: String = value
+                .get("signals")
+                .and_then(|v| v.as_array())
+                .map(|signals| {
+                    signals
+                        .iter()
+                        .map(|s| {
+                            let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                            let location =
+                                s.get("location").and_then(|v| v.as_str()).unwrap_or("?");
+                            let requirement = s
+                                .get("requirement_id")
+                                .and_then(|v| v.as_str())
+                                .map(|r| format!(" (satisfies {})", escape(r)))
+                                .unwrap_or_default();
+                            format!(
+                                "<li>{kind} at {location}{requirement}</li>",
+                                kind = escape(kind),
+                                location = escape(location),
+                                requirement = requirement,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let findings_html: String = value
+                .get("findings")
+                .and_then(|v| v.as_array())
+                .filter(|f| !f.is_empty())
+                .map(|findings| {
+                    let items: String = findings
+                        .iter()
+                        .map(|f| {
+                            let location =
+                                f.get("location").and_then(|v| v.as_str()).unwrap_or("?");
+                            let description =
+                                f.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+                            format!(
+                                r#"<li class="bad">{location}: {description}</li>"#,
+                                location = escape(location),
+                                description = escape(description),
+                            )
+                        })
+                        .collect();
+                    format!(r#"<div class="row"><b>Findings</b><ul>{items}</ul></div>"#)
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="card">
+  <h2>{identifier}</h2>
+  <div class="row"><b>Signals</b><ul>{signals_html}</ul></div>
+  {findings_html}
+  <div class="row"><b>when</b> {created}</div>
+</div>"#,
+                identifier = escape(&r.identifier),
+                signals_html = signals_html,
+                findings_html = findings_html,
+                created = escape(&r.created_at),
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// The dashboard's only observability mutation: run one pre-merge scan immediately
+/// instead of waiting for the background poller's next tick. Fire-and-forget
+/// (spawned, not awaited) since a real scan clones a repo and can take longer than a
+/// request should block on -- the redirect lands before it finishes, and the new
+/// evidence shows up on the page's next load (or its own next `/observability` visit)
+/// once the spawned scan completes.
+async fn observability_rescan(State(state): State<AppState>) -> Response {
+    let base = state.base_path.clone();
+    if let Some(handle) = state.observability.clone()
+        && let Some(repo) = handle.repo.clone()
+    {
+        tokio::spawn(async move {
+            if let Ok(host) = crate::repo_host::build(&repo) {
+                let mut seen = std::collections::HashSet::new();
+                if let Err(e) = crate::observability::pre_merge::poll_once(
+                    &repo,
+                    host.as_ref(),
+                    &handle.event_tx,
+                    &mut seen,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "observability: on-demand rescan failed");
+                }
+            }
+        });
+    }
+    Redirect::to(&format!("{base}/observability")).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,7 +969,7 @@ mod tests {
     async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.path().to_path_buf(), "");
+        let app = router_with_observability(rx, dir.path().to_path_buf(), "", None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -953,5 +1180,114 @@ mod tests {
         let html = chips(&q, "");
         assert!(html.contains("issue: 42"));
         assert!(!html.contains("clear all"));
+    }
+
+    #[test]
+    fn observability_row_renders_a_degraded_verdict_with_its_failing_check() {
+        let message = serde_json::json!({
+            "verdict": "degraded",
+            "window_minutes": 30,
+            "checks": [{"name": "error_rate", "value": 0.5, "max": 0.01, "passed": false}],
+            "reason": "check(s) exceeded threshold: error_rate",
+        })
+        .to_string();
+        let row = event_row_fixture("production_validation", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("verdict-degraded"));
+        assert!(html.contains("error_rate"));
+        assert!(html.contains("fail"));
+    }
+
+    #[test]
+    fn observability_row_renders_unknown_distinctly_from_healthy() {
+        let message = serde_json::json!({
+            "verdict": "unknown",
+            "window_minutes": 30,
+            "checks": [],
+            "reason": "no data returned for check 'error_rate'",
+        })
+        .to_string();
+        let row = event_row_fixture("production_validation", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("verdict-unknown"));
+        assert!(!html.contains("verdict-healthy"));
+    }
+
+    #[test]
+    fn observability_row_renders_telemetry_evidence_signals_and_findings() {
+        let message = serde_json::json!({
+            "signals": [{"kind": "log", "location": "src/lib.rs:1", "snippet": "x", "requirement_id": "R1"}],
+            "findings": [{"location": "src/lib.rs:2", "description": "possible secret"}],
+        })
+        .to_string();
+        let row = event_row_fixture("telemetry_evidence", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("src/lib.rs:1"));
+        assert!(html.contains("satisfies R1"));
+        assert!(html.contains("possible secret"));
+    }
+
+    #[tokio::test]
+    async fn observability_page_lists_recorded_evidence_and_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(eventlog::DB_FILENAME);
+        let tx = eventlog::spawn_writer(db.clone());
+        tx.send(eventlog::NewEvent {
+            issue_id: "1".to_string(),
+            identifier: "AIR-10".to_string(),
+            title: "deploy abc123".to_string(),
+            session_id: None,
+            event_type: "production_validation".to_string(),
+            message: Some(r#"{"verdict":"healthy","window_minutes":30,"checks":[],"reason":"all checks within threshold"}"#.to_string()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        })
+        .unwrap();
+        // Give the writer task a moment to persist before the page reads it back.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let app = router_with_observability(status_rx, dir.path().to_path_buf(), "", None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/observability"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("verdict-healthy"));
+        assert!(!body.contains("Rescan open PRs now"));
+    }
+
+    #[tokio::test]
+    async fn observability_page_shows_the_rescan_button_only_when_a_repo_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = ObservabilityHandle {
+            repo: Some(crate::config::RepoConfig {
+                url: "https://github.com/owner/name.git".to_string(),
+                default_branch: "main".to_string(),
+                ..Default::default()
+            }),
+            event_tx,
+        };
+        let app = router_with_observability(status_rx, dir.path().to_path_buf(), "", Some(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/observability"))
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Rescan open PRs now"));
     }
 }

@@ -9,6 +9,7 @@ mod frontmatter;
 mod hooks;
 mod mcp;
 mod metrics;
+mod observability;
 mod orchestrator;
 mod registry;
 mod repo_host;
