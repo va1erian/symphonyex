@@ -91,6 +91,14 @@ pub enum ConfigError {
         "invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field"
     )]
     InvalidPipelineStage(usize),
+    #[error(
+        "invalid_config: pipeline.security.block_on[{0}] is '{1}', not one of low|medium|high|critical"
+    )]
+    InvalidSecurityBlockOn(usize, String),
+    #[error(
+        "invalid_config: pipeline.security.scanners[{0}] is missing a non-empty 'name' or 'command' field"
+    )]
+    InvalidSecurityScanner(usize),
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -398,6 +406,35 @@ pub struct PipelineConfig {
     /// state already documents), so the orchestrator's existing eligibility checks
     /// simply stop selecting it for dispatch rather than needing new logic of their own.
     pub blocked_state: String,
+    /// AIR-8: settings for any stage whose `role` is `security`. Kept as its own
+    /// struct (not flattened into `PipelineConfig`) so the next role-specific config
+    /// block (e.g. AIR-6's test stage) has an obvious sibling to follow instead of a
+    /// second top-level shape.
+    pub security: SecurityConfig,
+}
+
+/// `pipeline.security.*` (AIR-8). Applies to every stage whose `role` is `security` --
+/// there is exactly one security stage in practice, but nothing here assumes that.
+#[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    /// A finding at or above one of these severities blocks the cycle (park in
+    /// `pipeline.blocked_state`, no PR opened) unless a human override has been
+    /// recorded for this issue through the dashboard. Defaults to `[critical, high]`.
+    pub block_on: Vec<crate::security::Severity>,
+    /// Deterministic scanner commands run through the hook plumbing (Docker mode
+    /// included) after the security stage's own turns complete, folded into the
+    /// `security_findings` artifact. Empty by default -- a project opts a scanner in
+    /// explicitly, same posture as every other opt-in extension in this file.
+    pub scanners: Vec<crate::security::ScannerConfig>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            block_on: vec![crate::security::Severity::Critical, crate::security::Severity::High],
+            scanners: Vec::new(),
+        }
+    }
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -874,11 +911,51 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     if pipeline_enabled && pipeline_stages.is_empty() {
         return Err(ConfigError::EmptyPipelineStages);
     }
+
+    let security_raw = get(pipeline_raw, "security").unwrap_or(&empty);
+    let block_on_raw = get_vec_str(security_raw, "block_on");
+    let block_on = if block_on_raw.is_empty() {
+        SecurityConfig::default().block_on
+    } else {
+        block_on_raw
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                crate::security::Severity::parse(s)
+                    .ok_or_else(|| ConfigError::InvalidSecurityBlockOn(i, s.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let scanners = get(security_raw, "scanners")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| -> Result<Vec<crate::security::ScannerConfig>, ConfigError> {
+            seq.iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let name = get_str(s, "name")
+                        .filter(|v| !v.trim().is_empty())
+                        .ok_or(ConfigError::InvalidSecurityScanner(i))?;
+                    let command = get_str(s, "command")
+                        .filter(|v| !v.trim().is_empty())
+                        .ok_or(ConfigError::InvalidSecurityScanner(i))?;
+                    let format = get_str(s, "format").unwrap_or_default();
+                    Ok(crate::security::ScannerConfig {
+                        name,
+                        command,
+                        format,
+                    })
+                })
+                .collect()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
         blocked_state: get_str(pipeline_raw, "blocked_state")
             .unwrap_or_else(|| "blocked".to_string()),
+        security: SecurityConfig { block_on, scanners },
     };
 
     let cfg = EffectiveConfig {
@@ -2137,5 +2214,54 @@ mod tests {
         assert_eq!(second.max_turns, 3);
         assert_eq!(second.on_failure, StageFailureAction::Skip);
         assert!(second.blocking);
+    }
+
+    #[test]
+    fn security_block_on_and_scanners_default() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.pipeline.security.block_on,
+            vec![crate::security::Severity::Critical, crate::security::Severity::High]
+        );
+        assert!(cfg.pipeline.security.scanners.is_empty());
+    }
+
+    #[test]
+    fn security_block_on_and_scanners_parse() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    \
+             block_on: [critical]\n    scanners:\n      \
+             - name: cargo-audit\n        command: cargo audit --json\n        format: cargo_audit_json\n      \
+             - name: gitleaks\n        command: gitleaks detect -f json\n        format: gitleaks_json\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.security.block_on, vec![crate::security::Severity::Critical]);
+        assert_eq!(cfg.pipeline.security.scanners.len(), 2);
+        assert_eq!(cfg.pipeline.security.scanners[0].name, "cargo-audit");
+        assert_eq!(cfg.pipeline.security.scanners[1].format, "gitleaks_json");
+    }
+
+    #[test]
+    fn security_block_on_rejects_an_unknown_severity() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    block_on: [extreme]\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidSecurityBlockOn(0, s)) if s == "extreme"
+        ));
+    }
+
+    #[test]
+    fn security_scanner_missing_command_errors() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    scanners:\n      \
+             - name: cargo-audit\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidSecurityScanner(0))
+        ));
     }
 }

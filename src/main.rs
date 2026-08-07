@@ -12,6 +12,8 @@ mod metrics;
 mod orchestrator;
 mod registry;
 mod repo_host;
+mod roles;
+mod security;
 mod service;
 mod status;
 mod swebot;

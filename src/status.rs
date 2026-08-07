@@ -20,15 +20,19 @@
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 
 use crate::eventlog;
+use crate::security::SecurityFindings;
+use crate::tracker::TrackerAdapter;
+use crate::web;
 use crate::web::{escape, urlencode};
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::extract::{Form, Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
@@ -85,12 +89,33 @@ struct AppState {
     /// still lands within the same mount point -- without it, a nested dashboard's
     /// own links would silently escape to the service's top-level routes instead.
     base_path: String,
+    /// Present iff `pipeline.security` has somewhere to send a human override
+    /// (`AppState`'s owner resolved a tracker for this project) -- `None` renders
+    /// `/security` read-only with an explanatory banner instead of a broken form.
+    security: Option<SecurityContext>,
 }
 
 impl AppState {
     fn eventlog_db_path(&self) -> PathBuf {
         self.workflow_dir.join(eventlog::DB_FILENAME)
     }
+}
+
+/// What `/security`'s override action (AIR-8) needs beyond read-only eventlog access:
+/// somewhere to write the resumed tracker state. General enough that AIR-5's
+/// `/approvals` page (the next dashboard action that mutates tracker state from a
+/// human click) can reuse the same shape rather than inventing its own.
+#[derive(Clone)]
+pub struct SecurityContext {
+    pub tracker: Arc<dyn TrackerAdapter>,
+    /// `pipeline.blocked_state` -- shown on the page so a human can see what state a
+    /// blocked issue is actually parked in.
+    pub blocked_state: String,
+    /// Tracker state an override moves the issue back to so the dispatcher picks it
+    /// up again -- `cfg.active_states.first()`, when the project has any configured.
+    /// `None` disables the override action (nothing to resume into) but still shows
+    /// findings.
+    pub resume_state: Option<String>,
 }
 
 /// Bind and serve the dashboard until the process exits. Loopback-only
@@ -117,15 +142,20 @@ impl AppState {
 /// attached -- lets a caller that already owns an axum server (`src/service.rs`'s
 /// multi-project web UI) `.nest()` one of these per registered project instead of
 /// duplicating any of this module's HTML/handler code.
+/// `security`: `Some` wires `/security`'s override action to a real tracker
+/// (`SecurityContext`); `None` renders `/security` read-only (no `pipeline.security`
+/// configured for this project, or the caller has no tracker handle to give it).
 pub fn router(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
     base_path: &str,
+    security: Option<SecurityContext>,
 ) -> Router {
     let state = AppState {
         status_rx,
         workflow_dir,
         base_path: base_path.to_string(),
+        security,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -133,17 +163,21 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/security", get(security_page))
+        .route("/security/override", post(security_override))
         .with_state(state)
 }
 
+/// `security`: see `router`'s doc comment.
 pub async fn serve_composite(
     port: u16,
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
     chat: Option<Router>,
+    security: Option<SecurityContext>,
 ) -> anyhow::Result<()> {
-    let mut app = router(status_rx, workflow_dir, "");
+    let mut app = router(status_rx, workflow_dir, "", security);
     if let Some(chat) = chat {
         app = app.nest("/chat", chat);
     }
@@ -734,6 +768,357 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     )
 }
 
+// --------------------------------------------------------------------------------
+// /security -- AIR-8: security_findings artifacts, blocking state, human override.
+//
+// `orchestrator::run_pipeline`'s `evaluate_security_stage` records three event types
+// per evaluation, always in this order: `security_findings` (the full redacted
+// artifact, first line `stage=<id> risk=<risk>` then the JSON), and then at most one
+// of `security_blocked` or `security_override_consumed`. `security_status_rows` below
+// reconstructs "is this issue currently blocked" from nothing but relative event ids
+// (the latest of the three per issue wins) -- no extra table, same one `events` log
+// every other page here already reads.
+// --------------------------------------------------------------------------------
+
+struct SecurityRow {
+    issue_id: String,
+    identifier: String,
+    title: String,
+    created_at: String,
+    findings: Option<SecurityFindings>,
+    blocked: bool,
+    /// A previous block on this same evaluation round was overridden (rather than
+    /// this round having no blocking findings at all) -- shown as a distinct badge
+    /// from plain "clear" so the override stays visible after it's been applied.
+    overridden: bool,
+    override_pending: bool,
+}
+
+fn security_status_rows(db_path: &std::path::Path) -> Vec<SecurityRow> {
+    let findings_events = eventlog::latest_events_by_type(db_path, "security_findings").unwrap_or_default();
+    let blocked_ids: std::collections::HashMap<String, i64> =
+        eventlog::latest_events_by_type(db_path, "security_blocked")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.issue_id, e.id))
+            .collect();
+    let consumed_ids: std::collections::HashMap<String, i64> =
+        eventlog::latest_events_by_type(db_path, "security_override_consumed")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.issue_id, e.id))
+            .collect();
+
+    findings_events
+        .into_iter()
+        .map(|e| {
+            let findings = e
+                .message
+                .as_deref()
+                .and_then(|m| m.split_once('\n'))
+                .and_then(|(_, json)| serde_json::from_str::<SecurityFindings>(json).ok());
+            // `security_findings` is always recorded before the `security_blocked` /
+            // `security_override_consumed` that (may) follow it for the same
+            // evaluation, so "id newer than this findings row" is exactly "belongs to
+            // this evaluation, not a stale earlier one."
+            let blocked = blocked_ids.get(&e.issue_id).is_some_and(|&b| b > e.id);
+            let overridden = consumed_ids.get(&e.issue_id).is_some_and(|&c| c > e.id);
+            let override_pending = eventlog::pending_override(db_path, &e.issue_id)
+                .ok()
+                .flatten()
+                .is_some();
+            SecurityRow {
+                issue_id: e.issue_id,
+                identifier: e.identifier,
+                title: e.title,
+                created_at: e.created_at,
+                findings,
+                blocked,
+                overridden,
+                override_pending,
+            }
+        })
+        .collect()
+}
+
+async fn security_page(State(state): State<AppState>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let rows = security_status_rows(&state.eventlog_db_path());
+
+    let banner = if state.security.is_none() {
+        web::error_banner(
+            "This project has no security stage configured, or its dashboard was mounted \
+             without tracker access -- findings below are read-only and overrides are disabled.",
+        )
+    } else {
+        String::new()
+    };
+
+    let cards: String = if rows.is_empty() {
+        "<p class=\"empty\">No security stage has run yet.</p>".to_string()
+    } else {
+        rows.iter().map(|r| security_card(r, &state, base)).collect()
+    };
+
+    let body = format!("{banner}<div class=\"grid\">{cards}</div>");
+    Html(page_shell("security", "/security", &body, "", base))
+}
+
+fn owasp_checklist_html(findings: &SecurityFindings) -> String {
+    if findings.owasp_checklist.is_empty() {
+        return "<p class=\"empty\">No OWASP checklist recorded.</p>".to_string();
+    }
+    let rows: String = findings
+        .owasp_checklist
+        .iter()
+        .map(|item| {
+            let status = match item.status {
+                crate::security::OwaspStatus::Pass => "pass",
+                crate::security::OwaspStatus::Fail => "fail",
+                crate::security::OwaspStatus::NotApplicable => "not_applicable",
+            };
+            format!(
+                "<tr><td>{id}</td><td>{name}</td><td>{status}</td><td>{evidence}</td></tr>",
+                id = escape(&item.id),
+                name = escape(&item.name),
+                status = escape(status),
+                evidence = escape(&item.evidence),
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"table-wrap\"><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+}
+
+fn findings_list_html(findings: &SecurityFindings) -> String {
+    if findings.findings.is_empty() {
+        return "<p class=\"empty\">No findings.</p>".to_string();
+    }
+    findings
+        .findings
+        .iter()
+        .map(|f| {
+            format!(
+                r#"<div class="card" id="finding-{id}">
+  <h2>{id} &middot; <span class="badge">{severity}</span></h2>
+  <div class="row">{summary}</div>
+  <div class="row"><b>location</b> {file}{line}</div>
+  <div class="row"><b>owasp</b> {owasp} &middot; <b>cwe</b> {cwe}</div>
+  <div class="msg"><b>exploit scenario:</b> {exploit}<br><b>remediation:</b> {remediation}</div>
+</div>"#,
+                id = escape(&f.id),
+                severity = escape(f.severity.as_str()),
+                summary = escape(&f.summary),
+                file = escape(f.file.as_deref().unwrap_or("-")),
+                line = f
+                    .line
+                    .map(|l| format!(":{l}"))
+                    .unwrap_or_default(),
+                owasp = escape(f.owasp_id.as_deref().unwrap_or("-")),
+                cwe = escape(f.cwe.as_deref().unwrap_or("-")),
+                exploit = escape(f.exploit_scenario.as_deref().unwrap_or("-")),
+                remediation = escape(f.remediation.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect()
+}
+
+fn secrets_and_deps_html(findings: &SecurityFindings) -> String {
+    let secret_rows: String = if findings.secrets_scan.matches.is_empty() {
+        "<tr><td colspan=\"2\" class=\"empty\">none</td></tr>".to_string()
+    } else {
+        findings
+            .secrets_scan
+            .matches
+            .iter()
+            .map(|m| {
+                format!(
+                    "<tr><td>{file}</td><td>{line}</td></tr>",
+                    file = escape(&m.file),
+                    line = m.line,
+                )
+            })
+            .collect()
+    };
+    let advisories: String = if findings.dependency_scan.advisories.is_empty() {
+        "<span class=\"empty\">none</span>".to_string()
+    } else {
+        findings
+            .dependency_scan
+            .advisories
+            .iter()
+            .map(|a| escape(a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let secrets_status = match findings.secrets_scan.status {
+        crate::security::ScanStatus::Clean => "clean",
+        crate::security::ScanStatus::Findings => "findings",
+        crate::security::ScanStatus::NotRun => "not_run",
+    };
+    let deps_status = match findings.dependency_scan.status {
+        crate::security::ScanStatus::Clean => "clean",
+        crate::security::ScanStatus::Findings => "findings",
+        crate::security::ScanStatus::NotRun => "not_run",
+    };
+    format!(
+        r#"<div class="row"><b>secrets scan</b> {secrets_status} -- file/line only, matched text is never stored</div>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Line</th></tr></thead><tbody>{secret_rows}</tbody></table></div>
+<div class="row"><b>dependency scan</b> ({tool}) {deps_status} -- {advisories}</div>"#,
+        tool = escape(&findings.dependency_scan.tool),
+    )
+}
+
+fn security_card(r: &SecurityRow, state: &AppState, base: &str) -> String {
+    let risk = r
+        .findings
+        .as_ref()
+        .map(|f| f.risk_classification.as_str())
+        .unwrap_or("unknown");
+    let status_badge = if r.blocked {
+        r#"<span class="badge closed">blocked</span>"#
+    } else if r.overridden {
+        r#"<span class="badge">overridden</span>"#
+    } else {
+        r#"<span class="badge">clear</span>"#
+    };
+    let pending_note = if r.override_pending {
+        r#"<div class="row">an override has been recorded and will be applied on the next run</div>"#
+    } else {
+        ""
+    };
+
+    let (checklist, findings_list, scans) = match &r.findings {
+        Some(f) => (
+            owasp_checklist_html(f),
+            findings_list_html(f),
+            secrets_and_deps_html(f),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
+
+    let override_form = if r.blocked && state.security.is_some() {
+        format!(
+            r#"<form class="compose" method="post" action="{base}/security/override" data-confirm="Override this blocking security finding and resume the cycle?">
+  <input type="hidden" name="issue_id" value="{issue_id}">
+  <label for="reason-{id_attr}">Override reason (required)</label>
+  <textarea id="reason-{id_attr}" name="reason" maxlength="2000" required></textarea>
+  <label for="token-{id_attr}">Admin token</label>
+  <input type="password" id="token-{id_attr}" name="admin_token" required>
+  <button type="submit" class="btn">Override and resume</button>
+</form>"#,
+            issue_id = escape(&r.issue_id),
+            id_attr = escape(&r.issue_id),
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<div class="card" id="sec-{id_attr}" style="flex-basis: 100%;">
+  <h2><a href="{base}/events?issue={issue_link}">{identifier}</a> &mdash; {title} {status_badge}</h2>
+  <div class="row"><b>risk</b> {risk} &middot; <b>evaluated</b> {created_at} &middot; <b>blocked_state</b> {blocked_state}</div>
+  {pending_note}
+  <section><h3>OWASP checklist</h3>{checklist}</section>
+  <section><h3>Findings</h3>{findings_list}</section>
+  <section><h3>Scanners</h3>{scans}</section>
+  {override_form}
+</div>"#,
+        id_attr = escape(&r.issue_id),
+        base = base,
+        issue_link = urlencode(&r.issue_id),
+        identifier = escape(&r.identifier),
+        title = escape(&r.title),
+        risk = escape(risk),
+        created_at = escape(&r.created_at),
+        blocked_state = state
+            .security
+            .as_ref()
+            .map(|s| escape(&s.blocked_state))
+            .unwrap_or_else(|| "-".to_string()),
+    )
+}
+
+#[derive(Deserialize)]
+struct OverrideForm {
+    issue_id: String,
+    reason: String,
+    admin_token: String,
+}
+
+/// POST-only, admin-token gated (per-request token field rather than the cookie-based
+/// login `service.rs` uses for its own admin routes -- this dashboard has no login
+/// page of its own, single-project or nested). Records a `security_override` event
+/// (consumed one-shot by the next `evaluate_security_stage` run, see
+/// `eventlog::pending_override`) and, when a resume state is configured, moves the
+/// issue out of `pipeline.blocked_state` immediately so the dispatcher picks it back
+/// up without waiting for the next poll to notice a state nothing changed.
+async fn security_override(
+    State(state): State<AppState>,
+    Form(form): Form<OverrideForm>,
+) -> Response {
+    let base = state.base_path.clone();
+    let Some(security) = &state.security else {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("This project's dashboard has no tracker access configured; overrides are disabled."),
+            "",
+            &base,
+        ))
+        .into_response();
+    };
+
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.is_empty() || form.admin_token != expected {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("Invalid admin token."),
+            "",
+            &base,
+        ))
+        .into_response();
+    }
+    if form.reason.trim().is_empty() {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("A reason is required to override a blocking security finding."),
+            "",
+            &base,
+        ))
+        .into_response();
+    }
+
+    let db_path = state.eventlog_db_path();
+    if let Err(e) = eventlog::insert_event(
+        &db_path,
+        &eventlog::NewEvent {
+            issue_id: form.issue_id.clone(),
+            identifier: form.issue_id.clone(),
+            title: String::new(),
+            session_id: None,
+            event_type: "security_override".to_string(),
+            message: Some(form.reason.clone()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        },
+    ) {
+        tracing::warn!(error = %e, issue_id = %form.issue_id, "failed to record security override");
+    }
+
+    if let Some(resume_state) = &security.resume_state
+        && let Err(e) = security.tracker.set_issue_state(&form.issue_id, resume_state).await
+    {
+        tracing::warn!(error = %e, issue_id = %form.issue_id, "failed to resume issue after security override");
+    }
+
+    Redirect::to(&format!("{base}/security")).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,7 +1127,7 @@ mod tests {
     async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.path().to_path_buf(), "");
+        let app = router(rx, dir.path().to_path_buf(), "", None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -953,5 +1338,161 @@ mod tests {
         let html = chips(&q, "");
         assert!(html.contains("issue: 42"));
         assert!(!html.contains("clear all"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-8: /security
+    // -----------------------------------------------------------------------------
+
+    fn sample_findings_json(risk: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"risk_classification":"{risk}","owasp_checklist":[],
+            "findings":[{{"id":"S1","severity":"{risk}","owasp_id":"A03:2021","cwe":"CWE-89",
+                "file":"src/x.rs","line":10,"summary":"sql injection","exploit_scenario":"...",
+                "remediation":"..."}}],
+            "secrets_scan":{{"status":"clean","matches":[]}},
+            "dependency_scan":{{"tool":"","status":"not_run","advisories":[]}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn security_status_rows_derives_blocked_overridden_and_clear_from_event_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(eventlog::DB_FILENAME);
+
+        let findings_event = |issue: &str, risk: &str| eventlog::NewEvent {
+            issue_id: issue.to_string(),
+            identifier: issue.to_string(),
+            title: "t".to_string(),
+            session_id: None,
+            event_type: "security_findings".to_string(),
+            message: Some(format!("stage=security risk={risk}\n{}", sample_findings_json(risk))),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        };
+        let marker_event = |issue: &str, event_type: &str| eventlog::NewEvent {
+            issue_id: issue.to_string(),
+            identifier: issue.to_string(),
+            title: "t".to_string(),
+            session_id: None,
+            event_type: event_type.to_string(),
+            message: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        };
+
+        // A: findings then blocked -> currently blocked.
+        eventlog::insert_event(&db, &findings_event("A", "critical")).unwrap();
+        eventlog::insert_event(&db, &marker_event("A", "security_blocked")).unwrap();
+        // B: findings then override-consumed -> overridden, not blocked.
+        eventlog::insert_event(&db, &findings_event("B", "critical")).unwrap();
+        eventlog::insert_event(&db, &marker_event("B", "security_override_consumed")).unwrap();
+        // C: findings only, nothing blocking -> clear.
+        eventlog::insert_event(&db, &findings_event("C", "low")).unwrap();
+
+        let rows = security_status_rows(&db);
+        assert_eq!(rows.len(), 3, "{:?}", rows.iter().map(|r| &r.issue_id).collect::<Vec<_>>());
+
+        let a = rows.iter().find(|r| r.issue_id == "A").unwrap();
+        assert!(a.blocked);
+        assert!(!a.overridden);
+
+        let b = rows.iter().find(|r| r.issue_id == "B").unwrap();
+        assert!(!b.blocked);
+        assert!(b.overridden);
+
+        let c = rows.iter().find(|r| r.issue_id == "C").unwrap();
+        assert!(!c.blocked);
+        assert!(!c.overridden);
+        assert_eq!(
+            c.findings.as_ref().unwrap().risk_classification,
+            crate::security::Severity::Low
+        );
+    }
+
+    #[test]
+    fn owasp_checklist_html_escapes_evidence_text() {
+        let findings: SecurityFindings = serde_json::from_str(&sample_findings_json("low"))
+            .map(|mut f: SecurityFindings| {
+                f.owasp_checklist.push(crate::security::OwaspItem {
+                    id: "A01:2021".to_string(),
+                    name: "Broken Access Control".to_string(),
+                    applicable: false,
+                    status: crate::security::OwaspStatus::NotApplicable,
+                    evidence: "<script>alert(1)</script>".to_string(),
+                });
+                f
+            })
+            .unwrap();
+        let html = owasp_checklist_html(&findings);
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn findings_list_html_never_contains_the_word_secret_value_placeholder() {
+        // Regression guard: findings/secrets rendering must never echo raw secret
+        // text -- `SecretMatch` structurally can't hold it (see `security` module's
+        // own tests), so this just checks the rendered HTML sticks to file/line.
+        let findings: SecurityFindings = serde_json::from_str(&sample_findings_json("high")).unwrap();
+        let html = secrets_and_deps_html(&findings);
+        assert!(html.contains("clean"));
+        assert!(!html.contains("sk-"));
+    }
+
+    #[test]
+    fn security_override_form_requires_reason_and_admin_token_fields() {
+        let row = SecurityRow {
+            issue_id: "A".to_string(),
+            identifier: "A".to_string(),
+            title: "t".to_string(),
+            created_at: "now".to_string(),
+            findings: None,
+            blocked: true,
+            overridden: false,
+            override_pending: false,
+        };
+        let state = AppState {
+            status_rx: watch::channel(StatusSnapshot::default()).1,
+            workflow_dir: PathBuf::from("."),
+            base_path: String::new(),
+            security: Some(SecurityContext {
+                tracker: Arc::new(crate::tracker::local::LocalTrackerAdapter::new(
+                    &serde_yaml::from_str("dir: .").unwrap(),
+                    std::path::Path::new("."),
+                )
+                .unwrap()),
+                blocked_state: "blocked".to_string(),
+                resume_state: Some("todo".to_string()),
+            }),
+        };
+        let html = security_card(&row, &state, "");
+        assert!(html.contains(r#"name="reason""#));
+        assert!(html.contains(r#"name="admin_token""#));
+        assert!(html.contains(r#"action="/security/override""#));
+    }
+
+    #[test]
+    fn security_override_form_is_absent_without_security_context() {
+        let row = SecurityRow {
+            issue_id: "A".to_string(),
+            identifier: "A".to_string(),
+            title: "t".to_string(),
+            created_at: "now".to_string(),
+            findings: None,
+            blocked: true,
+            overridden: false,
+            override_pending: false,
+        };
+        let state = AppState {
+            status_rx: watch::channel(StatusSnapshot::default()).1,
+            workflow_dir: PathBuf::from("."),
+            base_path: String::new(),
+            security: None,
+        };
+        let html = security_card(&row, &state, "");
+        assert!(!html.contains("action=\"/security/override\""));
     }
 }
