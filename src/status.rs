@@ -133,6 +133,8 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/insights", get(insights_page))
+        .route("/metrics", get(metrics_endpoint))
         .with_state(state)
 }
 
@@ -717,6 +719,129 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     Html(page_shell("usage", "/usage", &body, "", base))
 }
 
+// --------------------------------------------------------------------------------
+// /insights -- roadmap SS11 success-measure dashboard (src/insights.rs), grouped by
+// dimension with a period selector. /metrics -- the same computation, rendered as
+// Prometheus text exposition format for the Open Observability Platform to scrape.
+//
+// Both are plain per-request renders (like /events and /usage above), not pushed
+// through /fragment-stream: that mechanism carries live *in-process* orchestrator
+// state (`StatusSnapshot`), while insights are a point-in-time read of `symphony.db`
+// -- there is nothing to push between requests that a fresh read wouldn't already
+// pick up, exactly the same reasoning that already keeps /events and /usage on plain
+// per-request renders instead of SSE.
+// --------------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct InsightsQuery {
+    /// `"7d"`, `"30d"`, `"90d"`, or `"all"` (default).
+    since: Option<String>,
+}
+
+fn since_from_period(period: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let days = match period {
+        "7d" => 7,
+        "30d" => 30,
+        "90d" => 90,
+        _ => return None,
+    };
+    Some(chrono::Utc::now() - chrono::Duration::days(days))
+}
+
+async fn insights_page(
+    State(state): State<AppState>,
+    Query(q): Query<InsightsQuery>,
+) -> Html<String> {
+    let period = q.since.as_deref().unwrap_or("all");
+    let since = since_from_period(period);
+    let base = state.base_path.as_str();
+
+    let report = match crate::insights::compute(&state.eventlog_db_path(), since) {
+        Ok(r) => r,
+        Err(e) => {
+            let body = format!(
+                "<p class=\"empty\">Failed to compute insights: {}</p>",
+                escape(&e.to_string())
+            );
+            return Html(page_shell("insights", "/insights", &body, "", base));
+        }
+    };
+
+    let periods = [("all", "All time"), ("7d", "7d"), ("30d", "30d"), ("90d", "90d")];
+    let selector: String = periods
+        .iter()
+        .map(|(value, label)| {
+            let class = if *value == period { " class=\"active\"" } else { "" };
+            format!(r#"<a href="{base}/insights?since={value}"{class}>{label}</a>"#)
+        })
+        .collect();
+
+    let dimensions: String = report
+        .dimensions
+        .iter()
+        .map(|dim| {
+            let rows: String = dim
+                .metrics
+                .iter()
+                .map(|m| {
+                    let value = match &m.value {
+                        crate::insights::MetricValue::Number(n) => format!("{n}"),
+                        crate::insights::MetricValue::Unknown(_) => {
+                            "<span class=\"empty\">unknown</span>".to_string()
+                        }
+                    };
+                    let reason = match &m.value {
+                        crate::insights::MetricValue::Unknown(reason) => {
+                            format!(" &mdash; <span class=\"empty\">{}</span>", escape(reason))
+                        }
+                        crate::insights::MetricValue::Number(_) => String::new(),
+                    };
+                    format!(
+                        "<tr><td title=\"{formula}\">{label}</td><td>{value}{reason}</td></tr>",
+                        formula = escape(m.formula),
+                        label = escape(m.label),
+                    )
+                })
+                .collect();
+            format!(
+                "<section>\n<h3>{label}</h3>\n<div class=\"table-wrap\">\n<table>\n\
+                 <thead><tr><th>Measure</th><th>Value</th></tr></thead>\n<tbody>{rows}</tbody>\n\
+                 </table>\n</div>\n</section>",
+                label = escape(dim.label),
+            )
+        })
+        .collect();
+
+    let body = format!(
+        r#"<div class="filters">{selector}</div>
+<p class="empty">Since {since} &middot; as of {until} &middot; hover a measure for its exact formula.</p>
+{dimensions}"#,
+        selector = selector,
+        since = escape(
+            &report
+                .since
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "the beginning of history".to_string())
+        ),
+        until = escape(&report.until.to_rfc3339()),
+    );
+    Html(page_shell("insights", "/insights", &body, "", base))
+}
+
+async fn metrics_endpoint(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let report = crate::insights::compute(&state.eventlog_db_path(), None).unwrap_or_else(|_| {
+        crate::insights::InsightsReport {
+            since: None,
+            until: chrono::Utc::now(),
+            dimensions: Vec::new(),
+        }
+    });
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::insights::render_prometheus(&report),
+    )
+}
+
 fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     format!(
         "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td></tr>",
@@ -953,5 +1078,54 @@ mod tests {
         let html = chips(&q, "");
         assert!(html.contains("issue: 42"));
         assert!(!html.contains("clear all"));
+    }
+
+    #[tokio::test]
+    async fn insights_page_renders_all_five_dimensions_and_a_period_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "/base");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let body = reqwest::get(format!("http://{addr}/insights"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        for label in ["Flow", "Quality", "Autonomy", "Economics", "Reliability"] {
+            assert!(body.contains(label), "missing dimension {label}: {body}");
+        }
+        // Period selector links, nested correctly under this router's base_path.
+        assert!(body.contains("/base/insights?since=7d"), "{body}");
+        assert!(body.contains("/base/insights?since=30d"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_valid_prometheus_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/metrics")).await.unwrap();
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("# HELP symphony_autonomy_successful_parallel_cycles"));
+        assert!(body.contains("# TYPE symphony_autonomy_successful_parallel_cycles gauge"));
+        assert!(body.contains("symphony_reliability_repeated_failures 0"));
+        assert!(body.contains("symphony_flow_deployment_frequency NaN"));
     }
 }

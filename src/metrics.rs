@@ -4,6 +4,7 @@
 //! change so a report exists even if the process is killed rather than shut down
 //! cleanly.
 
+use crate::insights::{self, MetricValue};
 use crate::web::{self, escape};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
@@ -61,9 +62,17 @@ impl Metrics {
 }
 
 /// Render and write the HTML usage report to `path`. Best-effort: I/O errors are
-/// returned to the caller to log, never panicked on.
-pub fn write_report(path: &Path, workflow_path: &Path, metrics: &Metrics) -> std::io::Result<()> {
-    let html = render(workflow_path, metrics);
+/// returned to the caller to log, never panicked on. `db_path` is `symphony.db`
+/// (`eventlog::DB_FILENAME` joined onto `workflow_dir`) -- the same database
+/// `/insights`/`/metrics`/`symphony metrics` read, so the summary block at the top of
+/// this report always matches those other surfaces for the same (all-time) period.
+pub fn write_report(
+    path: &Path,
+    workflow_path: &Path,
+    db_path: &Path,
+    metrics: &Metrics,
+) -> std::io::Result<()> {
+    let html = render(workflow_path, db_path, metrics);
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -72,7 +81,37 @@ pub fn write_report(path: &Path, workflow_path: &Path, metrics: &Metrics) -> std
     std::fs::write(path, html)
 }
 
-fn render(workflow_path: &Path, m: &Metrics) -> String {
+/// The roadmap SS11 summary block rendered at the top of the report -- one row per
+/// dimension's known measures (unknown ones are omitted here; the full breakdown with
+/// reasons lives on `/insights`, linked from this block).
+fn insights_summary(db_path: &Path) -> String {
+    let report = match insights::compute(db_path, None) {
+        Ok(r) => r,
+        Err(_) => return String::new(),
+    };
+    let known: Vec<String> = report
+        .dimensions
+        .iter()
+        .flat_map(|d| d.metrics.iter())
+        .filter_map(|m| match &m.value {
+            MetricValue::Number(n) => Some(format!(
+                "<div class=\"stat\"><div class=\"n\">{n}</div><div class=\"l\">{}</div></div>",
+                escape(m.label)
+            )),
+            MetricValue::Unknown(_) => None,
+        })
+        .collect();
+    if known.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<section>\n<h3>Delivery metrics (roadmap &sect;11)</h3>\n<div class=\"stats\">{}</div>\n\
+         <p class=\"empty\">Full breakdown, including not-yet-derivable measures and why: /insights</p>\n</section>",
+        known.join("")
+    )
+}
+
+fn render(workflow_path: &Path, db_path: &Path, m: &Metrics) -> String {
     let now = Utc::now();
     let elapsed = now.signed_duration_since(m.run_started_at);
     let elapsed_str = format_duration(elapsed.num_seconds().max(0) as u64);
@@ -116,11 +155,15 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
             .collect()
     };
 
+    let insights_block = insights_summary(db_path);
+
     let body = format!(
         r#"<div class="meta">
   workflow <code>{workflow}</code> &middot; started {started} &middot; running for {elapsed}
   &middot; generated {generated}
 </div>
+
+{insights_block}
 
 <div class="stats">
   <div class="stat"><div class="n">{agents}</div><div class="l">Agents spawned</div></div>
@@ -165,6 +208,7 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
         started = escape(&m.run_started_at.to_rfc3339()),
         elapsed = elapsed_str,
         generated = escape(&now.to_rfc3339()),
+        insights_block = insights_block,
         agents = m.agents_spawned,
         turns = m.turns_started,
         tool_calls = m.tool_calls,
@@ -199,6 +243,8 @@ mod tests {
 
     #[test]
     fn report_contains_key_numbers() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("symphony.db");
         let mut m = Metrics {
             agents_spawned: 3,
             turns_started: 7,
@@ -214,7 +260,7 @@ mod tests {
         entry.turns = 3;
         entry.last_outcome = Some("done (normal)".to_string());
 
-        let html = render(Path::new("WORKFLOW.md"), &m);
+        let html = render(Path::new("WORKFLOW.md"), &db_path, &m);
         assert!(html.contains(">3<"));
         assert!(html.contains(">7<"));
         assert!(html.contains(">12<"));
@@ -228,8 +274,9 @@ mod tests {
     fn write_report_creates_parent_dirs_and_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("report.html");
+        let db_path = dir.path().join("symphony.db");
         let m = Metrics::default();
-        write_report(&path, Path::new("WORKFLOW.md"), &m).unwrap();
+        write_report(&path, Path::new("WORKFLOW.md"), &db_path, &m).unwrap();
         assert!(path.exists());
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("Symphony &mdash; usage report"));
@@ -237,10 +284,23 @@ mod tests {
 
     #[test]
     fn escapes_untrusted_content() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("symphony.db");
         let mut m = Metrics::default();
         m.issue_entry("<script>", "alpha & <b>bold</b>");
-        let html = render(Path::new("WORKFLOW.md"), &m);
+        let html = render(Path::new("WORKFLOW.md"), &db_path, &m);
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn insights_summary_shows_known_measures_and_links_to_insights() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("symphony.db");
+        let m = Metrics::default();
+        let html = render(Path::new("WORKFLOW.md"), &db_path, &m);
+        assert!(html.contains("Delivery metrics"));
+        assert!(html.contains("Successful parallel cycles"));
+        assert!(html.contains("/insights"));
     }
 }

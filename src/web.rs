@@ -310,6 +310,10 @@ pub const NAV_LINKS: &[NavLink] = &[
         label: "Usage",
     },
     NavLink {
+        href: "/insights",
+        label: "Insights",
+    },
+    NavLink {
         href: "/chat",
         label: "Chat",
     },
