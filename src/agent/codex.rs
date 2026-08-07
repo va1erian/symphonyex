@@ -362,7 +362,13 @@ mod tests {
         };
         let workspace = tempdir().unwrap();
         let result = backend
-            .start_session(workspace.path(), "issue-1", "t", None, &ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                "issue-1",
+                "t",
+                None,
+                &ToolPolicy::default(),
+            )
             .await;
         // Fails later for an unrelated reason (no such binary/RPC handshake), not on
         // the tool-policy check.

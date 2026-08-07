@@ -16,10 +16,10 @@
 //! provider-specific error text.
 
 use super::{PERSONA, extract_json_block, git, run_turn_collect_text};
-use crate::review_rubric::CHECKLIST;
 use crate::agent::{AgentBackend, ToolPolicy};
 use crate::config::EffectiveConfig;
 use crate::repo_host::{RepoHost, ReviewVerdict, extract_closes_issue_number};
+use crate::review_rubric::CHECKLIST;
 use crate::tracker::TrackerAdapter;
 
 pub async fn poll_once(

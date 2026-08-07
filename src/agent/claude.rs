@@ -21,7 +21,9 @@
 //! (`--allowedTools mcp__symphony__*`) independent of `permission_mode`, since they are
 //! host-mediated and adapter-scoped, not raw command/file access.
 
-use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome};
+use super::{
+    AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome,
+};
 use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -397,8 +399,7 @@ impl ClaudeSession {
                     // can detect it without every other tool call needing this.
                     if tool_name.ends_with("raise_clarification") {
                         let _ = events.send(
-                            AgentEvent::new("clarification_raised")
-                                .with_message(input.to_string()),
+                            AgentEvent::new("clarification_raised").with_message(input.to_string()),
                         );
                     }
                     let _ = events.send(AgentEvent::new("tool_call").with_message(tool_name));
@@ -585,12 +586,8 @@ mod tests {
         assert!(events.iter().any(|e| e.event == "clarification_raised"
             && e.message.as_deref()
                 == Some(r#"{"blocking":true,"question":"which auth scheme?"}"#)));
-        assert!(
-            events
-                .iter()
-                .any(|e| e.event == "tool_call"
-                    && e.message.as_deref() == Some("mcp__symphony__raise_clarification"))
-        );
+        assert!(events.iter().any(|e| e.event == "tool_call"
+            && e.message.as_deref() == Some("mcp__symphony__raise_clarification")));
     }
 
     #[test]

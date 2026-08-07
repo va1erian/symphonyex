@@ -1,4 +1,4 @@
-﻿//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
+//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
 //! (Section 7, 8, 16). One task owns all mutable scheduling state directly; worker
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
@@ -1911,8 +1911,14 @@ async fn run_turn_loop(
     let mut turn_number: u32 = 1;
     let mut last_message: Option<String> = None;
     loop {
-        let mut prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns, cycle)
-        {
+        let mut prompt = match render_turn_prompt(
+            prompt_template,
+            issue,
+            attempt,
+            turn_number,
+            max_turns,
+            cycle,
+        ) {
             Ok(p) => p,
             Err(e) => return (LoopExit::Error(format!("prompt error: {e}")), last_message),
         };
@@ -2164,7 +2170,13 @@ async fn run_pipeline(
             let backend = crate::roles::build_backend(&role, cfg);
             let title = format!("{}: {} [{}]", issue.identifier, issue.title, stage.id);
             match backend
-                .start_session(workspace_path, issue_id, &title, container, &role.tool_policy)
+                .start_session(
+                    workspace_path,
+                    issue_id,
+                    &title,
+                    container,
+                    &role.tool_policy,
+                )
                 .await
             {
                 Ok(s) => fresh_session = Some(s),
@@ -2284,7 +2296,8 @@ async fn run_pipeline(
         match outcome {
             LoopExit::Completed => {
                 if stage.requires_approval {
-                    let next_stage_id = cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
+                    let next_stage_id =
+                        cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
                     let auto_approved = handle_stage_approval(
                         issue_id,
                         issue,
@@ -2380,7 +2393,13 @@ async fn run_pipeline(
             // failure (AIR-4) -- same `block_issue` park, regardless of `stage.blocking`,
             // since this is the agent explicitly asking a human rather than an error.
             LoopExit::Blocked(question) => {
-                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, Some(&question)).await;
+                block_issue(
+                    snapshot,
+                    issue_id,
+                    &cfg.pipeline.blocked_state,
+                    Some(&question),
+                )
+                .await;
                 return ExitReason::Normal;
             }
             LoopExit::Error(reason) => {
@@ -2525,7 +2544,11 @@ async fn block_issue(
     blocked_state: &str,
     clarification: Option<&str>,
 ) {
-    if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
+    if let Err(e) = snapshot
+        .tracker
+        .set_issue_state(issue_id, blocked_state)
+        .await
+    {
         tracing::warn!(
             issue_id = %issue_id,
             blocked_state = %blocked_state,
@@ -2599,7 +2622,13 @@ async fn handle_stage_approval(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(issue_id = %issue_id, stage_id = %stage.id, error = %e, "failed to record pending approval; falling back to the plain blocking-stage park so the cycle doesn't silently spin");
-            block_issue(snapshot, issue_id, &cfg.pipeline.awaiting_approval_state, None).await;
+            block_issue(
+                snapshot,
+                issue_id,
+                &cfg.pipeline.awaiting_approval_state,
+                None,
+            )
+            .await;
             return false;
         }
     };
@@ -3260,7 +3289,10 @@ mod tests {
             config: cfg,
             prompt_template: String::new(),
             tracker: Arc::from(tracker_adapter),
-            agent_backend: Arc::new(ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new())),
+            agent_backend: Arc::new(ScriptedBackend::new(
+                Arc::new(Mutex::new(0)),
+                HashMap::new(),
+            )),
             workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
         };
 
@@ -3906,7 +3938,10 @@ mod tests {
         // Stopped right after the first turn of the first stage -- never even
         // finished out that stage's own turn budget (3), let alone started the
         // second stage.
-        assert_eq!(stages, vec![("started", "requirements"), ("finished", "requirements")]);
+        assert_eq!(
+            stages,
+            vec![("started", "requirements"), ("finished", "requirements")]
+        );
         assert!(msgs.iter().any(
             |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.contains("blocked: clarification"))
         ));
@@ -3967,7 +4002,10 @@ mod tests {
             .fetch_issues_by_ids(&["P-7".to_string()])
             .await
             .unwrap();
-        assert_eq!(refreshed[0].state, "todo", "non-blocking clarification must not park the issue");
+        assert_eq!(
+            refreshed[0].state, "todo",
+            "non-blocking clarification must not park the issue"
+        );
 
         let msgs = drain(rx).await;
         let stages = stage_events(&msgs);
@@ -4891,7 +4929,10 @@ mod tests {
     fn round_exceeds_limit_flips_once_the_next_round_would_pass_the_cap() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("symphony.db");
-        assert!(!round_exceeds_limit(&db, "1", 2), "round 1 of 2 is within the cap");
+        assert!(
+            !round_exceeds_limit(&db, "1", 2),
+            "round 1 of 2 is within the cap"
+        );
         crate::eventlog::record_rework_round(
             &db,
             &crate::eventlog::NewReworkRound {
@@ -4905,7 +4946,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!round_exceeds_limit(&db, "1", 2), "round 2 of 2 is still within the cap");
+        assert!(
+            !round_exceeds_limit(&db, "1", 2),
+            "round 2 of 2 is still within the cap"
+        );
         crate::eventlog::record_rework_round(
             &db,
             &crate::eventlog::NewReworkRound {
@@ -4919,7 +4963,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(round_exceeds_limit(&db, "1", 2), "round 3 of 2 exceeds the cap");
+        assert!(
+            round_exceeds_limit(&db, "1", 2),
+            "round 3 of 2 exceeds the cap"
+        );
     }
 
     /// AIR-7 acceptance criterion: the stage produces a schema-valid `review_findings`

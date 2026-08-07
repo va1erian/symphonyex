@@ -756,7 +756,11 @@ mod tests {
         put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
         let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
         assert_eq!(row.content, "[{\"id\":\"R1\"}]");
-        assert!(get_artifact(&db, "1", "acceptance_criteria").unwrap().is_none());
+        assert!(
+            get_artifact(&db, "1", "acceptance_criteria")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -764,7 +768,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("events.db");
         put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
-        put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"},{\"id\":\"R2\"}]").unwrap();
+        put_artifact(
+            &db,
+            "1",
+            "requirements",
+            "[{\"id\":\"R1\"},{\"id\":\"R2\"}]",
+        )
+        .unwrap();
         let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
         assert_eq!(row.content, "[{\"id\":\"R1\"},{\"id\":\"R2\"}]");
     }
@@ -778,7 +788,10 @@ mod tests {
         put_artifact(&db, "2", "requirements", "[\"other\"]").unwrap();
 
         assert_eq!(
-            get_artifact(&db, "1", "requirements").unwrap().unwrap().content,
+            get_artifact(&db, "1", "requirements")
+                .unwrap()
+                .unwrap()
+                .content,
             "[\"r\"]"
         );
         assert_eq!(
@@ -789,7 +802,10 @@ mod tests {
             "[\"ac\"]"
         );
         assert_eq!(
-            get_artifact(&db, "2", "requirements").unwrap().unwrap().content,
+            get_artifact(&db, "2", "requirements")
+                .unwrap()
+                .unwrap()
+                .content,
             "[\"other\"]"
         );
     }

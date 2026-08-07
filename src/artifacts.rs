@@ -177,7 +177,12 @@ struct Recorded {
 /// derived from the artifact's own bytes, so re-recording identical content on a retry
 /// resolves to the same id/path and the `ON CONFLICT` upsert below just refreshes
 /// `summary`/`stage_id`/`created_at` instead of erroring or duplicating a row.
-fn record(db_path: &Path, workflow_dir: &Path, new: &NewArtifact, bytes: &[u8]) -> Result<Recorded, String> {
+fn record(
+    db_path: &Path,
+    workflow_dir: &Path,
+    new: &NewArtifact,
+    bytes: &[u8],
+) -> Result<Recorded, String> {
     let unknown_kind = !KNOWN_KINDS.contains(&new.kind);
     if STRUCTURED_KINDS.contains(&new.kind) {
         validate_structured(new.kind, new.content_type, bytes)?;
@@ -309,7 +314,9 @@ pub async fn execute_tool(
             return ToolResult::error("provide either 'path' or 'content', not both");
         }
         (None, None) => {
-            return ToolResult::error("missing required argument: provide either 'path' or 'content'");
+            return ToolResult::error(
+                "missing required argument: provide either 'path' or 'content'",
+            );
         }
         (Some(path), None) => {
             let full = workspace_dir.join(path);
@@ -379,7 +386,11 @@ pub fn list_index(db_path: &Path, cycle_id: &str) -> Vec<ArtifactIndexEntry> {
             kind: row.kind.clone(),
             stage: row.stage_id,
             summary: row.summary,
-            path: format!("{WORKSPACE_ARTIFACTS_DIR}/{}.{}", row.kind, ext_for(&row.content_type)),
+            path: format!(
+                "{WORKSPACE_ARTIFACTS_DIR}/{}.{}",
+                row.kind,
+                ext_for(&row.content_type)
+            ),
         })
         .collect()
 }
@@ -388,7 +399,9 @@ pub fn list_for_cycle(db_path: &Path, cycle_id: &str) -> Vec<ArtifactRow> {
     let Ok(conn) = eventlog::open(db_path) else {
         return Vec::new();
     };
-    let sql = format!("SELECT {SELECT_COLUMNS} FROM artifacts WHERE cycle_id = ?1 ORDER BY created_at ASC");
+    let sql = format!(
+        "SELECT {SELECT_COLUMNS} FROM artifacts WHERE cycle_id = ?1 ORDER BY created_at ASC"
+    );
     let Ok(mut stmt) = conn.prepare(&sql) else {
         return Vec::new();
     };
@@ -449,7 +462,8 @@ pub fn prepare_workspace_for_stage(
     let _ = std::fs::create_dir_all(&dest_dir);
     // Latest row per kind: a `for` over `list_for_cycle`'s ascending order means a
     // later kind-match simply overwrites the map entry, leaving the newest.
-    let mut latest_by_kind: std::collections::HashMap<String, ArtifactRow> = std::collections::HashMap::new();
+    let mut latest_by_kind: std::collections::HashMap<String, ArtifactRow> =
+        std::collections::HashMap::new();
     for row in list_for_cycle(db_path, cycle_id) {
         latest_by_kind.insert(row.kind.clone(), row);
     }
@@ -521,13 +535,25 @@ mod tests {
             "content": "87%",
             "summary": "Line coverage"
         });
-        let first = execute_tool(&db, dir.path(), &workspace, "issue-2", "issue-2", args.clone()).await;
+        let first = execute_tool(
+            &db,
+            dir.path(),
+            &workspace,
+            "issue-2",
+            "issue-2",
+            args.clone(),
+        )
+        .await;
         assert!(first.success);
         let second = execute_tool(&db, dir.path(), &workspace, "issue-2", "issue-2", args).await;
         assert!(second.success);
 
         let rows = list_for_cycle(&db, "issue-2");
-        assert_eq!(rows.len(), 1, "identical retry must not create a second row");
+        assert_eq!(
+            rows.len(),
+            1,
+            "identical retry must not create a second row"
+        );
     }
 
     #[tokio::test]

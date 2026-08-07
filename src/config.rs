@@ -475,7 +475,9 @@ pub struct ReviewConfig {
 
 impl Default for ReviewConfig {
     fn default() -> Self {
-        Self { max_rework_rounds: 2 }
+        Self {
+            max_rework_rounds: 2,
+        }
     }
 }
 
@@ -991,8 +993,12 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                         on_failure: get_str(s, "on_failure")
                             .map(|v| StageFailureAction::parse(&v))
                             .unwrap_or(StageFailureAction::Escalate),
-                        blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
-                        optional: get(s, "optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                        blocking: get(s, "blocking")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        optional: get(s, "optional")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         requires_approval: get(s, "requires_approval")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false),
@@ -1074,7 +1080,11 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 Some(rel) => {
                     let path = envsub::resolve_path(&rel, workflow_dir);
                     let content = std::fs::read_to_string(&path).map_err(|e| {
-                        ConfigError::UnreadableRolePromptFile(name.clone(), rel.clone(), e.to_string())
+                        ConfigError::UnreadableRolePromptFile(
+                            name.clone(),
+                            rel.clone(),
+                            e.to_string(),
+                        )
                     })?;
                     Some(content)
                 }

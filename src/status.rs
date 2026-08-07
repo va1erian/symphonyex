@@ -969,7 +969,8 @@ async fn requirements_page(
     };
 
     let db = state.eventlog_db_path();
-    let requirements_artifact = eventlog::get_artifact(&db, &issue_id, "requirements").unwrap_or_default();
+    let requirements_artifact =
+        eventlog::get_artifact(&db, &issue_id, "requirements").unwrap_or_default();
     let requirements: Vec<serde_json::Value> = requirements_artifact
         .as_ref()
         .and_then(|a| serde_json::from_str(&a.content).ok())
@@ -991,7 +992,8 @@ async fn requirements_page(
         event_type: Some("clarification_raised".to_string()),
         include_low_importance: true,
     };
-    let clarifications = eventlog::recent_events(&db, &clarification_filter, 100, 0).unwrap_or_default();
+    let clarifications =
+        eventlog::recent_events(&db, &clarification_filter, 100, 0).unwrap_or_default();
     let has_blocking = clarifications.iter().any(|c| {
         c.message
             .as_deref()
@@ -1009,15 +1011,15 @@ async fn requirements_page(
         r#"<tr><td colspan="5" class="empty">No acceptance criteria recorded yet.</td></tr>"#
             .to_string()
     } else {
-        acceptance_criteria.iter().map(acceptance_criterion_row).collect()
+        acceptance_criteria
+            .iter()
+            .map(acceptance_criterion_row)
+            .collect()
     };
     let clarification_items: String = if clarifications.is_empty() {
         r#"<p class="empty">No clarifications raised.</p>"#.to_string()
     } else {
-        clarifications
-            .iter()
-            .map(clarification_item)
-            .collect()
+        clarifications.iter().map(clarification_item).collect()
     };
 
     let unblock_form = if has_blocking {
@@ -1135,7 +1137,10 @@ fn clarification_item(e: &eventlog::EventRow) -> String {
         .get("question")
         .and_then(|v| v.as_str())
         .unwrap_or("(no question given)");
-    let blocking = parsed.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
+    let blocking = parsed
+        .get("blocking")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let requirement_id = parsed.get("requirement_id").and_then(|v| v.as_str());
     let kind = if blocking {
         r#"<span class="badge" style="background:#c0392b">blocking</span>"#
@@ -1171,7 +1176,10 @@ struct ReviewsQuery {
     issue: Option<String>,
 }
 
-async fn reviews_page(State(state): State<AppState>, Query(q): Query<ReviewsQuery>) -> Html<String> {
+async fn reviews_page(
+    State(state): State<AppState>,
+    Query(q): Query<ReviewsQuery>,
+) -> Html<String> {
     let base = state.base_path.as_str();
     let Some(issue_id) = q.issue.filter(|s| !s.is_empty()) else {
         let body = format!(
@@ -1464,7 +1472,11 @@ async fn unblock_review(
 /// copy-pasted twice. Rebuilds a short-lived tracker adapter from `WORKFLOW.md` per
 /// request, same as `mcp.rs`'s pipeline-tool gating does in the MCP subprocess -- this
 /// dashboard has no long-lived tracker handle of its own.
-async fn resume_cycle(state: &AppState, issue_id: &str, headers: &HeaderMap) -> Result<(), Response> {
+async fn resume_cycle(
+    state: &AppState,
+    issue_id: &str,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
     if !admin_token_allows(headers) {
         return Err((StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response());
     }
@@ -1489,21 +1501,28 @@ async fn resume_cycle(state: &AppState, issue_id: &str, headers: &HeaderMap) -> 
         )
             .into_response());
     };
-    let adapter = crate::tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, &state.workflow_dir)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to build tracker adapter: {e}"),
-            )
-                .into_response()
-        })?;
-    adapter.set_issue_state(issue_id, target_state).await.map_err(|e| {
+    let adapter = crate::tracker::build(
+        &cfg.tracker_kind,
+        &cfg.tracker_provider,
+        &state.workflow_dir,
+    )
+    .map_err(|e| {
         (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to move issue back to an active state: {e}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build tracker adapter: {e}"),
         )
             .into_response()
-    })
+    })?;
+    adapter
+        .set_issue_state(issue_id, target_state)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("failed to move issue back to an active state: {e}"),
+            )
+                .into_response()
+        })
 }
 
 // --------------------------------------------------------------------------------

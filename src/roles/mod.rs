@@ -56,7 +56,9 @@ pub fn resolve(role_name: &str, cfg: &EffectiveConfig) -> Result<ResolvedRole, S
     let backend_override = project.and_then(|r| r.backend);
     let model_override = project.and_then(|r| r.model.clone());
     let backend = backend_override.unwrap_or(cfg.agent_backend);
-    let model = model_override.clone().or_else(|| default_model_for(backend, cfg));
+    let model = model_override
+        .clone()
+        .or_else(|| default_model_for(backend, cfg));
     // AIR-7: a project's `roles.<name>.tools` always wins when set; absent one, a
     // built-in role gets its own default posture (the Reviewer's is `ToolPolicy::SWEBOT`
     // -- "a Reviewer that can edit files is not a reviewer", roadmap §4 -- same as
@@ -125,10 +127,8 @@ mod tests {
     use serde_json::json;
 
     fn test_cfg(yaml_extra: &str) -> EffectiveConfig {
-        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-            "tracker:\n  kind: local\n{yaml_extra}"
-        ))
-        .unwrap();
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&format!("tracker:\n  kind: local\n{yaml_extra}")).unwrap();
         crate::config::resolve(&yaml, std::path::Path::new(".")).unwrap()
     }
 
@@ -158,7 +158,10 @@ mod tests {
             "roles:\n  reviewer:\n    prompt: \"Custom reviewer prompt for {{ issue.identifier }}\"\n",
         );
         let role = resolve("reviewer", &cfg).unwrap();
-        assert_eq!(role.prompt, "Custom reviewer prompt for {{ issue.identifier }}");
+        assert_eq!(
+            role.prompt,
+            "Custom reviewer prompt for {{ issue.identifier }}"
+        );
     }
 
     #[test]

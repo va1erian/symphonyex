@@ -369,7 +369,9 @@ pub async fn run(cfg: EffectiveConfig, tracker: Arc<dyn TrackerAdapter>) {
 /// construction, verdict routing) without spawning a real `claude` process.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::agent::{AgentBackend, AgentError, AgentEvent, AgentSession, ToolPolicy, TurnOutcome};
+    use crate::agent::{
+        AgentBackend, AgentError, AgentEvent, AgentSession, ToolPolicy, TurnOutcome,
+    };
     use crate::container::ContainerHandle;
     use async_trait::async_trait;
     use std::path::Path;
