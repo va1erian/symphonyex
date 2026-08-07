@@ -24,10 +24,10 @@ use crate::eventlog;
 use crate::web::{escape, urlencode};
 use axum::Router;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -137,6 +137,11 @@ pub fn router(
         .route("/usage", get(usage_page))
         .route("/artifacts", get(artifacts_page))
         .route("/artifacts/{id}", get(artifact_raw_page))
+        .route("/requirements", get(requirements_page))
+        .route(
+            "/requirements/{issue_id}/unblock",
+            post(unblock_clarification),
+        )
         .with_state(state)
 }
 
@@ -859,6 +864,313 @@ async fn artifact_raw_page(
         "",
         base,
     )))
+}
+
+// --------------------------------------------------------------------------------
+// /requirements -- AIR-4's requirements/acceptance-criteria/clarification panel: the
+// requirements stage's own state+history+explain surface, read straight from
+// `eventlog::artifacts_for_issue` (the `requirements`/`acceptance_criteria` artifacts)
+// and `eventlog::recent_events` (`clarification_raised`, already recorded whenever
+// `raise_clarification` is called -- see `agent/claude.rs`/`orchestrator.rs`). The one
+// action this panel implies -- resuming a cycle a blocking clarification parked -- is
+// `unblock_clarification` below: a real POST, not a link.
+// --------------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct RequirementsQuery {
+    issue: Option<String>,
+}
+
+async fn requirements_page(
+    State(state): State<AppState>,
+    Query(q): Query<RequirementsQuery>,
+) -> Html<String> {
+    let base = state.base_path.as_str();
+    let Some(issue_id) = q.issue.filter(|s| !s.is_empty()) else {
+        let body = format!(
+            r#"<p>Pass an issue id, e.g. <code>{base}/requirements?issue=1</code>. \
+               Find one on the <a href="{base}/events">Events</a> page.</p>"#
+        );
+        return Html(page_shell("requirements", "/requirements", &body, "", base));
+    };
+
+    let db = state.eventlog_db_path();
+    let requirements_artifact = eventlog::get_artifact(&db, &issue_id, "requirements").unwrap_or_default();
+    let requirements: Vec<serde_json::Value> = requirements_artifact
+        .as_ref()
+        .and_then(|a| serde_json::from_str(&a.content).ok())
+        .unwrap_or_default();
+    let acceptance_criteria_artifact =
+        eventlog::get_artifact(&db, &issue_id, "acceptance_criteria").unwrap_or_default();
+    let acceptance_criteria: Vec<serde_json::Value> = acceptance_criteria_artifact
+        .as_ref()
+        .and_then(|a| serde_json::from_str(&a.content).ok())
+        .unwrap_or_default();
+    let last_updated = [&requirements_artifact, &acceptance_criteria_artifact]
+        .into_iter()
+        .flatten()
+        .map(|a| a.created_at.clone())
+        .max();
+
+    let clarification_filter = eventlog::EventFilter {
+        issue_id: Some(issue_id.clone()),
+        event_type: Some("clarification_raised".to_string()),
+        include_low_importance: true,
+    };
+    let clarifications = eventlog::recent_events(&db, &clarification_filter, 100, 0).unwrap_or_default();
+    let has_blocking = clarifications.iter().any(|c| {
+        c.message
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("blocking").and_then(|b| b.as_bool()))
+            == Some(true)
+    });
+
+    let req_rows: String = if requirements.is_empty() {
+        r#"<tr><td colspan="6" class="empty">No requirements recorded yet.</td></tr>"#.to_string()
+    } else {
+        requirements.iter().map(requirement_row).collect()
+    };
+    let ac_rows: String = if acceptance_criteria.is_empty() {
+        r#"<tr><td colspan="5" class="empty">No acceptance criteria recorded yet.</td></tr>"#
+            .to_string()
+    } else {
+        acceptance_criteria.iter().map(acceptance_criterion_row).collect()
+    };
+    let clarification_items: String = if clarifications.is_empty() {
+        r#"<p class="empty">No clarifications raised.</p>"#.to_string()
+    } else {
+        clarifications
+            .iter()
+            .map(clarification_item)
+            .collect()
+    };
+
+    let unblock_form = if has_blocking {
+        format!(
+            r#"<form method="post" action="{base}/requirements/{issue_link}/unblock">
+  <button type="submit">Mark answered &amp; resume cycle</button>
+  <span class="empty">Parks are lifted by moving the issue back to an active tracker state; make sure a human has actually answered the question above first.</span>
+</form>"#,
+            issue_link = urlencode(&issue_id),
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r#"<form class="filters" method="get">
+  <label for="f-issue">Issue</label>
+  <input type="text" id="f-issue" name="issue" placeholder="issue id" value="{issue}">
+  <button type="submit">Load</button>
+  <a href="{base}/events?issue={issue_link}">View raw events for this issue</a>
+</form>
+<div class="meta">{last_updated}</div>
+
+<section>
+<h3>Requirements <span class="badge">{req_count}</span></h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>ID</th><th>Type</th><th>Statement</th><th>Constraint</th><th>Dependency</th><th>Assumption</th></tr></thead>
+<tbody>{req_rows}</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h3>Acceptance criteria <span class="badge">{ac_count}</span></h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>ID</th><th>Requirements</th><th>Given</th><th>When</th><th>Then</th></tr></thead>
+<tbody>{ac_rows}</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<h3>Clarifications <span class="badge">{cl_count}</span></h3>
+{clarification_items}
+{unblock_form}
+</section>"#,
+        issue = escape(&issue_id),
+        issue_link = urlencode(&issue_id),
+        last_updated = last_updated
+            .map(|t| format!("last recorded {}", escape(&t)))
+            .unwrap_or_else(|| "nothing recorded yet for this issue".to_string()),
+        req_count = requirements.len(),
+        ac_count = acceptance_criteria.len(),
+        cl_count = clarifications.len(),
+        req_rows = req_rows,
+        ac_rows = ac_rows,
+        clarification_items = clarification_items,
+        unblock_form = unblock_form,
+    );
+    Html(page_shell("requirements", "/requirements", &body, "", base))
+}
+
+fn requirement_row(r: &serde_json::Value) -> String {
+    let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let assumption = r
+        .get("assumption")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    format!(
+        "<tr><td>{id}</td><td>{ty}</td><td>{statement}</td><td>{constraint}</td><td>{dependency}</td><td>{assumption}</td></tr>",
+        id = escape(get("id")),
+        ty = escape(get("type")),
+        statement = escape(get("statement")),
+        constraint = escape(get("constraint")),
+        dependency = escape(get("dependency")),
+        assumption = if assumption { "yes" } else { "" },
+    )
+}
+
+fn acceptance_criterion_row(a: &serde_json::Value) -> String {
+    let get = |k: &str| a.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let requirement_ids: String = a
+        .get("requirement_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!(
+        "<tr><td>{id}</td><td>{reqs}</td><td>{given}</td><td>{when}</td><td>{then}</td></tr>",
+        id = escape(get("id")),
+        reqs = escape(&requirement_ids),
+        given = escape(get("given")),
+        when = escape(get("when")),
+        then = escape(get("then")),
+    )
+}
+
+/// One `clarification_raised` event, parsed back out of its JSON `message` (the raw
+/// `raise_clarification` tool arguments -- see `agent/claude.rs`) -- the explanation
+/// surface this panel owes a human: not just "the cycle stopped" but the exact
+/// question, whether it was blocking, and which requirement (if any) it concerns.
+fn clarification_item(e: &eventlog::EventRow) -> String {
+    let parsed = e
+        .message
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .unwrap_or_default();
+    let question = parsed
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no question given)");
+    let blocking = parsed.get("blocking").and_then(|v| v.as_bool()).unwrap_or(false);
+    let requirement_id = parsed.get("requirement_id").and_then(|v| v.as_str());
+    let kind = if blocking {
+        r#"<span class="badge" style="background:#c0392b">blocking</span>"#
+    } else {
+        r#"<span class="badge">non-blocking (assumption)</span>"#
+    };
+    let req_note = requirement_id
+        .map(|r| format!(" &middot; concerns {}", escape(r)))
+        .unwrap_or_default();
+    format!(
+        r#"<div class="card"><div class="row">{kind}{req_note} &middot; {at}</div><div class="row">{question}</div></div>"#,
+        kind = kind,
+        req_note = req_note,
+        at = escape(&e.created_at),
+        question = escape(question),
+    )
+}
+
+fn admin_token_allows(headers: &HeaderMap) -> bool {
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        // No token configured: same open-by-default posture the rest of this
+        // dashboard already has (Section 13.7 -- loopback-only, not hardened for
+        // exposure beyond the local machine). Setting SYMPHONY_ADMIN_TOKEN opts a
+        // deployment into requiring it here too.
+        return true;
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    if bearer == Some(expected.as_str()) {
+        return true;
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .into_iter()
+        .flat_map(|s| s.split(';'))
+        .filter_map(|part| part.trim().strip_prefix("symphony_admin="))
+        .any(|token| token == expected)
+}
+
+/// Resumes a cycle a blocking `raise_clarification` parked: moves the issue back to
+/// the project's first configured `tracker.active_states` entry, the same
+/// `TrackerAdapter::set_issue_state` host-side path `orchestrator::block_issue` used
+/// to park it (AIR-1's dispatch loop then simply picks it back up on its own, same as
+/// any other active-state issue -- no separate "resume" mechanism needed). Rebuilds a
+/// short-lived tracker adapter from `WORKFLOW.md` per request, same as `mcp.rs`'s
+/// pipeline-tool gating does in the MCP subprocess -- this dashboard has no long-lived
+/// tracker handle of its own.
+async fn unblock_clarification(
+    State(state): State<AppState>,
+    AxumPath(issue_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !admin_token_allows(&headers) {
+        return (StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response();
+    }
+    let def = match crate::workflow::load(&state.workflow_dir.join("WORKFLOW.md")) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load WORKFLOW.md: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let cfg = match crate::config::resolve(&def.config, &state.workflow_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to resolve config: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let Some(target_state) = cfg.active_states.first() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "project has no tracker.active_states configured",
+        )
+            .into_response();
+    };
+    let adapter = match crate::tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, &state.workflow_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build tracker adapter: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = adapter.set_issue_state(&issue_id, target_state).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to move issue back to an active state: {e}"),
+        )
+            .into_response();
+    }
+    Redirect::to(&format!(
+        "{}/requirements?issue={}",
+        state.base_path,
+        urlencode(&issue_id)
+    ))
+    .into_response()
 }
 
 #[cfg(test)]

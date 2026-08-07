@@ -117,6 +117,18 @@ pub trait TrackerAdapter: Send + Sync {
             "set_issue_state is not supported by this tracker adapter".to_string(),
         ))
     }
+
+    /// Post a host-side comment on the issue itself, host-side like `set_issue_state`
+    /// (not through `execute_agent_tool`). Used by the delivery pipeline's
+    /// `raise_clarification` tool (AIR-4) to surface a blocking question directly on
+    /// the tracker issue where the adapter supports it; a tracker that doesn't (the
+    /// default) falls back to the question being recorded in the event log and
+    /// dashboard only. Default: unsupported, like `create_issue`/`set_issue_state`.
+    async fn post_comment(&self, _issue_id: &str, _body: &str) -> Result<(), TrackerError> {
+        Err(TrackerError::Request(
+            "post_comment is not supported by this tracker adapter".to_string(),
+        ))
+    }
 }
 
 /// Construct the configured tracker adapter. Returns `UnsupportedTrackerKind` for any

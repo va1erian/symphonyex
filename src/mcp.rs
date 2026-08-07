@@ -16,7 +16,7 @@
 
 use crate::artifacts;
 use crate::repo_host::RepoHost;
-use crate::tracker::{ToolResult, TrackerAdapter};
+use crate::tracker::{ToolResult, ToolSpec, TrackerAdapter};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,19 +31,213 @@ pub struct ArtifactsWiring {
     pub workflow_dir: PathBuf,
 }
 
-/// Route a `tools/call` to whichever of the three independent tool sources actually
-/// owns `name` (Section "PR-based branch workflow", AIR-3): the tracker's own tools
-/// (e.g. `update_issue_state`), `record_artifact` (owned by the cycle, not the tracker
-/// or the code host -- checked first since it never overlaps with the other two), or,
-/// when `repo.pull_request` is enabled, `open_pull_request`/`attach_evidence` from
-/// `repo_host`. `tracker_names` decides tracker routing explicitly (not by matching on
-/// the tracker's own "unsupported tool" error text, which would be fragile).
+/// The delivery pipeline's own second tool source (AIR-4), independent of tracker kind,
+/// repo host, and of `ArtifactsWiring`/`record_artifact` above -- `record_requirements`,
+/// `record_acceptance_criteria` and `raise_clarification` are properties of the
+/// pipeline stage running, not of any particular tracker/host integration, so (like the
+/// "PR-based branch workflow" note on `route_call` explains for `open_pull_request`)
+/// they get their own tool source rather than being bolted onto `TrackerAdapter` or
+/// `RepoHost`. Only constructed when `pipeline.enabled` (main.rs), so a project not
+/// using the pipeline never sees these tools at all. Uses its own storage
+/// (`eventlog::put_artifact`/`get_artifact`, the `artifact_snapshots` table) rather
+/// than `crate::artifacts`' file-based store -- a known duplication worth reconciling
+/// later, not unified here.
+pub struct PipelineToolCtx {
+    /// `workflow_dir/symphony.db` -- the same event log/artifact store the running
+    /// orchestrator process writes to (Section: `eventlog.rs`).
+    pub db_path: PathBuf,
+}
+
+fn pipeline_tool_specs() -> Vec<ToolSpec> {
+    vec![
+        ToolSpec {
+            name: "record_requirements".to_string(),
+            description: "Record the full, current set of validated requirements for \
+                this issue (replaces any previously recorded set). Call this once you \
+                have extracted every requirement you're confident about -- do not \
+                invent a requirement you're not sure of; call raise_clarification \
+                instead."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "requirements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Stable id, e.g. 'R1'"},
+                                "statement": {"type": "string"},
+                                "source": {"type": "string", "description": "Where this came from, e.g. 'issue description' or 'DEMO-1 depends_on'"},
+                                "type": {"type": "string", "enum": ["functional", "non_functional"]},
+                                "constraint": {"type": "string", "description": "Set for a constraint this requirement imposes (e.g. a performance/security/operability bound)"},
+                                "dependency": {"type": "string", "description": "Set when this requirement is blocked on another issue (from depends_on)"},
+                                "assumption": {"type": "boolean", "description": "true if this requirement was decided via a non-blocking clarification rather than stated explicitly"}
+                            },
+                            "required": ["id", "statement", "source", "type"]
+                        }
+                    }
+                },
+                "required": ["requirements"]
+            }),
+        },
+        ToolSpec {
+            name: "record_acceptance_criteria".to_string(),
+            description: "Record the full, current set of acceptance criteria for this \
+                issue (replaces any previously recorded set). Each criterion must \
+                reference the requirement id(s) it verifies."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "acceptance_criteria": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string", "description": "Stable id, e.g. 'AC1'"},
+                                "requirement_ids": {"type": "array", "items": {"type": "string"}},
+                                "given": {"type": "string"},
+                                "when": {"type": "string"},
+                                "then": {"type": "string"}
+                            },
+                            "required": ["id", "requirement_ids", "given", "when", "then"]
+                        }
+                    }
+                },
+                "required": ["acceptance_criteria"]
+            }),
+        },
+        ToolSpec {
+            name: "raise_clarification".to_string(),
+            description: "Ask about a requirement you cannot resolve instead of \
+                guessing. `blocking: true` stops this cycle and parks the issue until \
+                a human answers (use this when guessing wrong would be costly or \
+                irreversible). `blocking: false` means you'll proceed on a documented \
+                assumption -- follow up by calling record_requirements with that \
+                requirement's `assumption: true`."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "blocking": {"type": "boolean"},
+                    "requirement_id": {"type": "string", "description": "The requirement id this clarification concerns, if any"}
+                },
+                "required": ["question", "blocking"]
+            }),
+        },
+    ]
+}
+
+fn json_array_or_error(value: &Value, field: &str) -> Result<Vec<Value>, ToolResult> {
+    value
+        .get(field)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| ToolResult::error(format!("missing required array argument '{field}'")))
+}
+
+/// `record_requirements`/`record_acceptance_criteria` each store their argument
+/// verbatim as the artifact's JSON content after a light shape check (every item has
+/// its required string/array fields) -- schema conformance for the artifact itself is
+/// enforced here so a malformed entry is rejected before it's ever persisted, rather
+/// than trusting the agent's JSON blindly.
+fn execute_pipeline_tool(ctx: &PipelineToolCtx, name: &str, arguments: Value, issue_id: &str) -> ToolResult {
+    match name {
+        "record_requirements" => {
+            let items = match json_array_or_error(&arguments, "requirements") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            for (i, item) in items.iter().enumerate() {
+                for field in ["id", "statement", "source", "type"] {
+                    if item.get(field).and_then(|v| v.as_str()).is_none() {
+                        return ToolResult::error(format!(
+                            "requirements[{i}] is missing required string field '{field}'"
+                        ));
+                    }
+                }
+                let ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty != "functional" && ty != "non_functional" {
+                    return ToolResult::error(format!(
+                        "requirements[{i}].type must be 'functional' or 'non_functional', got '{ty}'"
+                    ));
+                }
+            }
+            let count = items.len();
+            let content = Value::Array(items).to_string();
+            match crate::eventlog::put_artifact(&ctx.db_path, issue_id, "requirements", &content) {
+                Ok(()) => ToolResult::ok(format!("Recorded {count} requirement(s).")),
+                Err(e) => ToolResult::error(format!("failed to record requirements: {e}")),
+            }
+        }
+        "record_acceptance_criteria" => {
+            let items = match json_array_or_error(&arguments, "acceptance_criteria") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            for (i, item) in items.iter().enumerate() {
+                for field in ["id", "given", "when", "then"] {
+                    if item.get(field).and_then(|v| v.as_str()).is_none() {
+                        return ToolResult::error(format!(
+                            "acceptance_criteria[{i}] is missing required string field '{field}'"
+                        ));
+                    }
+                }
+                if item.get("requirement_ids").and_then(|v| v.as_array()).is_none() {
+                    return ToolResult::error(format!(
+                        "acceptance_criteria[{i}] is missing required array field 'requirement_ids'"
+                    ));
+                }
+            }
+            let content = Value::Array(items).to_string();
+            match crate::eventlog::put_artifact(&ctx.db_path, issue_id, "acceptance_criteria", &content) {
+                Ok(()) => ToolResult::ok("Recorded acceptance criteria.".to_string()),
+                Err(e) => ToolResult::error(format!("failed to record acceptance criteria: {e}")),
+            }
+        }
+        "raise_clarification" => {
+            let Some(question) = arguments.get("question").and_then(|v| v.as_str()) else {
+                return ToolResult::error("missing required argument 'question'");
+            };
+            let Some(blocking) = arguments.get("blocking").and_then(|v| v.as_bool()) else {
+                return ToolResult::error("missing required argument 'blocking'");
+            };
+            if blocking {
+                ToolResult::ok(format!(
+                    "Recorded blocking clarification: {question}. The cycle will stop \
+                     once this turn ends and the issue will be parked until a human answers."
+                ))
+            } else {
+                ToolResult::ok(format!(
+                    "Recorded non-blocking clarification: {question}. Proceed on your \
+                     best judgement, then call record_requirements with this \
+                     requirement's assumption: true so a reviewer sees what you decided."
+                ))
+            }
+        }
+        other => ToolResult::error(format!("unsupported tool '{other}'")),
+    }
+}
+
+/// Route a `tools/call` to whichever of the (up to three) independent tool sources
+/// actually owns `name` (Section "PR-based branch workflow"): the tracker's own tools
+/// (e.g. `update_issue_state`), `open_pull_request` from `repo_host` when
+/// `repo.pull_request` is enabled, or (AIR-4) the delivery pipeline's own
+/// `record_requirements`/`record_acceptance_criteria`/`raise_clarification` when
+/// `pipeline.enabled`. Each is a property of a different thing (the tracker, the code
+/// host, the pipeline stage running) so none of them is folded into another.
+/// `tracker_names`/`pipeline_names` decide routing explicitly (not by matching on an
+/// "unsupported tool" error text, which would be fragile).
 #[allow(clippy::too_many_arguments)]
 async fn route_call(
     adapter: &dyn TrackerAdapter,
     repo_host: Option<&dyn RepoHost>,
     artifacts_wiring: Option<&ArtifactsWiring>,
+    pipeline: Option<&PipelineToolCtx>,
     tracker_names: &HashSet<&str>,
+    pipeline_names: &HashSet<&str>,
     name: &str,
     arguments: Value,
     issue_id: &str,
@@ -67,6 +261,11 @@ async fn route_call(
     }
     if tracker_names.contains(name) {
         adapter.execute_agent_tool(name, arguments, issue_id).await
+    } else if pipeline_names.contains(name) {
+        match pipeline {
+            Some(ctx) => execute_pipeline_tool(ctx, name, arguments, issue_id),
+            None => ToolResult::error(format!("unsupported tool '{name}'")),
+        }
     } else if let Some(host) = repo_host {
         host.execute_agent_tool(name, arguments, issue_id, workspace_dir)
             .await
@@ -79,6 +278,7 @@ pub async fn run_stdio_server(
     adapter: Box<dyn TrackerAdapter>,
     repo_host: Option<Box<dyn RepoHost>>,
     artifacts_wiring: Option<ArtifactsWiring>,
+    pipeline: Option<PipelineToolCtx>,
     issue_id: &str,
     workspace_dir: &Path,
 ) -> anyhow::Result<()> {
@@ -92,11 +292,18 @@ pub async fn run_stdio_server(
     } else {
         Vec::new()
     };
+    let pipeline_specs = if pipeline.is_some() {
+        pipeline_tool_specs()
+    } else {
+        Vec::new()
+    };
     let tracker_names: HashSet<&str> = tracker_specs.iter().map(|s| s.name.as_str()).collect();
+    let pipeline_names: HashSet<&str> = pipeline_specs.iter().map(|s| s.name.as_str()).collect();
     let specs: Vec<_> = tracker_specs
         .iter()
         .chain(repo_specs.iter())
         .chain(artifact_specs.iter())
+        .chain(pipeline_specs.iter())
         .collect();
 
     let stdin = tokio::io::stdin();
@@ -153,7 +360,9 @@ pub async fn run_stdio_server(
                     adapter.as_ref(),
                     repo_host.as_deref(),
                     artifacts_wiring.as_ref(),
+                    pipeline.as_ref(),
                     &tracker_names,
+                    &pipeline_names,
                     name,
                     arguments,
                     issue_id,
@@ -290,7 +499,9 @@ mod tests {
             &tracker,
             Some(&host),
             None,
+            None,
             &names,
+            &HashSet::new(),
             "update_issue_state",
             json!({}),
             "1",
@@ -324,7 +535,9 @@ mod tests {
             &tracker,
             Some(&host),
             None,
+            None,
             &names,
+            &HashSet::new(),
             "open_pull_request",
             json!({"title": "t", "body": "b"}),
             "1",
@@ -344,7 +557,9 @@ mod tests {
             &tracker,
             None,
             None,
+            None,
             &names,
+            &HashSet::new(),
             "nonexistent",
             json!({}),
             "1",
@@ -376,14 +591,40 @@ mod tests {
         let tracker = FakeTracker;
         let specs = tracker.agent_tool_specs();
         let names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let empty_pipeline_names: HashSet<&str> = HashSet::new();
 
         let result = route_call(
             &tracker,
             None,
             None,
+            None,
             &names,
+            &empty_pipeline_names,
             "record_artifact",
             json!({}),
+            "1",
+            Path::new("."),
+        )
+        .await;
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn pipeline_tool_is_unsupported_without_pipeline_enabled() {
+        let tracker = FakeTracker;
+        let specs = tracker.agent_tool_specs();
+        let tracker_names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let pipeline_names: HashSet<&str> = ["raise_clarification"].into_iter().collect();
+
+        let result = route_call(
+            &tracker,
+            None,
+            None,
+            None,
+            &tracker_names,
+            &pipeline_names,
+            "raise_clarification",
+            json!({"question": "which auth scheme?", "blocking": true}),
             "1",
             Path::new("."),
         )
@@ -403,12 +644,15 @@ mod tests {
         let tracker = FakeTracker;
         let specs = tracker.agent_tool_specs();
         let names: HashSet<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        let empty_pipeline_names: HashSet<&str> = HashSet::new();
 
         let result = route_call(
             &tracker,
             None,
             Some(&wiring),
+            None,
             &names,
+            &empty_pipeline_names,
             "record_artifact",
             json!({
                 "kind": "plan",
@@ -421,5 +665,102 @@ mod tests {
         )
         .await;
         assert!(result.success, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn record_requirements_rejects_missing_fields_and_bad_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = PipelineToolCtx {
+            db_path: dir.path().join("symphony.db"),
+        };
+        let missing_source = execute_pipeline_tool(
+            &ctx,
+            "record_requirements",
+            json!({"requirements": [{"id": "R1", "statement": "s", "type": "functional"}]}),
+            "1",
+        );
+        assert!(!missing_source.success);
+
+        let bad_type = execute_pipeline_tool(
+            &ctx,
+            "record_requirements",
+            json!({"requirements": [{"id": "R1", "statement": "s", "source": "x", "type": "nope"}]}),
+            "1",
+        );
+        assert!(!bad_type.success);
+    }
+
+    #[tokio::test]
+    async fn record_requirements_then_record_acceptance_criteria_round_trip_via_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = PipelineToolCtx {
+            db_path: dir.path().join("symphony.db"),
+        };
+        let req_result = execute_pipeline_tool(
+            &ctx,
+            "record_requirements",
+            json!({"requirements": [
+                {"id": "R1", "statement": "Users can log in", "source": "issue body", "type": "functional"},
+                {"id": "R2", "statement": "p99 < 200ms", "source": "issue body", "type": "non_functional", "constraint": "performance"},
+                {"id": "R3", "statement": "Export respects the new schema", "source": "issue depends_on", "type": "functional", "dependency": "DEMO-2"}
+            ]}),
+            "42",
+        );
+        assert!(req_result.success, "{}", req_result.content);
+
+        let ac_result = execute_pipeline_tool(
+            &ctx,
+            "record_acceptance_criteria",
+            json!({"acceptance_criteria": [
+                {"id": "AC1", "requirement_ids": ["R1"], "given": "a user", "when": "they submit valid credentials", "then": "they are logged in"}
+            ]}),
+            "42",
+        );
+        assert!(ac_result.success, "{}", ac_result.content);
+
+        let reqs = crate::eventlog::get_artifact(&ctx.db_path, "42", "requirements")
+            .unwrap()
+            .unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&reqs.content).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["id"], "R1");
+        assert_eq!(parsed[1]["constraint"], "performance");
+        assert_eq!(parsed[2]["dependency"], "DEMO-2");
+
+        let acs = crate::eventlog::get_artifact(&ctx.db_path, "42", "acceptance_criteria")
+            .unwrap()
+            .unwrap();
+        let parsed_ac: Vec<Value> = serde_json::from_str(&acs.content).unwrap();
+        assert_eq!(parsed_ac[0]["id"], "AC1");
+        assert_eq!(parsed_ac[0]["requirement_ids"], json!(["R1"]));
+    }
+
+    #[tokio::test]
+    async fn raise_clarification_requires_question_and_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = PipelineToolCtx {
+            db_path: dir.path().join("symphony.db"),
+        };
+        let missing_blocking =
+            execute_pipeline_tool(&ctx, "raise_clarification", json!({"question": "q?"}), "1");
+        assert!(!missing_blocking.success);
+
+        let blocking_ok = execute_pipeline_tool(
+            &ctx,
+            "raise_clarification",
+            json!({"question": "which auth scheme?", "blocking": true}),
+            "1",
+        );
+        assert!(blocking_ok.success);
+        assert!(blocking_ok.content.contains("stop"));
+
+        let non_blocking_ok = execute_pipeline_tool(
+            &ctx,
+            "raise_clarification",
+            json!({"question": "default page size?", "blocking": false}),
+            "1",
+        );
+        assert!(non_blocking_ok.success);
+        assert!(non_blocking_ok.content.contains("assumption"));
     }
 }

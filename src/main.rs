@@ -293,7 +293,23 @@ async fn run_mcp_tool_server(
         db_path: workflow_dir.join(eventlog::DB_FILENAME),
         workflow_dir: workflow_dir.to_path_buf(),
     });
-    match mcp::run_stdio_server(adapter, repo_host, artifacts_wiring, issue_id, workspace_dir).await {
+    // AIR-4's own tools (`record_requirements`/`record_acceptance_criteria`/
+    // `raise_clarification`) are gated on the same already-threaded `pipeline_enabled`
+    // flag `artifacts_wiring` above uses, rather than AIR-4's original approach of
+    // re-loading and re-resolving WORKFLOW.md from scratch inside this subprocess.
+    let pipeline = pipeline_enabled.then(|| mcp::PipelineToolCtx {
+        db_path: workflow_dir.join(eventlog::DB_FILENAME),
+    });
+    match mcp::run_stdio_server(
+        adapter,
+        repo_host,
+        artifacts_wiring,
+        pipeline,
+        issue_id,
+        workspace_dir,
+    )
+    .await
+    {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");

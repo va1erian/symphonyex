@@ -16,7 +16,7 @@ use crate::template;
 use crate::tracker::{self, TrackerAdapter};
 use crate::workflow;
 use crate::workspace::{DockerContext, WorkspaceManager};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1590,6 +1590,14 @@ async fn run_attempt_body(
         {
             LoopExit::Completed | LoopExit::EndedByIssueState => ExitReason::Normal,
             LoopExit::Error(e) => ExitReason::Error(e),
+            // `raise_clarification` is only exposed when `pipeline.enabled` (gated in
+            // `mcp.rs`), so this arm is unreachable on the legacy single-stage path --
+            // handled rather than `unreachable!()` since a future tool-exposure change
+            // elsewhere shouldn't be able to panic the whole worker over this.
+            LoopExit::Blocked(question) => {
+                tracing::warn!(issue_id = %issue_id, question = %question, "raise_clarification called outside the delivery pipeline; ignoring");
+                ExitReason::Normal
+            }
         }
     };
 
@@ -1609,6 +1617,12 @@ enum LoopExit {
     Completed,
     EndedByIssueState,
     Error(String),
+    /// A turn called `raise_clarification` with `blocking: true` (AIR-4): the cycle
+    /// stops right away rather than running out the stage's remaining turn budget,
+    /// same as a blocking stage failure -- `run_pipeline` parks the issue in
+    /// `pipeline.blocked_state` via the same `block_issue` path. Carries the question
+    /// only for the `stage_finished` event message.
+    Blocked(String),
 }
 
 /// Runs 1..=`max_turns` turns of `session` against `issue`, refreshing tracker state
@@ -1656,8 +1670,9 @@ async fn run_turn_loop(
         });
 
         match run_one_turn(session, &prompt, issue_id, tx).await {
-            Ok(TurnOutcome::Completed { .. }) => {}
-            Ok(TurnOutcome::Failed { reason }) => {
+            Ok((_, Some(question))) => return LoopExit::Blocked(question),
+            Ok((TurnOutcome::Completed { .. }, None)) => {}
+            Ok((TurnOutcome::Failed { reason }, None)) => {
                 return LoopExit::Error(format!("agent turn error: {reason}"));
             }
             Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
@@ -1722,6 +1737,29 @@ async fn run_pipeline(
     let artifacts_db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
 
     for stage in &cfg.pipeline.stages {
+        // AIR-4: an `optional: true` stage can be opted out of per-issue by labeling
+        // the issue `skip-<stage-id>` -- checked before role resolution, since a
+        // skipped stage never actually runs a role.
+        let skip_label = format!("skip-{}", stage.id.trim().to_lowercase());
+        if stage.optional
+            && issue
+                .labels
+                .iter()
+                .any(|l| l.trim().to_lowercase() == skip_label)
+        {
+            let _ = tx.send(OrchMsg::StageStarted {
+                issue_id: issue_id.to_string(),
+                stage_id: stage.id.clone(),
+                role_summary: format!("{} — skipped", stage.id),
+            });
+            let _ = tx.send(OrchMsg::StageFinished {
+                issue_id: issue_id.to_string(),
+                stage_id: stage.id.clone(),
+                outcome: format!("skipped: issue labeled 'skip-{}'", stage.id),
+            });
+            continue;
+        }
+
         let role = match crate::roles::resolve(&stage.role, cfg) {
             Ok(r) => r,
             Err(e) => return ExitReason::Error(format!("stage '{}' role error: {e}", stage.id)),
@@ -1834,6 +1872,9 @@ async fn run_pipeline(
                 format!("failed, skipped: {reason}")
             }
             LoopExit::Error(reason) => format!("failed: {reason}"),
+            LoopExit::Blocked(question) => {
+                format!("blocked: clarification needed: {question}")
+            }
         };
         previous_stage_summary = format!("{}: {outcome_label}", stage.id);
         let _ = tx.send(OrchMsg::StageFinished {
@@ -1845,6 +1886,13 @@ async fn run_pipeline(
         match outcome {
             LoopExit::Completed => continue,
             LoopExit::EndedByIssueState => return ExitReason::Normal,
+            // A blocking clarification stops the cycle exactly like a blocking stage
+            // failure (AIR-4) -- same `block_issue` park, regardless of `stage.blocking`,
+            // since this is the agent explicitly asking a human rather than an error.
+            LoopExit::Blocked(question) => {
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, Some(&question)).await;
+                return ExitReason::Normal;
+            }
             LoopExit::Error(reason) => {
                 if stage.on_failure == StageFailureAction::Skip {
                     continue;
@@ -1858,7 +1906,7 @@ async fn run_pipeline(
                 // phrase and schedules the long, coordinated pause instead of the
                 // normal short backoff.
                 if stage.blocking && !is_plan_rate_limited(&reason) {
-                    block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                    block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
                     return ExitReason::Normal;
                 }
                 return ExitReason::Error(format!("stage '{}' failed: {reason}", stage.id));
@@ -1876,14 +1924,26 @@ fn backend_label(backend: AgentBackendKind) -> &'static str {
     }
 }
 
-/// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure --
-/// deliberately host-side (`TrackerAdapter::set_issue_state`, not the agent-facing
-/// `update_issue_state` tool): the decision to stop the cycle is the orchestrator's,
-/// not something to ask the (just-failed) agent to report on its own behalf. A tracker
-/// adapter that doesn't support this (the default) logs a warning rather than failing
-/// the cycle outright -- the cycle still stops via `ExitReason::Normal` either way,
-/// this only affects whether the tracker's own state reflects why.
-async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state: &str) {
+/// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure or a
+/// blocking clarification (AIR-4) -- deliberately host-side
+/// (`TrackerAdapter::set_issue_state`, not the agent-facing `update_issue_state`
+/// tool): the decision to stop the cycle is the orchestrator's, not something to ask
+/// the (just-failed) agent to report on its own behalf. A tracker adapter that doesn't
+/// support this (the default) logs a warning rather than failing the cycle outright --
+/// the cycle still stops via `ExitReason::Normal` either way, this only affects
+/// whether the tracker's own state reflects why.
+///
+/// `clarification` is `Some(question)` for a blocking `raise_clarification` call, in
+/// which case the question is also posted as a comment on the issue where the tracker
+/// adapter supports it (`TrackerAdapter::post_comment`, also default-unsupported --
+/// the question is still visible either way via the `clarification_raised` event
+/// already recorded when the tool was called).
+async fn block_issue(
+    snapshot: &DispatchSnapshot,
+    issue_id: &str,
+    blocked_state: &str,
+    clarification: Option<&str>,
+) {
     if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
         tracing::warn!(
             issue_id = %issue_id,
@@ -1892,28 +1952,61 @@ async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state:
             "failed to park issue in pipeline.blocked_state after a blocking stage failure"
         );
     }
+    if let Some(question) = clarification {
+        let body = format!(
+            "**Symphony: clarification needed before this cycle can continue.**\n\n\
+             {question}\n\n\
+             Reply on this issue (or edit its file directly, for the local tracker) \
+             with an answer, then move it back to an active state to resume."
+        );
+        if let Err(e) = snapshot.tracker.post_comment(issue_id, &body).await {
+            tracing::info!(
+                issue_id = %issue_id,
+                error = %e,
+                "tracker adapter does not support post_comment; clarification is recorded in the event log/dashboard only"
+            );
+        }
+    }
 }
 
+/// `Some(question)` if this turn called `raise_clarification` with `blocking: true`
+/// (AIR-4) -- extracted alongside forwarding so `run_turn_loop` can stop the cycle
+/// without a second pass over the event stream.
 async fn run_one_turn(
     session: &mut dyn AgentSession,
     prompt: &str,
     issue_id: &str,
     tx: &mpsc::UnboundedSender<OrchMsg>,
-) -> Result<TurnOutcome, crate::agent::AgentError> {
+) -> Result<(TurnOutcome, Option<String>), crate::agent::AgentError> {
     let (etx, mut erx) = mpsc::unbounded_channel::<AgentEvent>();
     let fwd_issue_id = issue_id.to_string();
     let fwd_tx = tx.clone();
     let forward = tokio::spawn(async move {
+        let mut blocked_on: Option<String> = None;
         while let Some(ev) = erx.recv().await {
+            if ev.event == "clarification_raised"
+                && let Some(msg) = &ev.message
+                && let Ok(payload) = serde_json::from_str::<Value>(msg)
+                && payload.get("blocking").and_then(|b| b.as_bool()) == Some(true)
+            {
+                blocked_on = Some(
+                    payload
+                        .get("question")
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("(no question given)")
+                        .to_string(),
+                );
+            }
             let _ = fwd_tx.send(OrchMsg::AgentEvent {
                 issue_id: fwd_issue_id.clone(),
                 event: ev,
             });
         }
+        blocked_on
     });
     let result = session.run_turn(prompt, etx).await;
-    let _ = forward.await;
-    result
+    let blocked_on = forward.await.unwrap_or(None);
+    result.map(|outcome| (outcome, blocked_on))
 }
 
 fn render_turn_prompt(
@@ -2709,5 +2802,441 @@ mod tests {
             state.rate_limited_until.is_none(),
             "an expired pause must be cleared"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-4: raise_clarification (blocking/non-blocking), optional stage skip, and
+    // the requirements stage picking up its builtin role prompt.
+    // -----------------------------------------------------------------------------
+
+    /// Like `ScriptedBackend`, but additionally records every prompt it's given (to
+    /// prove a stage with a matching `role` actually runs the builtin role prompt
+    /// instead of the project's own template -- `roles::builtin_prompt`) and can be
+    /// scripted to report a `raise_clarification` call (as the real agent event
+    /// stream would: a `clarification_raised` event alongside `turn_completed`,
+    /// exactly what `agent/claude.rs::handle_message` emits) on a given turn.
+    struct ClarifyingBackend {
+        calls: Arc<Mutex<u32>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        /// `(turn number, blocking)` -- `None` means never raise a clarification.
+        clarify_on_turn: Option<(u32, bool)>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ClarifyingBackend {
+        async fn start_session(
+            &self,
+            _workspace: &Path,
+            _issue_id: &str,
+            _title: &str,
+            _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
+        ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
+            Ok(Box::new(ClarifyingSession {
+                calls: self.calls.clone(),
+                prompts: self.prompts.clone(),
+                clarify_on_turn: self.clarify_on_turn,
+            }))
+        }
+    }
+
+    struct ClarifyingSession {
+        calls: Arc<Mutex<u32>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        clarify_on_turn: Option<(u32, bool)>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for ClarifyingSession {
+        fn session_id(&self) -> &str {
+            "clarifying-session"
+        }
+
+        async fn run_turn(
+            &mut self,
+            prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let n = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if let Some((turn, blocking)) = self.clarify_on_turn
+                && turn == n
+            {
+                let _ = events.send(AgentEvent::new("clarification_raised").with_message(
+                    json!({"question": "which auth scheme?", "blocking": blocking}).to_string(),
+                ));
+            }
+            let _ = events.send(AgentEvent::new("turn_completed"));
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    fn clarifying_snapshot(
+        tracker_dir: &Path,
+        stages_yaml: &str,
+        backend: ClarifyingBackend,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n{stages_yaml}"
+        ))
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(backend),
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_clarification_stops_the_cycle_and_parks_the_issue() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-6");
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 3\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: Some((1, true)),
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-6".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-6".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "blocked");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        // Stopped right after the first turn of the first stage -- never even
+        // finished out that stage's own turn budget (3), let alone started the
+        // second stage.
+        assert_eq!(stages, vec![("started", "requirements"), ("finished", "requirements")]);
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.contains("blocked: clarification"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_blocking_clarification_does_not_stop_the_cycle() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-7");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: calls.clone(),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: Some((1, false)),
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-7".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        assert_eq!(*calls.lock().unwrap(), 2, "both stages' turns ran");
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-7".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "todo", "non-blocking clarification must not park the issue");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_stage_is_skipped_when_issue_carries_its_skip_label() {
+        let tracker_dir = tempdir().unwrap();
+        std::fs::write(
+            tracker_dir.path().join("P-8.md"),
+            "---\nidentifier: P-8\ntitle: Test issue\nstate: todo\nlabels: [skip-requirements]\n---\nbody\n",
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n    optional: true\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: calls.clone(),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-8".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        // Only `implement`'s one turn ran -- `requirements` was skipped entirely.
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { stage_id, outcome, .. } if stage_id == "requirements" && outcome.starts_with("skipped"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn requirements_stage_runs_the_builtin_role_prompt() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-9");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: prompts.clone(),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-9".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        // The `requirements` stage got its builtin role prompt (mentions the tools
+        // it's meant to call)...
+        assert!(prompts[0].contains("record_requirements"));
+        assert!(prompts[0].contains("raise_clarification"));
+        // ...and `implement` (role "developer") got *its own* distinct builtin role
+        // prompt (AIR-2 ships one for every one of the eight roadmap roles, not just
+        // "requirements") -- proven by it being non-empty and different from
+        // `requirements`'s, not by falling back to the project's own template.
+        assert_ne!(prompts[1], "");
+        assert_ne!(prompts[1], prompts[0]);
+    }
+
+    /// AIR-4 acceptance criterion: "Requirements with `depends_on` blockers list them
+    /// under `dependency`." The requirements stage's prompt (`roles::builtin_prompt`)
+    /// is the thing that has to make the blocker visible to the agent so it can put it
+    /// in the `dependency` field it hands to `record_requirements` -- this proves
+    /// `issue.blocked_by` (populated by `depends_on` resolution, `tracker::depends_on`)
+    /// actually reaches the rendered prompt text.
+    #[tokio::test]
+    async fn requirements_prompt_surfaces_depends_on_blockers() {
+        let tracker_dir = tempdir().unwrap();
+        std::fs::write(
+            tracker_dir.path().join("BLOCKER.md"),
+            "---\nidentifier: BLOCKER\ntitle: Prerequisite\nstate: todo\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tracker_dir.path().join("P-10.md"),
+            "---\nidentifier: P-10\ntitle: Test issue\nstate: todo\ndepends_on: [BLOCKER]\n---\nbody\n",
+        )
+        .unwrap();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: prompts.clone(),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-10".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            issue.blocked_by[0].identifier.as_deref(),
+            Some("BLOCKER"),
+            "sanity check: depends_on resolution populated blocked_by"
+        );
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts[0].contains("BLOCKER"), "{}", prompts[0]);
     }
 }
