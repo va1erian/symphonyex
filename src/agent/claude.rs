@@ -21,7 +21,7 @@
 //! (`--allowedTools mcp__symphony__*`) independent of `permission_mode`, since they are
 //! host-mediated and adapter-scoped, not raw command/file access.
 
-use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome};
 use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -68,6 +68,7 @@ impl AgentBackend for ClaudeBackend {
         issue_id: &str,
         _title: &str,
         container: Option<&ContainerHandle>,
+        tool_policy: &ToolPolicy,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         let mcp_config_path = match &self.mcp_wiring {
             Some(wiring) => match write_mcp_config(workspace, wiring, issue_id, container) {
@@ -85,7 +86,7 @@ impl AgentBackend for ClaudeBackend {
 
         Ok(Box::new(ClaudeSession {
             command: self.command.clone(),
-            extra_args: self.extra_args.clone(),
+            extra_args: tool_policy_extra_args(&self.extra_args, tool_policy),
             model: self.model.clone(),
             permission_mode: self.permission_mode.clone(),
             turn_timeout_ms: self.turn_timeout_ms,
@@ -100,6 +101,27 @@ impl AgentBackend for ClaudeBackend {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
+}
+
+/// Translate a `ToolPolicy` (AIR-2) into `claude`'s own `--disallowedTools` flag,
+/// appended after `base` -- the backend-native mechanism this used to be SweBot's own
+/// hardcoded `--disallowedTools Edit,Write,NotebookEdit` (see `swebot::mod`'s history),
+/// now shared by any restricted session (SweBot, or a pipeline role with
+/// `tools.allow_edits: false`).
+fn tool_policy_extra_args(base: &[String], policy: &ToolPolicy) -> Vec<String> {
+    let mut args = base.to_vec();
+    let mut disallowed: Vec<&str> = Vec::new();
+    if !policy.allow_edits {
+        disallowed.extend(["Edit", "Write", "NotebookEdit"]);
+    }
+    if !policy.allow_commands {
+        disallowed.push("Bash");
+    }
+    if !disallowed.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(disallowed.join(","));
+    }
+    args
 }
 
 /// Write `<workspace>/.symphony-mcp.json` pointing back at `symphony __mcp_tool_server`
@@ -512,5 +534,37 @@ mod tests {
         let v = json!({"type": "system"});
         assert_eq!(extract_text(&v), None);
         assert!(extract_tool_uses(&v).is_empty());
+    }
+
+    #[test]
+    fn unrestricted_tool_policy_adds_no_flags() {
+        let args = tool_policy_extra_args(&["--verbose".to_string()], &ToolPolicy::default());
+        assert_eq!(args, vec!["--verbose".to_string()]);
+    }
+
+    #[test]
+    fn edits_denied_produces_disallowed_tools_flag() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: true,
+        };
+        let args = tool_policy_extra_args(&[], &policy);
+        assert_eq!(
+            args,
+            vec![
+                "--disallowedTools".to_string(),
+                "Edit,Write,NotebookEdit".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_denied_adds_bash_to_disallowed_tools() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: false,
+        };
+        let args = tool_policy_extra_args(&[], &policy);
+        assert_eq!(args[1], "Edit,Write,NotebookEdit,Bash");
     }
 }

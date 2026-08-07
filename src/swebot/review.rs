@@ -16,7 +16,7 @@
 //! provider-specific error text.
 
 use super::{PERSONA, extract_json_block, git, run_turn_collect_text};
-use crate::agent::AgentBackend;
+use crate::agent::{AgentBackend, ToolPolicy};
 use crate::config::EffectiveConfig;
 use crate::repo_host::{RepoHost, ReviewVerdict, extract_closes_issue_number};
 use crate::tracker::TrackerAdapter;
@@ -104,6 +104,7 @@ pub async fn poll_once(
                 &pr.number.to_string(),
                 &format!("PR #{}", pr.number),
                 None,
+                &ToolPolicy::SWEBOT,
             )
             .await
             .map_err(|e| e.to_string())?;

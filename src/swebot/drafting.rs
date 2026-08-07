@@ -25,7 +25,7 @@ use super::{
     PERSONA, answered_marker, extract_json_block, next_to_answer, run_turn_collect_text,
     transcript_up_to,
 };
-use crate::agent::AgentBackend;
+use crate::agent::{AgentBackend, ToolPolicy};
 use crate::config::EffectiveConfig;
 use crate::repo_host::DiscussionHost;
 use crate::tracker::TrackerAdapter;
@@ -69,6 +69,7 @@ pub async fn poll_once(
                 &thread.number.to_string(),
                 &thread.title,
                 None,
+                &ToolPolicy::SWEBOT,
             )
             .await
             .map_err(|e| e.to_string())?;
