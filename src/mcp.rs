@@ -62,7 +62,6 @@ pub struct PipelineToolCtx {
 /// running) so none of them is folded into another. `tracker_names`/`pipeline_names`
 /// decide routing explicitly (not by matching on an "unsupported tool" error text,
 /// which would be fragile).
-
 fn pipeline_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {

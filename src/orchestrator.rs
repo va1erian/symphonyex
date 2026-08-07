@@ -1913,13 +1913,19 @@ async fn run_pipeline(
                 {
                     let round = crate::eventlog::record_rework_round(
                         &artifacts_db_path,
-                        issue_id,
-                        &issue.identifier,
-                        &issue.title,
-                        &stage.id,
-                        &recommendation,
-                        &summary,
-                        round_exceeds_limit(&artifacts_db_path, issue_id, cfg.pipeline.review.max_rework_rounds),
+                        &crate::eventlog::NewReworkRound {
+                            issue_id,
+                            identifier: &issue.identifier,
+                            title: &issue.title,
+                            stage_id: &stage.id,
+                            recommendation: &recommendation,
+                            summary: &summary,
+                            escalated: round_exceeds_limit(
+                                &artifacts_db_path,
+                                issue_id,
+                                cfg.pipeline.review.max_rework_rounds,
+                            ),
+                        },
                     )
                     .unwrap_or(1);
                     if round > cfg.pipeline.review.max_rework_rounds as i64 {
@@ -2077,8 +2083,7 @@ fn latest_review_recommendation(
 ) -> Option<(String, String)> {
     let row = crate::artifacts::list_for_cycle(db_path, issue_id)
         .into_iter()
-        .filter(|r| r.kind == "review_findings" && r.stage_id.as_deref() == Some(stage_id))
-        .next_back()?;
+        .rfind(|r| r.kind == "review_findings" && r.stage_id.as_deref() == Some(stage_id))?;
     let bytes = crate::artifacts::read_content(workflow_dir, &row).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let recommendation = value.get("recommendation")?.as_str()?.to_string();
@@ -3345,5 +3350,112 @@ mod tests {
 
         let prompts = prompts.lock().unwrap();
         assert!(prompts[0].contains("BLOCKER"), "{}", prompts[0]);
+    }
+
+    fn stage(id: &str, role: &str) -> config::StageConfig {
+        config::StageConfig {
+            id: id.to_string(),
+            role: role.to_string(),
+            max_turns: 1,
+            on_failure: StageFailureAction::Retry,
+            blocking: false,
+            optional: false,
+        }
+    }
+
+    /// AIR-7: the rework loop resends to the *nearest* earlier `role: developer`
+    /// stage, not always the pipeline's first one.
+    #[test]
+    fn developer_stage_index_finds_the_nearest_earlier_developer_stage() {
+        let stages = vec![
+            stage("implement", "developer"),
+            stage("harden", "developer"),
+            stage("review", "reviewer"),
+        ];
+        assert_eq!(developer_stage_index(&stages, 2), Some(1));
+    }
+
+    #[test]
+    fn developer_stage_index_is_none_when_no_earlier_developer_stage_exists() {
+        let stages = vec![stage("review", "reviewer")];
+        assert_eq!(developer_stage_index(&stages, 0), None);
+    }
+
+    /// AIR-7 acceptance criterion: exceeding `pipeline.review.max_rework_rounds`
+    /// escalates instead of looping.
+    #[test]
+    fn round_exceeds_limit_flips_once_the_next_round_would_pass_the_cap() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("symphony.db");
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 1 of 2 is within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 1",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 2 of 2 is still within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 2",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(round_exceeds_limit(&db, "1", 2), "round 3 of 2 exceeds the cap");
+    }
+
+    /// AIR-7 acceptance criterion: the stage produces a schema-valid `review_findings`
+    /// artifact that the rework loop can read a recommendation back out of.
+    #[tokio::test]
+    async fn latest_review_recommendation_reads_the_recorded_artifact_back() {
+        let dir = tempdir().unwrap();
+        let workflow_dir = dir.path().to_path_buf();
+        let db = workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".symphony")).unwrap();
+        std::fs::write(workspace.join(".symphony/current-stage"), "review").unwrap();
+
+        let content = json!({
+            "schema_version": 1,
+            "recommendation": "request_changes",
+            "findings": [],
+            "unmet_acceptance_criteria": ["AC3"],
+            "over_implementation": []
+        })
+        .to_string();
+        let result = crate::artifacts::execute_tool(
+            &db,
+            &workflow_dir,
+            &workspace,
+            "issue-1",
+            "issue-1",
+            json!({
+                "kind": "review_findings",
+                "content_type": "application/json",
+                "content": content,
+                "summary": "requests changes: AC3 unmet"
+            }),
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
+
+        let (recommendation, summary) =
+            latest_review_recommendation(&workflow_dir, &db, "issue-1", "review").unwrap();
+        assert_eq!(recommendation, "request_changes");
+        assert_eq!(summary, "requests changes: AC3 unmet");
     }
 }

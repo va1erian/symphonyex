@@ -250,11 +250,16 @@ mod tests {
         let ctx = json!({
             "issue": serde_json::to_value(&issue).unwrap(),
             "attempt": Some(1),
+            "rubric": {
+                "persona": crate::review_rubric::PERSONA,
+                "checklist": crate::review_rubric::CHECKLIST,
+            },
             "cycle": {
                 "id": "AIR-2-1",
                 "stage": "review",
                 "artifacts": {},
                 "previous_stage_summary": "implement: completed",
+                "diff_path": ".symphony/review.diff",
             },
         });
         for name in builtin::ROLE_NAMES {

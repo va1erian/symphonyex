@@ -142,6 +142,8 @@ pub fn router(
             "/requirements/{issue_id}/unblock",
             post(unblock_clarification),
         )
+        .route("/reviews", get(reviews_page))
+        .route("/reviews/{issue_id}/unblock", post(unblock_review))
         .with_state(state)
 }
 
@@ -889,8 +891,7 @@ fn latest_artifact(
 ) -> Option<artifacts::ArtifactRow> {
     artifacts::list_for_cycle(db_path, issue_id)
         .into_iter()
-        .filter(|r| r.kind == kind)
-        .next_back()
+        .rfind(|r| r.kind == kind)
 }
 
 /// Parses a `requirements`/`acceptance_criteria` artifact's stored content
@@ -1112,6 +1113,238 @@ fn clarification_item(e: &eventlog::EventRow) -> String {
     )
 }
 
+// --------------------------------------------------------------------------------
+// /reviews -- AIR-7's Reviewer-stage state+history+explain surface: the
+// `review_findings` artifacts a cycle's Reviewer stage has recorded (read from the
+// same `crate::artifacts` store `/artifacts` browses, per-cycle history, not just the
+// latest -- a human reviewing a rework loop needs to see how the verdict changed round
+// over round) plus the `rework_round` events `eventlog::rework_rounds_for_issue`
+// returns. The one action this panel implies -- resuming a cycle the rework loop
+// escalated past `pipeline.review.max_rework_rounds` -- is `unblock_review` above: a
+// real POST, not a link, same pattern `/requirements`'s clarification panel already
+// uses for the same kind of park.
+// --------------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct ReviewsQuery {
+    issue: Option<String>,
+}
+
+async fn reviews_page(State(state): State<AppState>, Query(q): Query<ReviewsQuery>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let Some(issue_id) = q.issue.filter(|s| !s.is_empty()) else {
+        let body = format!(
+            r#"<p>Pass an issue id, e.g. <code>{base}/reviews?issue=1</code>. \
+               Find one on the <a href="{base}/events">Events</a> page.</p>"#
+        );
+        return Html(page_shell("reviews", "/reviews", &body, "", base));
+    };
+
+    let db = state.eventlog_db_path();
+    let findings_rows: Vec<artifacts::ArtifactRow> = artifacts::list_for_cycle(&db, &issue_id)
+        .into_iter()
+        .filter(|r| r.kind == "review_findings")
+        .collect();
+    // Most-recent-first from the store; oldest-first here so "round N" numbering
+    // (the rework loop's own counter, `eventlog::record_rework_round`) reads
+    // top-to-bottom in the order it actually happened.
+    let mut rounds = eventlog::rework_rounds_for_issue(&db, &issue_id).unwrap_or_default();
+    rounds.reverse();
+    let escalated = rounds.iter().any(|r| {
+        r.message
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("escalated").and_then(|b| b.as_bool()))
+            == Some(true)
+    });
+
+    let review_cards: String = if findings_rows.is_empty() {
+        r#"<p class="empty">No review findings recorded yet.</p>"#.to_string()
+    } else {
+        findings_rows
+            .iter()
+            .rev()
+            .map(|r| review_card(&state.workflow_dir, r))
+            .collect()
+    };
+
+    let round_rows: String = if rounds.is_empty() {
+        r#"<tr><td colspan="4" class="empty">No rework rounds recorded.</td></tr>"#.to_string()
+    } else {
+        rounds
+            .iter()
+            .enumerate()
+            .map(|(i, r)| rework_round_row(i + 1, r))
+            .collect()
+    };
+
+    let unblock_form = if escalated {
+        format!(
+            r#"<form method="post" action="{base}/reviews/{issue_link}/unblock">
+  <button type="submit">Resume cycle</button>
+  <span class="empty">This cycle was escalated after exceeding pipeline.review.max_rework_rounds. Make sure a human has actually addressed the findings above before resuming.</span>
+</form>"#,
+            issue_link = urlencode(&issue_id),
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r#"<form class="filters" method="get">
+  <label for="f-issue">Issue</label>
+  <input type="text" id="f-issue" name="issue" placeholder="issue id" value="{issue}">
+  <button type="submit">Load</button>
+  <a href="{base}/events?issue={issue_link}">View raw events for this issue</a>
+</form>
+
+<section>
+<h3>Review findings <span class="badge">{count}</span></h3>
+{review_cards}
+</section>
+
+<section>
+<h3>Rework rounds <span class="badge">{round_count}</span></h3>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Round</th><th>Stage</th><th>Recommendation</th><th>Escalated</th></tr></thead>
+<tbody>{round_rows}</tbody>
+</table>
+</div>
+{unblock_form}
+</section>"#,
+        issue = escape(&issue_id),
+        issue_link = urlencode(&issue_id),
+        count = findings_rows.len(),
+        review_cards = review_cards,
+        round_count = rounds.len(),
+        round_rows = round_rows,
+        unblock_form = unblock_form,
+    );
+    Html(page_shell("reviews", "/reviews", &body, "", base))
+}
+
+/// One recorded `review_findings` artifact, rendered as the explanation surface a
+/// human needs: the verdict, the unmet acceptance criteria and over-implementation
+/// call-outs, and the finding-by-finding table -- not just "the cycle stopped."
+fn review_card(workflow_dir: &std::path::Path, row: &artifacts::ArtifactRow) -> String {
+    let value: serde_json::Value = artifacts::read_content(workflow_dir, row)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let recommendation = value
+        .get("recommendation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let rec_color = match recommendation {
+        "approve" => "#2e7d32",
+        "request_changes" => "#c0392b",
+        _ => "#7f8c8d",
+    };
+    let findings = value
+        .get("findings")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let finding_rows: String = if findings.is_empty() {
+        r#"<tr><td colspan="6" class="empty">No findings.</td></tr>"#.to_string()
+    } else {
+        findings.iter().map(finding_row).collect()
+    };
+    let unmet = value
+        .get("unmet_acceptance_criteria")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(escape)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    let over = value
+        .get("over_implementation")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(escape)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    format!(
+        r#"<div class="card">
+  <div class="row"><span class="badge" style="background:{rec_color}">{recommendation}</span> &middot; stage {stage} &middot; {at}</div>
+  <div class="row"><b>unmet acceptance criteria</b> {unmet}</div>
+  <div class="row"><b>over-implementation</b> {over}</div>
+  <div class="table-wrap">
+  <table>
+  <thead><tr><th>ID</th><th>Severity</th><th>Category</th><th>File</th><th>Requirement</th><th>Summary</th></tr></thead>
+  <tbody>{finding_rows}</tbody>
+  </table>
+  </div>
+</div>"#,
+        rec_color = rec_color,
+        recommendation = escape(recommendation),
+        stage = escape(row.stage_id.as_deref().unwrap_or("-")),
+        at = escape(&row.created_at),
+        unmet = unmet,
+        over = over,
+        finding_rows = finding_rows,
+    )
+}
+
+fn finding_row(f: &serde_json::Value) -> String {
+    let get = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let line = f.get("line").and_then(|v| v.as_i64());
+    let file = match line {
+        Some(n) => format!("{}:{n}", get("file")),
+        None => get("file").to_string(),
+    };
+    format!(
+        "<tr><td>{id}</td><td>{severity}</td><td>{category}</td><td>{file}</td><td>{requirement}</td><td>{summary}</td></tr>",
+        id = escape(get("id")),
+        severity = escape(get("severity")),
+        category = escape(get("category")),
+        file = escape(&file),
+        requirement = escape(get("requirement_id")),
+        summary = escape(get("summary")),
+    )
+}
+
+/// One `rework_round` event (`eventlog::record_rework_round`'s JSON `message`),
+/// `round` numbered in the order it happened (see `reviews_page`'s `rounds.reverse()`).
+fn rework_round_row(round: usize, r: &eventlog::EventRow) -> String {
+    let parsed = r
+        .message
+        .as_deref()
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .unwrap_or_default();
+    let stage = parsed.get("stage").and_then(|v| v.as_str()).unwrap_or("-");
+    let recommendation = parsed
+        .get("recommendation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let escalated = parsed
+        .get("escalated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    format!(
+        "<tr><td>{round}</td><td>{stage}</td><td>{recommendation}</td><td>{escalated}</td></tr>",
+        round = round,
+        stage = escape(stage),
+        recommendation = escape(recommendation),
+        escalated = if escalated {
+            r#"<span class="badge" style="background:#c0392b">yes</span>"#
+        } else {
+            "no"
+        },
+    )
+}
+
 fn admin_token_allows(headers: &HeaderMap) -> bool {
     let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
     if expected.is_empty() {
@@ -1150,59 +1383,86 @@ async fn unblock_clarification(
     AxumPath(issue_id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    if !admin_token_allows(&headers) {
-        return (StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response();
+    match resume_cycle(&state, &issue_id, &headers).await {
+        Ok(()) => Redirect::to(&format!(
+            "{}/requirements?issue={}",
+            state.base_path,
+            urlencode(&issue_id)
+        ))
+        .into_response(),
+        Err(resp) => resp,
     }
-    let def = match crate::workflow::load(&state.workflow_dir.join("WORKFLOW.md")) {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load WORKFLOW.md: {e}"),
-            )
-                .into_response();
-        }
-    };
-    let cfg = match crate::config::resolve(&def.config, &state.workflow_dir) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to resolve config: {e}"),
-            )
-                .into_response();
-        }
-    };
+}
+
+/// AIR-7: resumes a cycle the Reviewer stage's rework loop escalated (exceeded
+/// `pipeline.review.max_rework_rounds`) -- same mechanism `unblock_clarification`
+/// (AIR-4) uses to lift a blocking-clarification park, since both are just "move the
+/// issue back to an active tracker state and let AIR-1's dispatch loop pick it back
+/// up" (see `resume_cycle` below). A human should have actually acted on the findings
+/// on `/reviews` first; this control doesn't verify that, same as
+/// `unblock_clarification` doesn't verify the clarification was actually answered.
+async fn unblock_review(
+    State(state): State<AppState>,
+    AxumPath(issue_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    match resume_cycle(&state, &issue_id, &headers).await {
+        Ok(()) => Redirect::to(&format!(
+            "{}/reviews?issue={}",
+            state.base_path,
+            urlencode(&issue_id)
+        ))
+        .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Moves `issue_id` back to the project's first configured `tracker.active_states`
+/// entry -- the one park-lifting action both `/requirements` (blocking clarification)
+/// and `/reviews` (rework-round escalation) need, factored out rather than
+/// copy-pasted twice. Rebuilds a short-lived tracker adapter from `WORKFLOW.md` per
+/// request, same as `mcp.rs`'s pipeline-tool gating does in the MCP subprocess -- this
+/// dashboard has no long-lived tracker handle of its own.
+async fn resume_cycle(state: &AppState, issue_id: &str, headers: &HeaderMap) -> Result<(), Response> {
+    if !admin_token_allows(headers) {
+        return Err((StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response());
+    }
+    let def = crate::workflow::load(&state.workflow_dir.join("WORKFLOW.md")).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load WORKFLOW.md: {e}"),
+        )
+            .into_response()
+    })?;
+    let cfg = crate::config::resolve(&def.config, &state.workflow_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to resolve config: {e}"),
+        )
+            .into_response()
+    })?;
     let Some(target_state) = cfg.active_states.first() else {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             "project has no tracker.active_states configured",
         )
-            .into_response();
+            .into_response());
     };
-    let adapter = match crate::tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, &state.workflow_dir) {
-        Ok(a) => a,
-        Err(e) => {
-            return (
+    let adapter = crate::tracker::build(&cfg.tracker_kind, &cfg.tracker_provider, &state.workflow_dir)
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to build tracker adapter: {e}"),
             )
-                .into_response();
-        }
-    };
-    if let Err(e) = adapter.set_issue_state(&issue_id, target_state).await {
-        return (
+                .into_response()
+        })?;
+    adapter.set_issue_state(issue_id, target_state).await.map_err(|e| {
+        (
             StatusCode::BAD_GATEWAY,
             format!("failed to move issue back to an active state: {e}"),
         )
-            .into_response();
-    }
-    Redirect::to(&format!(
-        "{}/requirements?issue={}",
-        state.base_path,
-        urlencode(&issue_id)
-    ))
-    .into_response()
+            .into_response()
+    })
 }
 
 #[cfg(test)]
@@ -1424,5 +1684,187 @@ mod tests {
         let html = chips(&q, "");
         assert!(html.contains("issue: 42"));
         assert!(!html.contains("clear all"));
+    }
+
+    #[test]
+    fn finding_row_renders_fields_and_escapes_untrusted_content() {
+        let finding = serde_json::json!({
+            "id": "F1",
+            "severity": "blocker",
+            "category": "over-implementation",
+            "file": "<script>alert(1)</script>",
+            "line": 42,
+            "requirement_id": "R1",
+            "summary": "unnecessary abstraction"
+        });
+        let html = finding_row(&finding);
+        assert!(html.contains("F1"));
+        assert!(html.contains("blocker"));
+        assert!(html.contains("over-implementation"));
+        assert!(html.contains("42"));
+        assert!(html.contains("R1"));
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn rework_round_row_shows_the_round_number_and_escalated_badge() {
+        let event = eventlog::EventRow {
+            id: 1,
+            issue_id: "1".to_string(),
+            identifier: "AIR-7".to_string(),
+            title: "t".to_string(),
+            session_id: None,
+            event_type: "rework_round".to_string(),
+            importance: "normal".to_string(),
+            message: Some(
+                serde_json::json!({
+                    "stage": "review",
+                    "recommendation": "request_changes",
+                    "summary": "still missing a test",
+                    "escalated": true
+                })
+                .to_string(),
+            ),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            created_at: "now".to_string(),
+        };
+        let html = rework_round_row(3, &event);
+        assert!(html.contains("<td>3</td>"));
+        assert!(html.contains("review"));
+        assert!(html.contains("request_changes"));
+        assert!(html.contains("yes"));
+    }
+
+    /// AIR-7 acceptance criterion: the `/reviews` panel is the explanation surface for
+    /// a recorded `review_findings` artifact -- recommendation, unmet acceptance
+    /// criteria, over-implementation and the finding table all readable from it.
+    #[tokio::test]
+    async fn review_card_renders_recommendation_unmet_criteria_and_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().to_path_buf();
+        let db = workflow_dir.join(eventlog::DB_FILENAME);
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".symphony")).unwrap();
+        std::fs::write(workspace.join(".symphony/current-stage"), "review").unwrap();
+
+        let content = serde_json::json!({
+            "schema_version": 1,
+            "recommendation": "request_changes",
+            "findings": [{
+                "id": "F1", "severity": "major", "category": "requirement-coverage",
+                "file": "src/x.rs", "line": 10, "requirement_id": "R2",
+                "summary": "does not handle the empty case"
+            }],
+            "unmet_acceptance_criteria": ["AC3"],
+            "over_implementation": ["speculative caching layer"]
+        })
+        .to_string();
+        let result = artifacts::execute_tool(
+            &db,
+            &workflow_dir,
+            &workspace,
+            "issue-1",
+            "issue-1",
+            serde_json::json!({
+                "kind": "review_findings",
+                "content_type": "application/json",
+                "content": content,
+                "summary": "requests changes"
+            }),
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
+
+        let row = artifacts::list_for_cycle(&db, "issue-1")
+            .into_iter()
+            .find(|r| r.kind == "review_findings")
+            .unwrap();
+        let html = review_card(&workflow_dir, &row);
+        assert!(html.contains("request_changes"));
+        assert!(html.contains("AC3"));
+        assert!(html.contains("speculative caching layer"));
+        assert!(html.contains("does not handle the empty case"));
+        assert!(html.contains("R2"));
+    }
+
+    #[tokio::test]
+    async fn reviews_page_without_an_issue_prompts_for_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+        };
+        let Html(body) = reviews_page(State(state), Query(ReviewsQuery { issue: None })).await;
+        assert!(body.contains("Pass an issue id"));
+    }
+
+    #[tokio::test]
+    async fn reviews_page_shows_an_unblock_form_only_when_a_round_was_escalated() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().to_path_buf();
+        let db = workflow_dir.join(eventlog::DB_FILENAME);
+        eventlog::record_rework_round(
+            &db,
+            &eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 1",
+                escalated: false,
+            },
+        )
+        .unwrap();
+
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx.clone(),
+            workflow_dir: workflow_dir.clone(),
+            base_path: String::new(),
+        };
+        let Html(body) = reviews_page(
+            State(state),
+            Query(ReviewsQuery {
+                issue: Some("1".to_string()),
+            }),
+        )
+        .await;
+        assert!(!body.contains("Resume cycle"), "not escalated yet: {body}");
+
+        eventlog::record_rework_round(
+            &db,
+            &eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 2",
+                escalated: true,
+            },
+        )
+        .unwrap();
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir,
+            base_path: String::new(),
+        };
+        let Html(body) = reviews_page(
+            State(state),
+            Query(ReviewsQuery {
+                issue: Some("1".to_string()),
+            }),
+        )
+        .await;
+        assert!(body.contains("Resume cycle"));
+        assert!(body.contains("/reviews/1/unblock"));
+        assert!(body.contains("<td>1</td>"));
+        assert!(body.contains("<td>2</td>"));
     }
 }
