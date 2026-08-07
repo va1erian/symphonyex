@@ -132,6 +132,13 @@ pub const STYLE: &str = r#"
   .error-banner a { color: var(--bad-fg); text-decoration: underline; }
   :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
+  /* Budget consumption bars (AIR-11: `/usage`'s budgets panel, running-card notes). */
+  .meter { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 4px; height: 10px; overflow: hidden; margin: 4px 0 8px; }
+  .meter-fill { background: var(--accent); height: 100%; }
+  .budget-note { color: var(--warn-fg); }
+  .budget-note form { display: inline; margin-left: 8px; }
+  .budget-note .btn { padding: 2px 10px; margin-top: 0; font-size: 0.78rem; }
+
   /* Chat-bubble transcript: the shared markup/style contract between the chat UI
      (`swebot::chat::web`, client-rendered from JSON via matching JS) and the
      issue-filtered `/events` view (`status.rs::render_transcript`, server-rendered
@@ -229,6 +236,41 @@ function cellSortValue(row, idx) {
   return cell.getAttribute('data-sort-value') || cell.textContent.trim();
 }
 "#;
+
+/// Whether `headers` carries `SYMPHONY_ADMIN_TOKEN` -- via `Authorization: Bearer` or
+/// the `symphony_admin` cookie, same two places `service.rs`'s own admin gate accepts
+/// it from (kept as an independent, tiny check here rather than sharing that private
+/// fn: this one has different "no token configured" behavior on purpose, see below).
+///
+/// Returns `true` when `SYMPHONY_ADMIN_TOKEN` isn't set at all -- unlike
+/// `service.rs::require_admin` (which refuses to even start `symphony serve` without
+/// one), the single-project CLI dashboard (`status.rs`) has no admin-token concept
+/// today and is explicitly documented as "not hardened for exposure beyond the local
+/// machine." A state-changing control mounted there needs *some* gate when an operator
+/// has opted in by setting the env var, but must not become unusable for the common
+/// case where nobody set one.
+pub fn admin_token_ok(headers: &axum::http::HeaderMap) -> bool {
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.is_empty() {
+        return true;
+    }
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION)
+        && let Ok(s) = auth.to_str()
+        && let Some(token) = s.strip_prefix("Bearer ")
+    {
+        return token == expected;
+    }
+    if let Some(cookie_header) = headers.get(axum::http::header::COOKIE)
+        && let Ok(s) = cookie_header.to_str()
+    {
+        for part in s.split(';') {
+            if let Some(v) = part.trim().strip_prefix("symphony_admin=") {
+                return v == expected;
+            }
+        }
+    }
+    false
+}
 
 pub fn escape(s: &str) -> String {
     s.replace('&', "&amp;")

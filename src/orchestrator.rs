@@ -95,6 +95,10 @@ struct RunningEntry {
     /// already is, so a human watching a multi-stage cycle can see which stage is
     /// running without opening `/events`.
     current_stage: Option<String>,
+    /// Most recent budget/stop-condition note (AIR-11), e.g. "cycle budget exceeded:
+    /// 2.1M tokens used, budget is 2M" -- mirrors `last_message`'s "keep the latest,
+    /// surface it on the dashboard card" shape. `None` until the first such event fires.
+    budget_note: Option<String>,
 }
 
 struct RetryEntry {
@@ -136,11 +140,13 @@ impl OrchestratorState {
     }
 }
 
+#[derive(Debug)]
 enum ExitReason {
     Normal,
     Error(String),
 }
 
+#[derive(Debug)]
 enum OrchMsg {
     SessionStarted {
         issue_id: String,
@@ -175,6 +181,15 @@ enum OrchMsg {
         issue_id: String,
         stage_id: String,
         outcome: String,
+    },
+    /// A budget rule fired, or a `stop_conditions.*` check tripped (AIR-11) --
+    /// `event_type` is one of `budget_warn`/`budget_escalated`/`budget_stop`/
+    /// `stop_condition`, `message` is the human-readable reason `/events` and the
+    /// dashboard show verbatim as "why".
+    BudgetEvent {
+        issue_id: String,
+        event_type: String,
+        message: String,
     },
 }
 
@@ -351,6 +366,10 @@ pub struct ProjectHandles {
     /// `EffectiveConfig::workflow_dir` -- `status::router` derives the eventlog db
     /// path from this itself.
     pub workflow_dir: PathBuf,
+    /// Lets the dashboard's `/budget/extend` control (AIR-11) move an escalated/stopped
+    /// issue back to an active tracker state -- the same `TrackerAdapter` abstraction
+    /// `block_issue` already writes through, just handed to the read side too.
+    pub tracker: Arc<dyn TrackerAdapter>,
     /// Present when `swebot.chat.enabled` -- chat mode's store+worker. The
     /// multi-project service nests the web chat UI under `/projects/<id>/chat` only
     /// when `web_enabled` is set (the single-project status server serves it at
@@ -452,6 +471,7 @@ async fn run_inner(
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         let status_rx_for_serve = status_rx.clone();
         let workflow_dir_for_serve = workflow_dir.clone();
+        let tracker_for_serve = shared.tracker.clone();
         // Composite dashboard: the status router at the root, chat's UI nested under
         // /chat -- only when the web connector is enabled.
         let chat_router = chat
@@ -464,6 +484,7 @@ async fn run_inner(
                 bind_all_interfaces,
                 status_rx_for_serve,
                 workflow_dir_for_serve,
+                tracker_for_serve,
                 chat_router,
             )
             .await
@@ -476,6 +497,7 @@ async fn run_inner(
         let _ = handles_tx.send(ProjectHandles {
             status_rx: status_rx.clone(),
             workflow_dir: workflow_dir.clone(),
+            tracker: shared.tracker.clone(),
             chat,
         });
     }
@@ -537,6 +559,7 @@ fn build_status_snapshot(state: &OrchestratorState) -> status::StatusSnapshot {
             last_event: e.last_event.clone(),
             last_message: e.last_message.clone(),
             stage: e.current_stage.clone(),
+            budget_note: e.budget_note.clone(),
         })
         .collect();
 
@@ -768,6 +791,7 @@ async fn dispatch_issue(
             handle,
             retry_attempt: attempt,
             current_stage: None,
+            budget_note: None,
         },
     );
     state.claimed.insert(issue_id.clone());
@@ -1428,6 +1452,31 @@ async fn handle_msg(
                 );
             }
         }
+        OrchMsg::BudgetEvent {
+            issue_id,
+            event_type,
+            message,
+        } => {
+            if let Some(e) = state.running.get_mut(&issue_id) {
+                e.budget_note = Some(message.clone());
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type,
+                        message: Some(message),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1538,8 +1587,30 @@ async fn run_attempt_body(
     });
 
     let exit = if cfg.pipeline.enabled {
-        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+        run_pipeline(
+            issue_id,
+            &mut issue,
+            attempt,
+            workspace_path,
+            session.as_mut(),
+            snapshot,
+            tx,
+        )
+        .await
     } else {
+        let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let model_key = cfg.effective_model_key();
+        let budget = TurnLoopBudget {
+            db_path,
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: None,
+        };
+        let mut cycle_usage = TokenUsage::default();
+        let mut progress = crate::budget::ProgressTracker::default();
         match run_turn_loop(
             session.as_mut(),
             &snapshot.tracker,
@@ -1551,11 +1622,18 @@ async fn run_attempt_body(
             cfg.max_turns,
             issue_id,
             tx,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
         )
         .await
         {
             LoopExit::Completed | LoopExit::EndedByIssueState => ExitReason::Normal,
             LoopExit::Error(e) => ExitReason::Error(e),
+            LoopExit::BudgetExceeded { .. } | LoopExit::StoppedByCondition(_) => {
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                ExitReason::Normal
+            }
         }
     };
 
@@ -1571,10 +1649,34 @@ async fn run_attempt_body(
 /// `update_issue_state` to a terminal state) means the whole cycle is done, whereas
 /// `Completed` (the stage simply ran out its own turn budget) means "move on to the
 /// next stage."
+#[derive(Debug)]
 enum LoopExit {
     Completed,
     EndedByIssueState,
     Error(String),
+    /// A budget (`config::BudgetsConfig`) was exceeded at some scope, with
+    /// `on_exceeded: escalate` or `stop` -- both end the cycle cleanly the same way a
+    /// blocking stage's failure does (`block_issue`); which one it was has already been
+    /// recorded distinctly via `OrchMsg::BudgetEvent` (its `event_type`) by the time
+    /// this is returned, so there's nothing left for a caller to branch on here.
+    BudgetExceeded { reason: String },
+    /// `stop_conditions.no_progress_turns`/`repeated_error` fired (AIR-11) -- same
+    /// clean-stop handling as `BudgetExceeded`.
+    StoppedByCondition(String),
+}
+
+/// Everything a `run_turn_loop` call needs for budget enforcement and the
+/// no-progress/repeated-error stopping conditions (AIR-11), bundled so the loop's own
+/// signature doesn't grow another five positional arguments. Built once per
+/// `run_turn_loop` invocation (i.e. once per stage) by its caller.
+struct TurnLoopBudget<'a> {
+    db_path: PathBuf,
+    workspace_path: &'a Path,
+    budgets: &'a config::BudgetsConfig,
+    stop_conditions: &'a config::StopConditionsConfig,
+    pricing: &'a crate::budget::PricingTable,
+    model_key: &'a str,
+    stage_override: Option<&'a config::BudgetLimits>,
 }
 
 /// Runs 1..=`max_turns` turns of `session` against `issue`, refreshing tracker state
@@ -1582,6 +1684,12 @@ enum LoopExit {
 /// exactly the loop `run_attempt_body` always ran (Section 16.5), generalized so it can
 /// be invoked once per pipeline stage (each with its own turn budget) as well as once
 /// for a whole attempt (the legacy, and still default, single-stage behavior).
+///
+/// `cycle_usage` accumulates across every call within one cycle (a pipeline has one
+/// call per stage, sharing the same accumulator; the non-pipeline path has exactly one
+/// call, so it's equivalent to "whole cycle" trivially); `progress` similarly persists
+/// per cycle. Both are owned by the caller so they survive across the several
+/// `run_turn_loop` calls a multi-stage pipeline makes.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_loop(
     session: &mut dyn AgentSession,
@@ -1594,7 +1702,11 @@ async fn run_turn_loop(
     max_turns: u32,
     issue_id: &str,
     tx: &mpsc::UnboundedSender<OrchMsg>,
+    budget: &TurnLoopBudget<'_>,
+    cycle_usage: &mut TokenUsage,
+    progress: &mut crate::budget::ProgressTracker,
 ) -> LoopExit {
+    let mut stage_usage = TokenUsage::default();
     let mut turn_number: u32 = 1;
     loop {
         let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
@@ -1607,12 +1719,95 @@ async fn run_turn_loop(
             issue_id: issue_id.to_string(),
         });
 
-        match run_one_turn(session, &prompt, issue_id, tx).await {
-            Ok(TurnOutcome::Completed { .. }) => {}
-            Ok(TurnOutcome::Failed { reason }) => {
-                return LoopExit::Error(format!("agent turn error: {reason}"));
+        let (turn_result, had_tool_call) = run_one_turn(session, &prompt, issue_id, tx).await;
+
+        let error_text = match &turn_result {
+            Ok(TurnOutcome::Failed { reason }) => Some(reason.clone()),
+            Err(e) => Some(e.to_string()),
+            Ok(TurnOutcome::Completed { .. }) => None,
+        };
+        // `None` (git unavailable/not a repo) falls back to the tool-call signal alone
+        // rather than assuming "touched" -- see `budget::workspace_touched`'s doc.
+        let touched = crate::budget::workspace_touched(budget.workspace_path)
+            .await
+            .unwrap_or(false);
+        let made_progress = had_tool_call || touched;
+
+        match progress.observe_turn(made_progress, error_text.as_deref(), budget.stop_conditions) {
+            crate::budget::StopSignal::None => {}
+            crate::budget::StopSignal::NoProgress(n) => {
+                let reason = format!("no progress for {n} consecutive turns");
+                let _ = tx.send(OrchMsg::BudgetEvent {
+                    issue_id: issue_id.to_string(),
+                    event_type: "stop_condition".to_string(),
+                    message: reason.clone(),
+                });
+                return LoopExit::StoppedByCondition(reason);
             }
-            Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
+            crate::budget::StopSignal::RepeatedError(n) => {
+                let reason = format!("same error repeated {n} times in a row");
+                let _ = tx.send(OrchMsg::BudgetEvent {
+                    issue_id: issue_id.to_string(),
+                    event_type: "stop_condition".to_string(),
+                    message: reason.clone(),
+                });
+                return LoopExit::StoppedByCondition(reason);
+            }
+        }
+
+        match turn_result {
+            Ok(TurnOutcome::Completed { usage }) => {
+                if let Some(u) = usage {
+                    stage_usage.input_tokens += u.input_tokens;
+                    stage_usage.output_tokens += u.output_tokens;
+                    stage_usage.total_tokens += u.total_tokens;
+                    cycle_usage.input_tokens += u.input_tokens;
+                    cycle_usage.output_tokens += u.output_tokens;
+                    cycle_usage.total_tokens += u.total_tokens;
+                }
+            }
+            Ok(TurnOutcome::Failed { reason }) => {
+                // Fail fast exactly as before unless `stop_conditions.repeated_error`
+                // is configured to tolerate repeats -- in that case `observe_turn`
+                // above already handles ending the loop once the streak hits its
+                // threshold, so a failure short of that just continues to the next
+                // turn like a completed (if unproductive) one.
+                if budget.stop_conditions.repeated_error.is_none() {
+                    return LoopExit::Error(format!("agent turn error: {reason}"));
+                }
+            }
+            Err(e) => {
+                if budget.stop_conditions.repeated_error.is_none() {
+                    return LoopExit::Error(format!("agent turn error: {e}"));
+                }
+            }
+        }
+
+        let budget_ctx = crate::budget::BudgetContext {
+            db_path: &budget.db_path,
+            budgets: budget.budgets,
+            pricing: budget.pricing,
+            model_key: budget.model_key,
+            stage_override: budget.stage_override,
+        };
+        if let Some(verdict) = crate::budget::check_after_turn(&budget_ctx, &stage_usage, cycle_usage) {
+            let event_type = match verdict.action {
+                config::BudgetAction::Warn => "budget_warn",
+                config::BudgetAction::Escalate => "budget_escalated",
+                config::BudgetAction::Stop => "budget_stop",
+            };
+            let message = format!("{} budget exceeded: {}", verdict.scope.label(), verdict.reason);
+            let _ = tx.send(OrchMsg::BudgetEvent {
+                issue_id: issue_id.to_string(),
+                event_type: event_type.to_string(),
+                message: message.clone(),
+            });
+            match verdict.action {
+                config::BudgetAction::Warn => {}
+                config::BudgetAction::Escalate | config::BudgetAction::Stop => {
+                    return LoopExit::BudgetExceeded { reason: message };
+                }
+            }
         }
 
         let refreshed = match tracker.fetch_issues_by_ids(std::slice::from_ref(&issue.id)).await {
@@ -1647,11 +1842,18 @@ async fn run_pipeline(
     issue_id: &str,
     issue: &mut Issue,
     attempt: Option<u32>,
+    workspace_path: &Path,
     session: &mut dyn AgentSession,
     snapshot: &DispatchSnapshot,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let model_key = cfg.effective_model_key();
+    // Shared across every stage in this cycle -- a pipeline calls `run_turn_loop` once
+    // per stage, but `budgets.cycle` and `stop_conditions.*` are whole-cycle concepts.
+    let mut cycle_usage = TokenUsage::default();
+    let mut progress = crate::budget::ProgressTracker::default();
 
     for stage in &cfg.pipeline.stages {
         let _ = tx.send(OrchMsg::StageStarted {
@@ -1659,6 +1861,15 @@ async fn run_pipeline(
             stage_id: stage.id.clone(),
         });
 
+        let budget = TurnLoopBudget {
+            db_path: db_path.clone(),
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: stage.budget.as_ref(),
+        };
         let mut outcome = run_turn_loop(
             session,
             &snapshot.tracker,
@@ -1670,6 +1881,9 @@ async fn run_pipeline(
             stage.max_turns,
             issue_id,
             tx,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
         )
         .await;
 
@@ -1688,6 +1902,9 @@ async fn run_pipeline(
                 stage.max_turns,
                 issue_id,
                 tx,
+                &budget,
+                &mut cycle_usage,
+                &mut progress,
             )
             .await;
         }
@@ -1699,6 +1916,8 @@ async fn run_pipeline(
                 format!("failed, skipped: {reason}")
             }
             LoopExit::Error(reason) => format!("failed: {reason}"),
+            LoopExit::BudgetExceeded { reason, .. } => format!("stopped: {reason}"),
+            LoopExit::StoppedByCondition(reason) => format!("stopped: {reason}"),
         };
         let _ = tx.send(OrchMsg::StageFinished {
             issue_id: issue_id.to_string(),
@@ -1709,6 +1928,12 @@ async fn run_pipeline(
         match outcome {
             LoopExit::Completed => continue,
             LoopExit::EndedByIssueState => return ExitReason::Normal,
+            LoopExit::BudgetExceeded { .. } | LoopExit::StoppedByCondition(_) => {
+                // Orchestrator-level cuts, independent of the stage's own
+                // `on_failure`/`blocking` config -- always parked, never retried.
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                return ExitReason::Normal;
+            }
             LoopExit::Error(reason) => {
                 if stage.on_failure == StageFailureAction::Skip {
                     continue;
@@ -1750,17 +1975,26 @@ async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state:
     }
 }
 
+/// Also reports whether at least one `tool_call` event was observed during the turn --
+/// the "did this turn do anything" half of `stop_conditions.no_progress_turns`'s signal
+/// (the other half, a workspace diff, is checked separately since it needs the
+/// workspace path, not anything in the event stream).
 async fn run_one_turn(
     session: &mut dyn AgentSession,
     prompt: &str,
     issue_id: &str,
     tx: &mpsc::UnboundedSender<OrchMsg>,
-) -> Result<TurnOutcome, crate::agent::AgentError> {
+) -> (Result<TurnOutcome, crate::agent::AgentError>, bool) {
     let (etx, mut erx) = mpsc::unbounded_channel::<AgentEvent>();
     let fwd_issue_id = issue_id.to_string();
     let fwd_tx = tx.clone();
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let had_tool_call_writer = had_tool_call.clone();
     let forward = tokio::spawn(async move {
         while let Some(ev) = erx.recv().await {
+            if ev.event == "tool_call" {
+                had_tool_call_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = fwd_tx.send(OrchMsg::AgentEvent {
                 issue_id: fwd_issue_id.clone(),
                 event: ev,
@@ -1769,7 +2003,7 @@ async fn run_one_turn(
     });
     let result = session.run_turn(prompt, etx).await;
     let _ = forward.await;
-    result
+    (result, had_tool_call.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn render_turn_prompt(
@@ -1996,6 +2230,282 @@ mod tests {
         }
     }
 
+    /// Same shape as `pipeline_snapshot` but with the whole config YAML supplied
+    /// directly, for tests (budgets, `stop_conditions`) that need top-level keys
+    /// outside `pipeline.stages`.
+    fn snapshot_with_config(
+        tracker_dir: &Path,
+        cfg_yaml: &str,
+        backend: Arc<dyn AgentBackend>,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(cfg_yaml).unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: backend,
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    /// Runs `run_turn_loop` directly (the non-pipeline path's shape) against
+    /// `snapshot`, returning its `LoopExit` -- shared setup for the `stop_conditions`
+    /// tests below, which don't need `pipeline.enabled` at all.
+    async fn run_turn_loop_for_test(
+        snapshot: &DispatchSnapshot,
+        issue_id: &str,
+        workspace_path: &Path,
+        tx: &mpsc::UnboundedSender<OrchMsg>,
+    ) -> LoopExit {
+        let cfg = &snapshot.config;
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(std::slice::from_ref(&issue_id.to_string()))
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(workspace_path, &issue.id, "t", None)
+            .await
+            .unwrap();
+        let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let model_key = cfg.effective_model_key();
+        let budget = TurnLoopBudget {
+            db_path,
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: None,
+        };
+        let mut cycle_usage = TokenUsage::default();
+        let mut progress = crate::budget::ProgressTracker::default();
+        let outcome = run_turn_loop(
+            session.as_mut(),
+            &snapshot.tracker,
+            &cfg.active_states,
+            &cfg.required_labels,
+            &snapshot.prompt_template,
+            &mut issue,
+            None,
+            cfg.max_turns,
+            issue_id,
+            tx,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
+        )
+        .await;
+        session.stop().await;
+        outcome
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-11: stop_conditions (no_progress_turns/repeated_error) stop a looping agent
+    // -----------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_progress_turns_stops_a_looping_agent_before_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "NP-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nstop_conditions:\n  no_progress_turns: 3\n",
+            Arc::new(ScriptedBackend {
+                calls: calls.clone(),
+                failures: HashMap::new(),
+            }),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Not a git repo: `budget::workspace_touched` returns `None` here, so the only
+        // progress signal left is the tool-call one -- `ScriptedSession` never sends a
+        // `tool_call` event, so every turn counts as "no progress."
+        let workspace = tempdir().unwrap();
+
+        let outcome =
+            run_turn_loop_for_test(&snapshot, "NP-1", workspace.path(), &tx).await;
+
+        assert!(
+            matches!(outcome, LoopExit::StoppedByCondition(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            3,
+            "should stop after exactly 3 no-progress turns, not run to max_turns (10)"
+        );
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::BudgetEvent { event_type, .. } if event_type == "stop_condition")
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_error_stops_a_looping_agent_before_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "RE-1");
+        let calls = Arc::new(Mutex::new(0));
+        let failures: HashMap<u32, String> = (1..=10).map(|n| (n, "boom: same error".to_string())).collect();
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nstop_conditions:\n  repeated_error: 3\n",
+            Arc::new(ScriptedBackend {
+                calls: calls.clone(),
+                failures,
+            }),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome =
+            run_turn_loop_for_test(&snapshot, "RE-1", workspace.path(), &tx).await;
+
+        assert!(
+            matches!(outcome, LoopExit::StoppedByCondition(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            3,
+            "should stop after exactly 3 identical failures in a row, not run to max_turns (10)"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn without_stop_conditions_a_single_failure_still_ends_the_loop_immediately() {
+        // Same failing session as the repeated-error test, but with no `stop_conditions`
+        // configured at all -- behavior must be unchanged from before this ticket:
+        // the very first failure ends the loop.
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "RE-2");
+        let calls = Arc::new(Mutex::new(0));
+        let failures: HashMap<u32, String> = (1..=10).map(|n| (n, "boom".to_string())).collect();
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\n",
+            Arc::new(ScriptedBackend {
+                calls: calls.clone(),
+                failures,
+            }),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome =
+            run_turn_loop_for_test(&snapshot, "RE-2", workspace.path(), &tx).await;
+
+        assert!(matches!(outcome, LoopExit::Error(_)), "{outcome:?}");
+        assert_eq!(*calls.lock().unwrap(), 1);
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn cycle_token_budget_stop_parks_the_issue_without_reaching_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "BUD-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nbudgets:\n  cycle:\n    tokens: 250\n  on_exceeded: stop\n",
+            Arc::new(ScriptedTokenBackend {
+                calls: calls.clone(),
+                tokens_per_turn: 100,
+            }),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome =
+            run_turn_loop_for_test(&snapshot, "BUD-1", workspace.path(), &tx).await;
+
+        assert!(matches!(outcome, LoopExit::BudgetExceeded { .. }), "{outcome:?}");
+        // 100 tokens/turn: still under 250 after turn 2 (200), over after turn 3 (300).
+        assert_eq!(*calls.lock().unwrap(), 3);
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::BudgetEvent { event_type, .. } if event_type == "budget_stop")
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    /// A canned-outcome session that reports real `TokenUsage` every turn (unlike
+    /// `ScriptedSession`, which always reports `None`) -- lets a budget test drive the
+    /// cycle-level token accumulator deterministically.
+    struct ScriptedTokenBackend {
+        calls: Arc<Mutex<u32>>,
+        tokens_per_turn: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ScriptedTokenBackend {
+        async fn start_session(
+            &self,
+            _workspace: &Path,
+            _issue_id: &str,
+            _title: &str,
+            _container: Option<&ContainerHandle>,
+        ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
+            Ok(Box::new(ScriptedTokenSession {
+                calls: self.calls.clone(),
+                tokens_per_turn: self.tokens_per_turn,
+            }))
+        }
+    }
+
+    struct ScriptedTokenSession {
+        calls: Arc<Mutex<u32>>,
+        tokens_per_turn: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for ScriptedTokenSession {
+        fn session_id(&self) -> &str {
+            "scripted-token-session"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+            }
+            let _ = events.send(AgentEvent::new("tool_call").with_message("edit"));
+            Ok(TurnOutcome::Completed {
+                usage: Some(TokenUsage {
+                    input_tokens: self.tokens_per_turn,
+                    output_tokens: 0,
+                    total_tokens: self.tokens_per_turn,
+                }),
+            })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
     async fn drain(mut rx: mpsc::UnboundedReceiver<OrchMsg>) -> Vec<OrchMsg> {
         rx.close();
         let mut out = Vec::new();
@@ -2044,7 +2554,16 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            Path::new("."),
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2090,7 +2609,16 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            Path::new("."),
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2139,7 +2667,16 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            Path::new("."),
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2186,7 +2723,16 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            Path::new("."),
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
 
@@ -2225,7 +2771,16 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            Path::new("."),
+            session.as_mut(),
+            &snapshot,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
@@ -2312,6 +2867,7 @@ mod tests {
                 handle,
                 retry_attempt: None,
                 current_stage: None,
+                budget_note: None,
             },
         );
 

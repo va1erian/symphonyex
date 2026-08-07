@@ -38,6 +38,9 @@ struct RunningProject {
     shutdown_tx: Option<oneshot::Sender<()>>,
     status_rx: watch::Receiver<status::StatusSnapshot>,
     workflow_dir: PathBuf,
+    /// Handed to the nested `status::router` so its `/budget/extend` control (AIR-11)
+    /// can resume a budget-blocked cycle.
+    tracker: Arc<dyn crate::tracker::TrackerAdapter>,
     /// Present when `swebot.chat.enabled` -- backs the project's nested `/chat` UI
     /// when `web_enabled`.
     chat: Option<crate::swebot::chat::ChatHandles>,
@@ -187,6 +190,7 @@ async fn spawn_project(
             shutdown_tx: Some(shutdown_tx),
             status_rx: handles.status_rx,
             workflow_dir: handles.workflow_dir,
+            tracker: handles.tracker,
             chat: handles.chat,
         },
     );
@@ -524,10 +528,15 @@ async fn project_proxy(
         Some(id) => id.clone(),
         None => return (StatusCode::NOT_FOUND, "missing project id").into_response(),
     };
-    let (status_rx, workflow_dir, chat) = {
+    let (status_rx, workflow_dir, tracker, chat) = {
         let running = state.running.lock().await;
         match running.get(&id) {
-            Some(p) => (p.status_rx.clone(), p.workflow_dir.clone(), p.chat.clone()),
+            Some(p) => (
+                p.status_rx.clone(),
+                p.workflow_dir.clone(),
+                p.tracker.clone(),
+                p.chat.clone(),
+            ),
             None => return (StatusCode::NOT_FOUND, "unknown or removed project").into_response(),
         }
     };
@@ -544,7 +553,7 @@ async fn project_proxy(
         *req.uri_mut() = new_uri;
     }
 
-    let sub_router = status::router(status_rx, workflow_dir, &prefix);
+    let sub_router = status::router(status_rx, workflow_dir, tracker, &prefix);
     let sub_router = match &chat {
         Some(handles) if handles.web_enabled => sub_router.nest(
             "/chat",

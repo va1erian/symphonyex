@@ -19,16 +19,20 @@
 //! as before. The plain `/fragment` endpoint (a single non-streaming render) stays
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 
+use crate::config;
 use crate::eventlog;
+use crate::tracker::TrackerAdapter;
 use crate::web::{escape, urlencode};
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::extract::{Form, Query, State};
+use axum::http::HeaderMap;
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
@@ -60,6 +64,9 @@ pub struct RunningRow {
     /// pipeline (`pipeline.enabled`) is on for this project. `None` for the legacy
     /// single-stage path, or before the first stage has started.
     pub stage: Option<String>,
+    /// Most recent budget/stop-condition note (AIR-11: `budget::check_after_turn`,
+    /// `stop_conditions.*`), e.g. "cycle budget exceeded: ...". `None` until one fires.
+    pub budget_note: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -85,12 +92,42 @@ struct AppState {
     /// still lands within the same mount point -- without it, a nested dashboard's
     /// own links would silently escape to the service's top-level routes instead.
     base_path: String,
+    /// Backs `/budget/extend` (AIR-11): moves an issue an `escalate`/`stop` budget
+    /// decision parked in `pipeline.blocked_state` back to an active tracker state, the
+    /// same `TrackerAdapter` write `orchestrator::block_issue` used to park it.
+    tracker: Arc<dyn TrackerAdapter>,
 }
 
 impl AppState {
     fn eventlog_db_path(&self) -> PathBuf {
         self.workflow_dir.join(eventlog::DB_FILENAME)
     }
+}
+
+/// Re-reads `WORKFLOW.md` and resolves it the same way `orchestrator::build_shared`
+/// does, just for the handful of read-only fields the dashboard needs
+/// (`budgets`/`pricing`/`active_states`) -- deliberately not threaded through
+/// `Shared`/`AppState` at startup, since that would mean plumbing a config-reload path
+/// into the dashboard just to read a few numbers it can cheaply re-derive itself on
+/// each render.
+struct BudgetView {
+    budgets: crate::config::BudgetsConfig,
+    pricing: crate::budget::PricingTable,
+    model_key: String,
+    active_states: Vec<String>,
+}
+
+/// `None` on any error (missing file, bad YAML): the budgets panel simply doesn't
+/// render rather than breaking the rest of the dashboard.
+fn load_budget_view(workflow_dir: &Path) -> Option<BudgetView> {
+    let wf = crate::workflow::load(&workflow_dir.join("WORKFLOW.md")).ok()?;
+    let cfg = crate::config::resolve(&wf.config, workflow_dir).ok()?;
+    Some(BudgetView {
+        budgets: cfg.budgets.clone(),
+        pricing: cfg.pricing.clone(),
+        model_key: cfg.effective_model_key(),
+        active_states: cfg.active_states.clone(),
+    })
 }
 
 /// Bind and serve the dashboard until the process exits. Loopback-only
@@ -120,12 +157,14 @@ impl AppState {
 pub fn router(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
+    tracker: Arc<dyn TrackerAdapter>,
     base_path: &str,
 ) -> Router {
     let state = AppState {
         status_rx,
         workflow_dir,
         base_path: base_path.to_string(),
+        tracker,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -133,6 +172,7 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/budget/extend", post(extend_budget))
         .with_state(state)
 }
 
@@ -141,9 +181,10 @@ pub async fn serve_composite(
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
+    tracker: Arc<dyn TrackerAdapter>,
     chat: Option<Router>,
 ) -> anyhow::Result<()> {
-    let mut app = router(status_rx, workflow_dir, "");
+    let mut app = router(status_rx, workflow_dir, tracker, "");
     if let Some(chat) = chat {
         app = app.nest("/chat", chat);
     }
@@ -295,7 +336,18 @@ fn render_fragment(s: &StatusSnapshot, base: &str) -> String {
 {retry_rows}
 </tbody>
 </table>
+</section>
+
+<section>
+<h3>Budget-blocked cycle</h3>
+<p class="empty">A cycle an <code>escalate</code>/<code>stop</code> budget decision parked in <code>pipeline.blocked_state</code> (see its issue id on the card above, or on <a href="{base}/events">/events</a>) can be resumed here.</p>
+<form class="admin" method="post" action="{base}/budget/extend">
+  <label for="extend-issue-id">Issue id</label>
+  <input type="text" id="extend-issue-id" name="issue_id" required>
+  <br><button type="submit" class="btn">Extend &amp; resume</button>
+</form>
 </section>"#,
+        base = base,
         running = s.running.len(),
         retrying = s.retrying.len(),
         running_cards = running_cards,
@@ -318,6 +370,18 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         .as_deref()
         .map(|s| format!(r#"<div class="row"><b>stage</b> {}</div>"#, escape(s)))
         .unwrap_or_default();
+    // AIR-11: the "why" for whatever budget/stop-condition decision most recently fired
+    // against this cycle -- an explanation surface, not just a pass/fail badge.
+    let budget_row = r
+        .budget_note
+        .as_deref()
+        .map(|note| {
+            format!(
+                r#"<div class="row budget-note"><b>budget</b> {}</div>"#,
+                escape(note)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<div class="card" id="run-{id_attr}">
   <h2><a href="{base}/events?issue={issue_link}">{identifier}</a></h2>
@@ -325,6 +389,7 @@ fn running_card(r: &RunningRow, base: &str) -> String {
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
   {stage_row}
+  {budget_row}
   <div class="row"><b>last event</b> {event}</div>
   <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
@@ -338,6 +403,7 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         turn = r.turn_count,
         tools = r.tool_call_count,
         stage_row = stage_row,
+        budget_row = budget_row,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
         message = escape(message),
     )
@@ -686,8 +752,10 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
         by_issue.iter().map(|r| issue_usage_row(r, base)).collect()
     };
 
+    let budget_panel = render_budget_panel(&state.workflow_dir, &state.eventlog_db_path());
+
     let body = format!(
-        r#"<div class="stats">
+        r#"{budget_panel}<div class="stats">
   <div class="stat"><div class="n">{dispatches}</div><div class="l">Dispatches</div></div>
   <div class="stat"><div class="n">{turns}</div><div class="l">Turns</div></div>
   <div class="stat"><div class="n">{tools}</div><div class="l">Tool calls</div></div>
@@ -717,6 +785,153 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     Html(page_shell("usage", "/usage", &body, "", base))
 }
 
+/// One consumption bar per configured scope (`budgets.application`/`budgets.platform`)
+/// -- the "known token consumption and AI cost" the roadmap's acceptance criteria ask
+/// for, made visible without reading logs or SQLite. Empty string when no `budgets:`
+/// block is configured at all, so a project that never opted in sees nothing extra on
+/// `/usage`.
+fn render_budget_panel(workflow_dir: &Path, db_path: &Path) -> String {
+    let Some(view) = load_budget_view(workflow_dir) else {
+        return String::new();
+    };
+    if view.budgets.application.is_none() && view.budgets.platform.is_none() {
+        return String::new();
+    }
+    let since = crate::budget::window_start(view.budgets.window, chrono::Utc::now()).to_rfc3339();
+    let usage = eventlog::usage_summary_since(db_path, &since).unwrap_or_default();
+    let token_usage = crate::agent::TokenUsage {
+        input_tokens: usage.input_tokens.max(0) as u64,
+        output_tokens: usage.output_tokens.max(0) as u64,
+        total_tokens: usage.total_tokens.max(0) as u64,
+    };
+    let cost = crate::budget::compute_cost(&token_usage, &view.model_key, &view.pricing);
+
+    let mut bars = String::new();
+    if let Some(limits) = &view.budgets.application {
+        bars.push_str(&budget_bar("Application", &token_usage, cost, limits, &view.budgets.currency));
+    }
+    if let Some(limits) = &view.budgets.platform {
+        bars.push_str(&budget_bar(
+            "Platform (this project's own share)",
+            &token_usage,
+            cost,
+            limits,
+            &view.budgets.currency,
+        ));
+    }
+    format!(
+        r#"<section>
+<h3>Budgets <span class="empty">rolling {window}, since {since}</span></h3>
+{bars}
+</section>"#,
+        window = match view.budgets.window {
+            config::BudgetWindow::Daily => "daily",
+            config::BudgetWindow::Weekly => "weekly",
+            config::BudgetWindow::Monthly => "monthly",
+        },
+        since = escape(&since),
+        bars = bars,
+    )
+}
+
+fn budget_bar(
+    label: &str,
+    usage: &crate::agent::TokenUsage,
+    cost: crate::budget::Cost,
+    limits: &config::BudgetLimits,
+    currency: &str,
+) -> String {
+    let token_pct = limits
+        .tokens
+        .filter(|l| *l > 0)
+        .map(|l| ((usage.total_tokens as f64 / l as f64) * 100.0).min(100.0))
+        .unwrap_or(0.0);
+    let tokens_line = match limits.tokens {
+        Some(l) => format!("{} / {} tokens", usage.total_tokens, l),
+        None => format!("{} tokens (no token limit set)", usage.total_tokens),
+    };
+    let cost_line = match (limits.cost, cost) {
+        (Some(l), crate::budget::Cost::Known(spent)) => {
+            format!("{spent:.2} / {l:.2} {currency}")
+        }
+        (Some(l), crate::budget::Cost::Unknown) => {
+            format!("cost unknown (unpriced model) / {l:.2} {currency} budget")
+        }
+        (None, crate::budget::Cost::Known(spent)) => format!("{spent:.2} {currency} (no cost limit set)"),
+        (None, crate::budget::Cost::Unknown) => "cost unknown (unpriced model)".to_string(),
+    };
+    format!(
+        r#"<div class="row"><b>{label}</b></div>
+<div class="meter"><div class="meter-fill" style="width:{pct:.1}%"></div></div>
+<div class="row">{tokens_line} &middot; {cost_line}</div>"#,
+        label = escape(label),
+        pct = token_pct,
+        tokens_line = escape(&tokens_line),
+        cost_line = escape(&cost_line),
+    )
+}
+
+#[derive(Deserialize)]
+struct ExtendBudgetForm {
+    issue_id: String,
+}
+
+/// Human action for a cycle an `escalate`/`stop` budget decision parked in
+/// `pipeline.blocked_state` (AIR-11): moves it back to the project's first configured
+/// `tracker.active_states` entry so the normal dispatch loop picks it up again. Gated
+/// by `SYMPHONY_ADMIN_TOKEN` when one is set (always true under `symphony serve`, see
+/// `service.rs`); the single-project CLI dashboard has no admin-token concept at all
+/// today (same "not hardened for exposure" posture the rest of this module already
+/// documents), so it stays open there rather than inventing a second auth story.
+async fn extend_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ExtendBudgetForm>,
+) -> Response {
+    if !crate::web::admin_token_ok(&headers) {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    }
+    let Some(view) = load_budget_view(&state.workflow_dir) else {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    };
+    let Some(active_state) = view.active_states.first().cloned() else {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    };
+    match state
+        .tracker
+        .set_issue_state(&form.issue_id, &active_state)
+        .await
+    {
+        Ok(()) => {
+            let db_path = state.eventlog_db_path();
+            let issue_id = form.issue_id.clone();
+            // Best-effort (`eventlog::record_now`'s own doc comment) -- a lost history
+            // row here isn't worth failing the actual unblock over.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = eventlog::record_now(
+                    &db_path,
+                    &eventlog::NewEvent {
+                        issue_id: issue_id.clone(),
+                        identifier: issue_id,
+                        title: String::new(),
+                        session_id: None,
+                        event_type: "budget_extended".to_string(),
+                        message: Some(format!("resumed into '{active_state}' by an operator")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            })
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(issue_id = %form.issue_id, error = %e, "/budget/extend: failed to resume issue");
+        }
+    }
+    Redirect::to(&format!("{}/", state.base_path)).into_response()
+}
+
 fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     format!(
         "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td></tr>",
@@ -738,11 +953,23 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
 mod tests {
     use super::*;
 
+    fn test_tracker(dir: &Path) -> Arc<dyn TrackerAdapter> {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            serde_yaml::Value::from("dir"),
+            serde_yaml::Value::from(dir.to_string_lossy().to_string()),
+        );
+        Arc::new(
+            crate::tracker::local::LocalTrackerAdapter::new(&serde_yaml::Value::Mapping(map), dir)
+                .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.path().to_path_buf(), "");
+        let app = router(rx, dir.path().to_path_buf(), test_tracker(dir.path()), "");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -777,6 +1004,7 @@ mod tests {
                 last_event: None,
                 last_message: None,
                 stage: None,
+                budget_note: None,
             }],
             retrying: vec![],
         })
@@ -812,6 +1040,7 @@ mod tests {
             last_event: None,
             last_message: None,
             stage: None,
+            budget_note: None,
         };
         let html = running_card(&row, "");
         assert!(!html.contains("<script>alert"));
@@ -831,6 +1060,7 @@ mod tests {
             last_event: None,
             last_message: None,
             stage: None,
+            budget_note: None,
         };
         let html = running_card(&row, "/projects/p1");
         assert!(html.contains(r#"<a href="/projects/p1/events?issue=issue-42">AR-1</a>"#));

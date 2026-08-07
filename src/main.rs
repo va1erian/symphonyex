@@ -1,4 +1,5 @@
 mod agent;
+mod budget;
 mod config;
 mod container;
 mod daemon;
