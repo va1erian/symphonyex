@@ -1,11 +1,16 @@
 ---
 identifier: AIR-12
 title: DORA and success-measure metrics (flow, quality, autonomy, economics, reliability)
-state: todo
+state: done
 priority: 1
-labels: [phase-1, metrics, observability]
+labels:
+- phase-1
+- metrics
+- observability
 dispatchable: true
-depends_on: [AIR-11]
+depends_on:
+- AIR-11
+updated_at: 2026-08-07T04:39:19.381912+00:00
 ---
 ## Context
 

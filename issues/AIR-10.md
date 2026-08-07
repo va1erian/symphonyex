@@ -1,11 +1,16 @@
 ---
 identifier: AIR-10
 title: Observability agent — telemetry, dashboards, SLOs and production validation evidence
-state: todo
+state: done
 priority: 2
-labels: [phase-1, agent-role, observability]
+labels:
+- phase-1
+- agent-role
+- observability
 dispatchable: true
-depends_on: [AIR-9]
+depends_on:
+- AIR-9
+updated_at: 2026-08-07T09:21:25.093840600+00:00
 ---
 ## Context
 

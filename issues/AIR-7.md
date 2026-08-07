@@ -1,11 +1,16 @@
 ---
 identifier: AIR-7
 title: Reviewer agent stage — requirement coverage, standards and minimal-implementation review
-state: todo
+state: done
 priority: 2
-labels: [phase-1, agent-role, quality]
+labels:
+- phase-1
+- agent-role
+- quality
 dispatchable: true
-depends_on: [AIR-6]
+depends_on:
+- AIR-6
+updated_at: 2026-08-07T03:59:25.638342400+00:00
 ---
 ## Context
 

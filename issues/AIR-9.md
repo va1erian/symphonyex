@@ -1,11 +1,17 @@
 ---
 identifier: AIR-9
 title: Release agent — evidence bundle, traceability manifest and deployment-ready MR
-state: todo
+state: done
 priority: 1
-labels: [phase-1, agent-role, evidence, release]
+labels:
+- phase-1
+- agent-role
+- evidence
+- release
 dispatchable: true
-depends_on: [AIR-8]
+depends_on:
+- AIR-8
+updated_at: 2026-08-07T04:47:35.147137900+00:00
 ---
 ## Context
 

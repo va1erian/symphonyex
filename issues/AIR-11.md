@@ -1,11 +1,16 @@
 ---
 identifier: AIR-11
 title: Token and cost budgets with enforced stopping conditions
-state: todo
+state: done
 priority: 1
-labels: [phase-1, cost, orchestrator]
-dispatchable: false
-depends_on: [AIR-1]
+labels:
+- phase-1
+- cost
+- orchestrator
+dispatchable: true
+depends_on:
+- AIR-1
+updated_at: 2026-08-07T04:26:08.080508900+00:00
 ---
 ## Context
 

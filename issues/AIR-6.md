@@ -1,11 +1,16 @@
 ---
 identifier: AIR-6
 title: Test agent — generate and execute tests, produce coverage and regression evidence
-state: todo
+state: done
 priority: 1
-labels: [phase-1, agent-role, quality]
+labels:
+- phase-1
+- agent-role
+- quality
 dispatchable: true
-depends_on: [AIR-5]
+depends_on:
+- AIR-5
+updated_at: 2026-08-06T23:35:39.372062900+00:00
 ---
 ## Context
 

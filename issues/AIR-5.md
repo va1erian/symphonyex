@@ -1,11 +1,16 @@
 ---
 identifier: AIR-5
 title: Planner/Architecture agent and the human approval gate
-state: todo
+state: done
 priority: 1
-labels: [phase-1, agent-role, governance]
+labels:
+- phase-1
+- agent-role
+- governance
 dispatchable: true
-depends_on: [AIR-4]
+depends_on:
+- AIR-4
+updated_at: 2026-08-06T23:11:45.769300400+00:00
 ---
 ## Context
 

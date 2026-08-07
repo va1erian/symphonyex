@@ -1,11 +1,16 @@
 ---
 identifier: AIR-8
 title: Security agent — OWASP-aligned validation, risk classification and blocking findings
-state: todo
+state: done
 priority: 1
-labels: [phase-1, agent-role, security]
+labels:
+- phase-1
+- agent-role
+- security
 dispatchable: true
-depends_on: [AIR-7]
+depends_on:
+- AIR-7
+updated_at: 2026-08-07T04:23:09.290214300+00:00
 ---
 ## Context
 
