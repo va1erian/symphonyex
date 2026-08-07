@@ -505,6 +505,69 @@ pub async fn exec_script(
     .await
 }
 
+/// Full captured output of an `exec_capture_script` run -- unlike `exec`/`exec_script`,
+/// a non-zero exit is not an error here: the caller (test execution, AIR-6) needs the
+/// exit code and full stdout/stderr as *data* (pass/fail counts, output tail), not a
+/// signal that something went wrong with the exec mechanism itself.
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    /// `None` only if the process was killed by a signal rather than exiting.
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Same stdin-piping contract as `exec_script`, but returns the full output regardless
+/// of exit status instead of collapsing failure into `ContainerError`. Still errors on
+/// a genuine exec-mechanism failure (spawn/timeout).
+pub async fn exec_capture_script(
+    container: &ContainerHandle,
+    cwd_in_container: &Path,
+    script: &str,
+    timeout_ms: u64,
+) -> Result<ExecOutput, ContainerError> {
+    let mut cmd = Command::new("docker");
+    cmd.arg("exec")
+        .arg("-i")
+        .arg("-w")
+        .arg(to_container_path_str(cwd_in_container))
+        .arg(&container.name)
+        .arg("bash")
+        .arg("-l")
+        .arg("-s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ContainerError::Spawn(e.to_string()))?;
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let script_owned = script.to_string();
+    let write_task = tokio::spawn(async move {
+        let _ = stdin.write_all(script_owned.as_bytes()).await;
+    });
+
+    let wait = child.wait_with_output();
+    let result = tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await;
+    let _ = write_task.await;
+
+    match result {
+        Ok(Ok(output)) => Ok(ExecOutput {
+            exit_code: output.status.code(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }),
+        Ok(Err(e)) => Err(ContainerError::Spawn(e.to_string())),
+        Err(_) => {
+            kill_process_by_name(&container.name, "bash").await;
+            Err(ContainerError::Timeout(timeout_ms))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

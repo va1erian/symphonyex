@@ -59,6 +59,20 @@ impl ToolResult {
     }
 }
 
+/// One comment on an issue thread, as read by AIR-5's approval-comment poller
+/// (`orchestrator::poll_approval_comments`) -- a human replying `/approve`,
+/// `/changes <reason>` or `/reject [reason]` on the issue itself.
+#[derive(Debug, Clone)]
+pub struct IssueComment {
+    /// Provider-native comment id -- monotonically increasing within an issue, used
+    /// as the poller's "already scanned up to here" cursor
+    /// (`approvals::last_seen_comment_id`). Not necessarily a database id in every
+    /// provider, just some stable, orderable identifier.
+    pub id: u64,
+    pub author: Option<String>,
+    pub body: String,
+}
+
 #[async_trait]
 pub trait TrackerAdapter: Send + Sync {
     /// Fetch normalized issues in the configured scope matching any of `states`
@@ -104,6 +118,44 @@ pub trait TrackerAdapter: Send + Sync {
         _issue_id: &str,
     ) -> ToolResult {
         ToolResult::error(format!("unsupported tool '{name}'"))
+    }
+
+    /// Directly set an issue's tracker state, host-side -- not through the agent-tool
+    /// round trip `execute_agent_tool("update_issue_state", ...)` uses. Used by the
+    /// delivery pipeline (`orchestrator::run_pipeline`) to park an issue in
+    /// `pipeline.blocked_state` when a blocking stage fails: that's the orchestrator's
+    /// own decision, not the agent's, so it goes through this instead of asking the
+    /// agent to call a tool on its own behalf. Default: unsupported, like `create_issue`.
+    async fn set_issue_state(&self, _issue_id: &str, _state: &str) -> Result<(), TrackerError> {
+        Err(TrackerError::Request(
+            "set_issue_state is not supported by this tracker adapter".to_string(),
+        ))
+    }
+
+    /// Post a host-side comment on the issue itself, host-side like `set_issue_state`
+    /// (not through `execute_agent_tool`). Used by the delivery pipeline's
+    /// `raise_clarification` tool (AIR-4) to surface a blocking question directly on
+    /// the tracker issue where the adapter supports it; a tracker that doesn't (the
+    /// default) falls back to the question being recorded in the event log and
+    /// dashboard only. Default: unsupported, like `create_issue`/`set_issue_state`.
+    async fn post_comment(&self, _issue_id: &str, _body: &str) -> Result<(), TrackerError> {
+        Err(TrackerError::Request(
+            "post_comment is not supported by this tracker adapter".to_string(),
+        ))
+    }
+
+    /// Comments on `issue_id`'s own thread, oldest first -- AIR-5's second approval
+    /// channel (`orchestrator::poll_approval_comments`) reads these looking for
+    /// `/approve`, `/changes <reason>` or `/reject [reason]` so a human never has to
+    /// open the dashboard. Default: unsupported adapters report no comments (`Ok(vec![])`)
+    /// rather than erroring -- indistinguishable, from the poller's point of view, from
+    /// "nothing new since last time," so it can poll every adapter uniformly without
+    /// special-casing the ones that don't implement this yet.
+    async fn fetch_issue_comments(
+        &self,
+        _issue_id: &str,
+    ) -> Result<Vec<IssueComment>, TrackerError> {
+        Ok(Vec::new())
     }
 }
 

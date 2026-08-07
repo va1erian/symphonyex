@@ -33,7 +33,7 @@
 //! extra configuration.
 
 use super::depends_on::{RawIssue, parse_depends_on, resolve_dependencies};
-use super::{ToolResult, ToolSpec, TrackerAdapter, TrackerError};
+use super::{IssueComment, ToolResult, ToolSpec, TrackerAdapter, TrackerError};
 use crate::domain::Issue;
 use crate::envsub;
 use async_trait::async_trait;
@@ -500,6 +500,56 @@ impl TrackerAdapter for GithubTrackerAdapter {
             Err(e) => ToolResult::error(e.to_string()),
         }
     }
+
+    /// AIR-5's second approval channel: GitHub Issues comments are plain REST, no
+    /// separate "discussion" concept to route through the way `repo_host`'s
+    /// Discussions/PR-review handling does.
+    async fn fetch_issue_comments(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<IssueComment>, TrackerError> {
+        let Ok(number) = issue_id.parse::<u64>() else {
+            return Err(TrackerError::Response(format!(
+                "invalid issue id '{issue_id}'"
+            )));
+        };
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let url = format!(
+                "{}/repos/{}/issues/{}/comments",
+                self.base_url, self.repo, number
+            );
+            let req = self.client.get(&url).query(&[
+                ("per_page", &PER_PAGE.to_string()),
+                ("page", &page.to_string()),
+            ]);
+            let batch: Vec<GhComment> = self.send_json(self.auth_headers(req)).await?;
+            let got = batch.len();
+            out.extend(batch.into_iter().map(|c| IssueComment {
+                id: c.id,
+                author: c.user.map(|u| u.login),
+                body: c.body.unwrap_or_default(),
+            }));
+            if got < PER_PAGE as usize {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhComment {
+    id: u64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<GhUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhUser {
+    login: String,
 }
 
 #[cfg(test)]
@@ -779,5 +829,34 @@ mod tests {
             .execute_agent_tool("update_issue_state", json!({"state": "nonexistent"}), "5")
             .await;
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_comments_maps_id_author_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/issues/5/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 101, "body": "/approve", "user": {"login": "alice"}},
+                {"id": 102, "body": "/changes please split this up", "user": {"login": "bob"}},
+            ])))
+            .mount(&server)
+            .await;
+
+        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        let comments = adapter.fetch_issue_comments("5").await.unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 101);
+        assert_eq!(comments[0].author.as_deref(), Some("alice"));
+        assert_eq!(comments[0].body, "/approve");
+        assert_eq!(comments[1].id, 102);
+        assert_eq!(comments[1].body, "/changes please split this up");
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_comments_rejects_a_non_numeric_id() {
+        let server = MockServer::start().await;
+        let adapter = GithubTrackerAdapter::new(&provider_yaml(&server.uri())).unwrap();
+        assert!(adapter.fetch_issue_comments("not-a-number").await.is_err());
     }
 }
