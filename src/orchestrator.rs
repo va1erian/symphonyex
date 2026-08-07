@@ -1,10 +1,11 @@
-//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
+﻿//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
 //! (Section 7, 8, 16). One task owns all mutable scheduling state directly; worker
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
 use crate::agent::{
     AgentBackend, AgentEvent, AgentSession, TokenUsage, TurnOutcome, claude, codex, opencode,
 };
+use crate::approvals;
 use crate::config::{self, AgentBackendKind, EffectiveConfig, StageFailureAction};
 use crate::container::{self, ContainerHandle};
 use crate::domain::Issue;
@@ -16,7 +17,7 @@ use crate::template;
 use crate::tracker::{self, TrackerAdapter};
 use crate::workflow;
 use crate::workspace::{DockerContext, WorkspaceManager};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -82,7 +83,7 @@ struct RunningEntry {
     /// The worker task's own `JoinHandle`, not just an `AbortHandle`: reconciliation
     /// needs to `.abort()` *and then await* it before touching the workspace itself
     /// (running `after_run`, deleting the directory), so the aborted task's `Drop`
-    /// (which `kill_on_drop`s the agent subprocess) has actually finished first —
+    /// (which `kill_on_drop`s the agent subprocess) has actually finished first â€”
     /// otherwise a hook/cleanup racing a not-yet-dead subprocess can silently lose
     /// work (see the `AR-8` incident this fixed: `after_run` never ran on
     /// reconciliation-triggered termination, so a fully-verified attempt's git commit
@@ -165,6 +166,13 @@ enum OrchMsg {
     StageStarted {
         issue_id: String,
         stage_id: String,
+        /// AIR-2: human-readable summary of the resolved role driving this stage --
+        /// `"<role>"` when it runs on `agent.backend` like everything else, or
+        /// `"<role> (opencode/fireworks/x)"` when the role overrides backend/model.
+        /// Surfaced on the dashboard (`status::RunningRow::stage`) so a human watching
+        /// a multi-stage cycle can see *which* role/backend is running, not just which
+        /// stage id.
+        role_summary: String,
     },
     /// A pipeline stage finished, however it finished (`outcome` is a short
     /// human-readable label: "completed", "ended by issue state", "failed", or
@@ -175,6 +183,20 @@ enum OrchMsg {
         issue_id: String,
         stage_id: String,
         outcome: String,
+    },
+    /// AIR-5: a `requires_approval` stage finished and is now parked, waiting on a
+    /// human decision (`approvals::ApprovalRow` id `approval_id`).
+    ApprovalRequested {
+        issue_id: String,
+        stage_id: String,
+        approval_id: i64,
+    },
+    /// AIR-5: a `requires_approval` stage finished and `pipeline.approval.
+    /// auto_approve_when` matched -- no pending row was ever created, the cycle just
+    /// moved on to the next stage.
+    ApprovalAutoApproved {
+        issue_id: String,
+        stage_id: String,
     },
 }
 
@@ -207,7 +229,13 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
         .filter(|r| r.pull_request)
         .map(serde_json::to_string)
         .transpose()?;
-    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty() && repo_pr_json.is_none() {
+    // AIR-3: `pipeline.enabled` on its own also needs the MCP subprocess wired up, even
+    // when the tracker has no tools of its own and `repo.pull_request` is off --
+    // `record_artifact` is a property of the cycle, not of either of those.
+    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty()
+        && repo_pr_json.is_none()
+        && !cfg.pipeline.enabled
+    {
         None
     } else {
         Some(claude::McpToolWiring {
@@ -215,6 +243,7 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             tracker_provider_json: serde_json::to_string(&cfg.tracker_provider)?,
             workflow_dir: cfg.workflow_dir.clone(),
             repo_pr_json,
+            pipeline_enabled: cfg.pipeline.enabled,
         })
     };
     let agent_backend: Arc<dyn AgentBackend> = match cfg.agent_backend {
@@ -241,7 +270,6 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             extra_args: cfg.opencode.args.clone(),
             auto_approve: cfg.opencode.auto_approve,
             turn_timeout_ms: cfg.opencode.turn_timeout_ms,
-            permission_config: None,
             mcp_wiring,
             workflow_dir: cfg.workflow_dir.clone(),
         }),
@@ -596,6 +624,8 @@ async fn on_tick(
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) {
     reconcile(shared, state, tx).await;
+    poll_approval_comments(shared).await;
+    apply_resolved_approvals(shared).await;
 
     if let Some(until) = state.rate_limited_until {
         if Instant::now() < until {
@@ -874,7 +904,7 @@ async fn terminate_running(
 }
 
 /// Abort a running worker and *wait for it to actually stop* (not just request
-/// cancellation) before touching its workspace, then run `after_run` if configured —
+/// cancellation) before touching its workspace, then run `after_run` if configured â€”
 /// Section 9.4 requires `after_run` to fire on cancellation, not just normal/error
 /// exit, and it can't safely run (or workspace cleanup safely proceed) while the
 /// aborted task's `Drop` (which `kill_on_drop`s the agent subprocess) might still be
@@ -1095,6 +1125,164 @@ async fn reconcile_stalled(
     }
 }
 
+/// AIR-5's issue-comment approval channel: for every still-pending approval, scan the
+/// issue thread's comments for `/approve`, `/changes <reason>` or `/reject [reason]`
+/// past whatever was already scanned (`approvals::last_seen_comment_id`), and record a
+/// decision on the first match -- `apply_resolved_approvals` (called right after this,
+/// same tick) then applies it exactly the same way a dashboard-recorded decision is
+/// applied. Unsupported trackers (`TrackerAdapter::fetch_issue_comments`'s default)
+/// simply never surface a comment here, so this is safe to run unconditionally.
+async fn poll_approval_comments(shared: &Shared) {
+    let db_path = approvals_db_path(&shared.config);
+    let pending = match approvals::list_pending(&db_path) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list pending approvals; skipping comment poll this tick");
+            return;
+        }
+    };
+    for row in pending {
+        let comments = match shared.tracker.fetch_issue_comments(&row.issue_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(issue_id = %row.issue_id, error = %e, "fetch_issue_comments failed; will retry next tick");
+                continue;
+            }
+        };
+        let last_seen = approvals::last_seen_comment_id(&db_path, row.id).unwrap_or(0);
+        let mut max_seen = last_seen;
+        let mut decided = false;
+        for c in comments.iter().filter(|c| c.id > last_seen) {
+            max_seen = max_seen.max(c.id);
+            if decided {
+                continue; // first matching command wins; keep scanning only to advance the cursor
+            }
+            let Some((decision, reason)) = parse_approval_command(&c.body) else {
+                continue;
+            };
+            let actor = c
+                .author
+                .clone()
+                .unwrap_or_else(|| "issue-comment".to_string());
+            match approvals::resolve(&db_path, row.id, decision, &actor, reason.as_deref()) {
+                Ok(true) => decided = true,
+                Ok(false) => {} // already resolved (e.g. via the dashboard) moments earlier
+                Err(e) => {
+                    tracing::warn!(approval_id = row.id, error = %e, "failed to record comment-driven approval decision");
+                }
+            }
+        }
+        if max_seen > last_seen
+            && let Err(e) = approvals::set_last_seen_comment_id(&db_path, row.id, max_seen)
+        {
+            tracing::warn!(approval_id = row.id, error = %e, "failed to advance approval comment cursor");
+        }
+    }
+}
+
+/// `/approve`, `/changes <reason>`, `/reject [reason]` (case-insensitive command,
+/// original-case reason) -- `None` for anything else, including a comment that merely
+/// mentions one of these words in passing.
+fn parse_approval_command(body: &str) -> Option<(approvals::Decision, Option<String>)> {
+    let trimmed = body.trim();
+    let lower = trimmed.to_lowercase();
+    for (cmd, decision) in [
+        ("/approve", approvals::Decision::Approve),
+        ("/changes", approvals::Decision::RequestChanges),
+        ("/reject", approvals::Decision::Reject),
+    ] {
+        if lower == cmd || lower.starts_with(&format!("{cmd} ")) {
+            let reason = trimmed[cmd.len()..].trim();
+            let reason = if reason.is_empty() {
+                None
+            } else {
+                Some(reason.to_string())
+            };
+            return Some((decision, reason));
+        }
+    }
+    None
+}
+
+/// Applies every approval decision resolved since the last tick -- whichever channel
+/// recorded it (dashboard POST, `poll_approval_comments` above) -- to tracker state and
+/// the event log. The sole place either channel's decision actually takes effect: this
+/// is the orchestrator's own tick loop, the one thing in Symphony with standing
+/// authority to mutate tracker state (`orchestrator.rs`'s module doc comment), so
+/// neither channel does it directly.
+async fn apply_resolved_approvals(shared: &Shared) {
+    let db_path = approvals_db_path(&shared.config);
+    let unapplied = match approvals::take_unapplied(&db_path) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list unapplied approval decisions; skipping this tick");
+            return;
+        }
+    };
+    for row in unapplied {
+        let Some(decision) = row.decision.as_deref().and_then(approvals::Decision::parse) else {
+            tracing::warn!(approval_id = row.id, decision = ?row.decision, "resolved approval row has an unrecognized decision; leaving unapplied");
+            continue;
+        };
+        let default_active_state = shared
+            .config
+            .active_states
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "todo".to_string());
+        let (target_state, resume_stage_id): (String, Option<String>) = match decision {
+            approvals::Decision::Approve => (default_active_state, row.next_stage_id.clone()),
+            approvals::Decision::RequestChanges => {
+                (default_active_state, Some(row.stage_id.clone()))
+            }
+            approvals::Decision::Reject => (shared.config.pipeline.blocked_state.clone(), None),
+        };
+
+        if let Err(e) = shared
+            .tracker
+            .set_issue_state(&row.issue_id, &target_state)
+            .await
+        {
+            tracing::warn!(
+                approval_id = row.id,
+                issue_id = %row.issue_id,
+                target_state = %target_state,
+                error = %e,
+                "failed to move issue after an approval decision; will retry next tick"
+            );
+            continue;
+        }
+
+        record_event(
+            shared,
+            crate::eventlog::NewEvent {
+                issue_id: row.issue_id.clone(),
+                identifier: row.identifier.clone(),
+                title: row.title.clone(),
+                session_id: None,
+                event_type: "approval_decided".to_string(),
+                message: Some(format!(
+                    "stage '{}': {} by {}{}",
+                    row.stage_id,
+                    decision.as_str(),
+                    row.actor.as_deref().unwrap_or("unknown"),
+                    row.comment
+                        .as_deref()
+                        .map(|c| format!(" -- {c}"))
+                        .unwrap_or_default()
+                )),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+        );
+
+        if let Err(e) = approvals::mark_applied(&db_path, row.id, resume_stage_id.as_deref()) {
+            tracing::warn!(approval_id = row.id, error = %e, "failed to mark approval decision applied (tracker state was already moved; this may reapply harmlessly next tick)");
+        }
+    }
+}
+
 async fn handle_retry_fired(
     shared: &Shared,
     state: &mut OrchestratorState,
@@ -1249,13 +1437,36 @@ async fn handle_msg(
             let is_tool_call = event.event == "tool_call";
             let tool_name = event.message.clone().unwrap_or_default();
 
+            // `test_report`/`coverage`'s `message` is the full JSON blob (AIR-6) --
+            // worth persisting (below) and browsing on `/events`, but not worth
+            // clobbering the running card's "last event" line with; the one-line
+            // `test_summary`/`coverage_summary` companions carry the human-readable
+            // version of the same data and update it normally.
+            let is_full_report = matches!(event.event.as_str(), "test_report" | "coverage");
+
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.last_event = Some(event.event.clone());
-                e.last_event_at = Some(Instant::now());
-                if let Some(m) = &event.message {
-                    e.last_message = Some(m.clone());
+                if !is_full_report {
+                    e.last_event = Some(event.event.clone());
+                    e.last_event_at = Some(Instant::now());
+                    if let Some(m) = &event.message {
+                        e.last_message = Some(m.clone());
+                    }
                 }
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+
+                match event.event.as_str() {
+                    "test_summary" => {
+                        state
+                            .metrics
+                            .issue_entry(&identifier, &title)
+                            .last_test_summary = event.message.clone();
+                    }
+                    "coverage_summary" => {
+                        state.metrics.issue_entry(&identifier, &title).last_coverage =
+                            event.message.clone();
+                    }
+                    _ => {}
+                }
 
                 if let Some(u) = &event.usage {
                     e.tokens.input_tokens += u.input_tokens;
@@ -1344,7 +1555,8 @@ async fn handle_msg(
                     };
                     let delay = if rate_limited {
                         state.rate_limited_until = Some(
-                            Instant::now() + Duration::from_millis(shared.config.rate_limit_pause_ms),
+                            Instant::now()
+                                + Duration::from_millis(shared.config.rate_limit_pause_ms),
                         );
                         shared.config.rate_limit_pause_ms
                     } else {
@@ -1383,9 +1595,13 @@ async fn handle_msg(
         } => {
             handle_retry_fired(shared, state, tx, issue_id, generation).await;
         }
-        OrchMsg::StageStarted { issue_id, stage_id } => {
+        OrchMsg::StageStarted {
+            issue_id,
+            stage_id,
+            role_summary,
+        } => {
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.current_stage = Some(stage_id.clone());
+                e.current_stage = Some(role_summary);
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
                 let session_id = e.session_id.clone();
                 record_event(
@@ -1421,6 +1637,54 @@ async fn handle_msg(
                         session_id: Some(session_id),
                         event_type: "stage_finished".to_string(),
                         message: Some(format!("{stage_id}: {outcome}")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::ApprovalRequested {
+            issue_id,
+            stage_id,
+            approval_id,
+        } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "approval_requested".to_string(),
+                        message: Some(format!(
+                            "stage '{stage_id}' is awaiting approval (#{approval_id})"
+                        )),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::ApprovalAutoApproved { issue_id, stage_id } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "approval_auto_approved".to_string(),
+                        message: Some(format!(
+                            "stage '{stage_id}' matched pipeline.approval.auto_approve_when"
+                        )),
                         input_tokens: None,
                         output_tokens: None,
                         total_tokens: None,
@@ -1525,7 +1789,13 @@ async fn run_attempt_body(
     let title = format!("{}: {}", issue.identifier, issue.title);
     let mut session = match snapshot
         .agent_backend
-        .start_session(workspace_path, &issue.id, &title, container)
+        .start_session(
+            workspace_path,
+            &issue.id,
+            &title,
+            container,
+            &crate::agent::ToolPolicy::default(),
+        )
         .await
     {
         Ok(s) => s,
@@ -1538,9 +1808,19 @@ async fn run_attempt_body(
     });
 
     let exit = if cfg.pipeline.enabled {
-        run_pipeline(issue_id, &mut issue, attempt, session.as_mut(), snapshot, tx).await
+        run_pipeline(
+            issue_id,
+            &mut issue,
+            attempt,
+            session.as_mut(),
+            snapshot,
+            workspace_path,
+            container,
+            tx,
+        )
+        .await
     } else {
-        match run_turn_loop(
+        let (outcome, _last_message) = run_turn_loop(
             session.as_mut(),
             &snapshot.tracker,
             &cfg.active_states,
@@ -1550,12 +1830,22 @@ async fn run_attempt_body(
             attempt,
             cfg.max_turns,
             issue_id,
+            None,
             tx,
+            None,
         )
-        .await
-        {
+        .await;
+        match outcome {
             LoopExit::Completed | LoopExit::EndedByIssueState => ExitReason::Normal,
             LoopExit::Error(e) => ExitReason::Error(e),
+            // `raise_clarification` is only exposed when `pipeline.enabled` (gated in
+            // `mcp.rs`), so this arm is unreachable on the legacy single-stage path --
+            // handled rather than `unreachable!()` since a future tool-exposure change
+            // elsewhere shouldn't be able to panic the whole worker over this.
+            LoopExit::Blocked(question) => {
+                tracing::warn!(issue_id = %issue_id, question = %question, "raise_clarification called outside the delivery pipeline; ignoring");
+                ExitReason::Normal
+            }
         }
     };
 
@@ -1575,6 +1865,12 @@ enum LoopExit {
     Completed,
     EndedByIssueState,
     Error(String),
+    /// A turn called `raise_clarification` with `blocking: true` (AIR-4): the cycle
+    /// stops right away rather than running out the stage's remaining turn budget,
+    /// same as a blocking stage failure -- `run_pipeline` parks the issue in
+    /// `pipeline.blocked_state` via the same `block_issue` path. Carries the question
+    /// only for the `stage_finished` event message.
+    Blocked(String),
 }
 
 /// Runs 1..=`max_turns` turns of `session` against `issue`, refreshing tracker state
@@ -1582,6 +1878,14 @@ enum LoopExit {
 /// exactly the loop `run_attempt_body` always ran (Section 16.5), generalized so it can
 /// be invoked once per pipeline stage (each with its own turn budget) as well as once
 /// for a whole attempt (the legacy, and still default, single-stage behavior).
+///
+/// Returns the last turn's final text message alongside the `LoopExit` -- AIR-5's
+/// approval gate uses it as a `requires_approval` stage's plan content
+/// (`handle_stage_approval`); every other caller ignores it.
+///
+/// `resume_note`, when set, is appended to *only* the first turn's prompt -- a human
+/// reviewer's "request changes" comment, injected back into the same stage's next
+/// attempt (`run_pipeline`'s resume handling).
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_loop(
     session: &mut dyn AgentSession,
@@ -1593,34 +1897,75 @@ async fn run_turn_loop(
     attempt: Option<u32>,
     max_turns: u32,
     issue_id: &str,
+    // AIR-2: the `cycle.*` template namespace (id/stage/artifacts/previous_stage_summary)
+    // for a pipeline stage's own role prompt. `None` for the legacy single-stage path,
+    // whose `WORKFLOW.md` prompt never references `cycle.*` -- `template::render`'s
+    // strict mode only errors on a *referenced* unknown variable, so omitting the key
+    // entirely is safe there. AIR-3's real per-cycle artifact index is folded into this
+    // object's `"artifacts"` field by `run_pipeline` before it's passed down here,
+    // rather than threaded through as a separate parameter.
+    cycle: Option<&serde_json::Value>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
-) -> LoopExit {
+    resume_note: Option<&str>,
+) -> (LoopExit, Option<String>) {
     let mut turn_number: u32 = 1;
+    let mut last_message: Option<String> = None;
     loop {
-        let prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns)
+        let mut prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns, cycle)
         {
             Ok(p) => p,
-            Err(e) => return LoopExit::Error(format!("prompt error: {e}")),
+            Err(e) => return (LoopExit::Error(format!("prompt error: {e}")), last_message),
         };
+        if turn_number == 1
+            && let Some(note) = resume_note
+        {
+            prompt.push_str(&format!(
+                "\n\n---\nA human reviewer requested changes to this stage's prior output: \
+                 {note}\nAddress this feedback in your revised output.\n"
+            ));
+        }
 
         let _ = tx.send(OrchMsg::TurnStarted {
             issue_id: issue_id.to_string(),
         });
 
-        match run_one_turn(session, &prompt, issue_id, tx).await {
+        let (outcome, question, msg) = run_one_turn(session, &prompt, issue_id, tx).await;
+        if msg.is_some() {
+            last_message = msg;
+        }
+        if let Some(question) = question {
+            return (LoopExit::Blocked(question), last_message);
+        }
+        match outcome {
             Ok(TurnOutcome::Completed { .. }) => {}
             Ok(TurnOutcome::Failed { reason }) => {
-                return LoopExit::Error(format!("agent turn error: {reason}"));
+                return (
+                    LoopExit::Error(format!("agent turn error: {reason}")),
+                    last_message,
+                );
             }
-            Err(e) => return LoopExit::Error(format!("agent turn error: {e}")),
+            Err(e) => {
+                return (
+                    LoopExit::Error(format!("agent turn error: {e}")),
+                    last_message,
+                );
+            }
         }
 
-        let refreshed = match tracker.fetch_issues_by_ids(std::slice::from_ref(&issue.id)).await {
+        let refreshed = match tracker
+            .fetch_issues_by_ids(std::slice::from_ref(&issue.id))
+            .await
+        {
             Ok(r) => r,
-            Err(e) => return LoopExit::Error(format!("issue state refresh error: {e}")),
+            Err(e) => {
+                return (
+                    LoopExit::Error(format!("issue state refresh error: {e}")),
+                    last_message,
+                );
+            }
         };
         let Some(next_issue) = refreshed.into_iter().next() else {
-            return LoopExit::EndedByIssueState;
+            return (LoopExit::EndedByIssueState, last_message);
         };
         *issue = next_issue;
 
@@ -1629,47 +1974,226 @@ async fn run_turn_loop(
             .iter()
             .any(|s| s.trim().to_lowercase() == normalized);
         if !active || !issue.is_routable(required_labels) {
-            return LoopExit::EndedByIssueState;
+            return (LoopExit::EndedByIssueState, last_message);
         }
         if turn_number >= max_turns {
-            return LoopExit::Completed;
+            return (LoopExit::Completed, last_message);
         }
         turn_number += 1;
     }
 }
 
 /// Drives one delivery cycle through `pipeline.stages` in order, within the one
-/// workspace/session `run_attempt_body` already set up (AIR-1: a stage boundary is not
-/// a workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
+/// workspace `run_attempt_body` already set up (AIR-1: a stage boundary is not a
+/// workspace boundary). Each stage's own turn budget runs via `run_turn_loop`;
 /// `StageStarted`/`StageFinished` bracket it so `/events` shows per-stage progress
 /// regardless of how the stage (or the whole cycle) ends.
+///
+/// AIR-2: each stage resolves its own role (`roles::resolve`) for its prompt, tool
+/// policy, and optionally a different backend/model than `agent.backend`. A stage whose
+/// role doesn't override backend/model keeps running on `session` -- the one shared
+/// session `run_attempt_body` started, preserving conversational continuity across
+/// stages exactly as before this ticket. A stage that *does* override gets its own
+/// freshly-started session (same workspace/container) for just that stage, stopped once
+/// the stage finishes.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     issue_id: &str,
     issue: &mut Issue,
     attempt: Option<u32>,
     session: &mut dyn AgentSession,
     snapshot: &DispatchSnapshot,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
+    // AIR-2's own display-facing id (used only in `cycle.id`, e.g. distinguishing
+    // retried attempts of the same issue in a rendered prompt). The artifact store
+    // (AIR-3) deliberately keys on plain `issue_id` instead, matching what
+    // `record_artifact`'s MCP wiring (`src/mcp.rs`) actually threads through today --
+    // one shared artifact index per issue, not one per attempt, so a retry still sees
+    // what earlier attempts already recorded rather than starting over.
+    let cycle_id = format!("{issue_id}-{}", attempt.unwrap_or(1));
+    let mut previous_stage_summary = String::new();
+    let artifacts_db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
 
-    for stage in &cfg.pipeline.stages {
+    // AIR-5: a prior cycle may have parked at a `requires_approval` stage and just
+    // been resumed (approved -> the stage after it; "request changes" -> the same
+    // stage again, with the reviewer's comment). `take_resume` hands this out at most
+    // once, so a later dispatch of the same issue for an unrelated reason (retry,
+    // manual re-trigger) doesn't replay it. An unresolvable stage id (stale config
+    // between the decision and this dispatch) falls back to starting over from stage 0
+    // rather than silently skipping the whole pipeline.
+    let resume = match approvals::take_resume(&approvals_db_path(cfg), issue_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, error = %e, "failed to read approval resume point; starting from stage 0");
+            None
+        }
+    };
+    let start_idx = resume
+        .as_ref()
+        .and_then(|r| cfg.pipeline.stages.iter().position(|s| s.id == r.stage_id))
+        .unwrap_or(0);
+    let resume_comment = resume.and_then(|r| r.reviewer_comment);
+
+    // AIR-7: an index, not a `for`-loop over `&cfg.pipeline.stages`, so a Reviewer
+    // stage's `request_changes` can rewind to an earlier Developer stage instead of
+    // simply advancing (see the rework handling in the `LoopExit::Completed` arm
+    // below) -- and so AIR-5's approval resume above can start mid-pipeline the same
+    // way the old `.skip(start_idx)` did.
+    let mut stage_idx: usize = start_idx;
+    while stage_idx < cfg.pipeline.stages.len() {
+        let stage = &cfg.pipeline.stages[stage_idx];
+        let resume_note = if stage_idx == start_idx {
+            resume_comment.as_deref()
+        } else {
+            None
+        };
+
+        // The test stage (AIR-6) is identified by convention (`id: test` plus a
+        // configured `pipeline.test` block), the same way every other stage's `role`
+        // is just a string until AIR-2 gives roles their own resolved behavior --
+        // no new "stage kind" concept, just a naming convention two config keys agree
+        // on. "Before touching anything" (the ticket's own words for the baseline run)
+        // means literally before this stage's agent turns start writing tests.
+        let is_test_stage = stage.id.eq_ignore_ascii_case("test") && cfg.pipeline.test.is_some();
+        let baseline = if is_test_stage {
+            match (&cfg.pipeline.test, &cfg.repo) {
+                (Some(test_cfg), Some(repo)) => {
+                    crate::quality::collect_baseline(
+                        test_cfg,
+                        &cfg.workflow_dir,
+                        workspace_path,
+                        &repo.default_branch,
+                        cfg.hook_timeout_ms,
+                        container,
+                    )
+                    .await
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // AIR-4: an `optional: true` stage can be opted out of per-issue by labeling
+        // the issue `skip-<stage-id>` -- checked before role resolution, since a
+        // skipped stage never actually runs a role.
+        let skip_label = format!("skip-{}", stage.id.trim().to_lowercase());
+        if stage.optional
+            && issue
+                .labels
+                .iter()
+                .any(|l| l.trim().to_lowercase() == skip_label)
+        {
+            let _ = tx.send(OrchMsg::StageStarted {
+                issue_id: issue_id.to_string(),
+                stage_id: stage.id.clone(),
+                role_summary: format!("{} — skipped", stage.id),
+            });
+            let _ = tx.send(OrchMsg::StageFinished {
+                issue_id: issue_id.to_string(),
+                stage_id: stage.id.clone(),
+                outcome: format!("skipped: issue labeled 'skip-{}'", stage.id),
+            });
+            stage_idx += 1;
+            continue;
+        }
+
+        let role = match crate::roles::resolve(&stage.role, cfg) {
+            Ok(r) => r,
+            Err(e) => return ExitReason::Error(format!("stage '{}' role error: {e}", stage.id)),
+        };
+        let role_key = stage.role.trim().to_lowercase();
+        let role_summary = if role.overrides_backend {
+            format!(
+                "{} — {} ({}{})",
+                stage.id,
+                stage.role,
+                backend_label(role.backend),
+                role.model
+                    .as_ref()
+                    .map(|m| format!("/{m}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!("{} — {}", stage.id, stage.role)
+        };
         let _ = tx.send(OrchMsg::StageStarted {
             issue_id: issue_id.to_string(),
             stage_id: stage.id.clone(),
+            role_summary,
         });
 
-        let mut outcome = run_turn_loop(
-            session,
+        // AIR-3: tag the workspace with the stage now running (read back by
+        // `record_artifact`, executing in the separate `__mcp_tool_server`
+        // subprocess) and refresh its `.symphony/artifacts/` copies with whatever
+        // earlier stages of this cycle have recorded so far -- covers a workspace
+        // recreated since the last stage ran, not just a continuously-running one.
+        crate::artifacts::prepare_workspace_for_stage(
+            &artifacts_db_path,
+            &cfg.workflow_dir,
+            issue_id,
+            workspace_path,
+            &stage.id,
+        );
+        let cycle_artifacts = crate::artifacts::list_index(&artifacts_db_path, issue_id);
+        // AIR-7: the Reviewer stage needs the working diff, but must not itself be
+        // able to write files (`ToolPolicy::SWEBOT`) -- computed here, host-side, via
+        // the hook plumbing (works identically against a plain host checkout or a
+        // containerized one) and handed over as a workspace-relative path, the same
+        // write-then-reference convention `swebot::review` already uses for the same
+        // "a real diff can exceed the command line" reason.
+        let diff_path = if role_key == "reviewer" {
+            write_review_diff(cfg, workspace_path, container).await
+        } else {
+            None
+        };
+        let cycle_ctx = json!({
+            "id": cycle_id,
+            "stage": stage.id,
+            "artifacts": cycle_artifacts,
+            "previous_stage_summary": previous_stage_summary,
+            "diff_path": diff_path.unwrap_or_default(),
+        });
+
+        let mut fresh_session: Option<Box<dyn AgentSession>> = None;
+        if role.overrides_backend {
+            let backend = crate::roles::build_backend(&role, cfg);
+            let title = format!("{}: {} [{}]", issue.identifier, issue.title, stage.id);
+            match backend
+                .start_session(workspace_path, issue_id, &title, container, &role.tool_policy)
+                .await
+            {
+                Ok(s) => fresh_session = Some(s),
+                Err(e) => {
+                    return ExitReason::Error(format!(
+                        "stage '{}' session startup error: {e}",
+                        stage.id
+                    ));
+                }
+            }
+        }
+        let active_session: &mut dyn AgentSession = match &mut fresh_session {
+            Some(s) => s.as_mut(),
+            None => &mut *session,
+        };
+
+        let (mut outcome, mut last_message) = run_turn_loop(
+            active_session,
             &snapshot.tracker,
             &cfg.active_states,
             &cfg.required_labels,
-            &snapshot.prompt_template,
+            &role.prompt,
             issue,
             attempt,
             stage.max_turns,
             issue_id,
+            Some(&cycle_ctx),
             tx,
+            resume_note,
         )
         .await;
 
@@ -1677,19 +2201,66 @@ async fn run_pipeline(
         // through to the same handling `escalate` gets -- a bounded retry, not
         // unbounded looping.
         if matches!(outcome, LoopExit::Error(_)) && stage.on_failure == StageFailureAction::Retry {
-            outcome = run_turn_loop(
-                session,
+            (outcome, last_message) = run_turn_loop(
+                active_session,
                 &snapshot.tracker,
                 &cfg.active_states,
                 &cfg.required_labels,
-                &snapshot.prompt_template,
+                &role.prompt,
                 issue,
                 attempt,
                 stage.max_turns,
                 issue_id,
+                Some(&cycle_ctx),
                 tx,
+                resume_note,
             )
             .await;
+        }
+
+        if let Some(s) = fresh_session {
+            s.stop().await;
+        }
+
+        // Run the configured suites/coverage for real once the agent's own turns are
+        // done writing tests (skipped if the stage's turns errored out -- that failure
+        // is handled by the normal `on_failure` path below, running tests against a
+        // possibly half-written change adds nothing). A blocking coverage-gate miss is
+        // handled exactly like a blocking stage failure: park the issue and stop, same
+        // `block_issue` path `on_failure: escalate` already uses.
+        if is_test_stage && !matches!(outcome, LoopExit::Error(_)) {
+            let test_cfg = cfg
+                .pipeline
+                .test
+                .as_ref()
+                .expect("is_test_stage implies Some");
+            let stage_outcome = crate::quality::run_test_stage(
+                test_cfg,
+                &cfg.workflow_dir,
+                workspace_path,
+                cfg.hook_timeout_ms,
+                container,
+                baseline.as_deref(),
+                stage.blocking,
+            )
+            .await;
+            emit_test_stage_events(tx, issue_id, &stage_outcome);
+
+            if let crate::quality::CoverageGate::Blocking {
+                percent,
+                min_percent,
+            } = stage_outcome.gate
+            {
+                let _ = tx.send(OrchMsg::StageFinished {
+                    issue_id: issue_id.to_string(),
+                    stage_id: stage.id.clone(),
+                    outcome: format!(
+                        "blocked: coverage {percent:.1}% below required {min_percent:.1}%"
+                    ),
+                });
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
+                return ExitReason::Normal;
+            }
         }
 
         let outcome_label = match &outcome {
@@ -1699,7 +2270,11 @@ async fn run_pipeline(
                 format!("failed, skipped: {reason}")
             }
             LoopExit::Error(reason) => format!("failed: {reason}"),
+            LoopExit::Blocked(question) => {
+                format!("blocked: clarification needed: {question}")
+            }
         };
+        previous_stage_summary = format!("{}: {outcome_label}", stage.id);
         let _ = tx.send(OrchMsg::StageFinished {
             issue_id: issue_id.to_string(),
             stage_id: stage.id.clone(),
@@ -1707,10 +2282,110 @@ async fn run_pipeline(
         });
 
         match outcome {
-            LoopExit::Completed => continue,
+            LoopExit::Completed => {
+                if stage.requires_approval {
+                    let next_stage_id = cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
+                    let auto_approved = handle_stage_approval(
+                        issue_id,
+                        issue,
+                        stage,
+                        next_stage_id,
+                        last_message,
+                        snapshot,
+                        tx,
+                    )
+                    .await;
+                    if auto_approved {
+                        stage_idx += 1;
+                        continue;
+                    }
+                    return ExitReason::Normal; // parked awaiting approval
+                }
+                // AIR-7: a Reviewer stage's `request_changes` recommendation sends the
+                // cycle back to the nearest earlier Developer stage instead of simply
+                // advancing -- a measured rework loop (roadmap §11: rework is a
+                // recorded quantity, not silent looping), bounded by
+                // `pipeline.review.max_rework_rounds`.
+                if role_key == "reviewer"
+                    && let Some((recommendation, summary)) = latest_review_recommendation(
+                        &cfg.workflow_dir,
+                        &artifacts_db_path,
+                        issue_id,
+                        &stage.id,
+                    )
+                    && recommendation == "request_changes"
+                {
+                    let round = crate::eventlog::record_rework_round(
+                        &artifacts_db_path,
+                        &crate::eventlog::NewReworkRound {
+                            issue_id,
+                            identifier: &issue.identifier,
+                            title: &issue.title,
+                            stage_id: &stage.id,
+                            recommendation: &recommendation,
+                            summary: &summary,
+                            escalated: round_exceeds_limit(
+                                &artifacts_db_path,
+                                issue_id,
+                                cfg.pipeline.review.max_rework_rounds,
+                            ),
+                        },
+                    )
+                    .unwrap_or(1);
+                    if round > cfg.pipeline.review.max_rework_rounds as i64 {
+                        block_issue(
+                            snapshot,
+                            issue_id,
+                            &cfg.pipeline.blocked_state,
+                            Some(&format!(
+                                "Reviewer stage '{}' requested changes {round} times, exceeding \
+                                 pipeline.review.max_rework_rounds ({}) -- escalating instead of \
+                                 reworking again. Last review: {summary}",
+                                stage.id, cfg.pipeline.review.max_rework_rounds
+                            )),
+                        )
+                        .await;
+                        return ExitReason::Normal;
+                    }
+                    match developer_stage_index(&cfg.pipeline.stages, stage_idx) {
+                        Some(dev_idx) => {
+                            previous_stage_summary = format!(
+                                "{}: request_changes (rework round {round}) — {summary}",
+                                stage.id
+                            );
+                            stage_idx = dev_idx;
+                            continue;
+                        }
+                        None => {
+                            block_issue(
+                                snapshot,
+                                issue_id,
+                                &cfg.pipeline.blocked_state,
+                                Some(&format!(
+                                    "Reviewer stage '{}' requested changes but no earlier \
+                                     'developer'-role stage exists to rework: {summary}",
+                                    stage.id
+                                )),
+                            )
+                            .await;
+                            return ExitReason::Normal;
+                        }
+                    }
+                }
+                stage_idx += 1;
+                continue;
+            }
             LoopExit::EndedByIssueState => return ExitReason::Normal,
+            // A blocking clarification stops the cycle exactly like a blocking stage
+            // failure (AIR-4) -- same `block_issue` park, regardless of `stage.blocking`,
+            // since this is the agent explicitly asking a human rather than an error.
+            LoopExit::Blocked(question) => {
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, Some(&question)).await;
+                return ExitReason::Normal;
+            }
             LoopExit::Error(reason) => {
                 if stage.on_failure == StageFailureAction::Skip {
+                    stage_idx += 1;
                     continue;
                 }
                 // A plan usage-limit hit isn't a genuine exit-criteria failure -- it
@@ -1722,7 +2397,7 @@ async fn run_pipeline(
                 // phrase and schedules the long, coordinated pause instead of the
                 // normal short backoff.
                 if stage.blocking && !is_plan_rate_limited(&reason) {
-                    block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state).await;
+                    block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
                     return ExitReason::Normal;
                 }
                 return ExitReason::Error(format!("stage '{}' failed: {reason}", stage.id));
@@ -1732,14 +2407,124 @@ async fn run_pipeline(
     ExitReason::Normal
 }
 
-/// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure --
-/// deliberately host-side (`TrackerAdapter::set_issue_state`, not the agent-facing
-/// `update_issue_state` tool): the decision to stop the cycle is the orchestrator's,
-/// not something to ask the (just-failed) agent to report on its own behalf. A tracker
-/// adapter that doesn't support this (the default) logs a warning rather than failing
-/// the cycle outright -- the cycle still stops via `ExitReason::Normal` either way,
-/// this only affects whether the tracker's own state reflects why.
-async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state: &str) {
+/// `git diff <merge-base>..HEAD` in `workspace_path`, written to
+/// `.symphony/review.diff` and returned as that workspace-relative path (AIR-7) --
+/// run through the hook plumbing (`hooks::run_hook_maybe_containerized`) so it works
+/// identically against a plain host checkout or a containerized one, rather than a
+/// direct `Command::new("git")` that would only ever see the host side. `None` if the
+/// script itself couldn't be launched at all; a missing/empty diff (no `repo:`
+/// configured, nothing to diff against) still writes an empty file rather than
+/// failing, since a Reviewer stage should still run -- just with less to go on.
+async fn write_review_diff(
+    cfg: &EffectiveConfig,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
+) -> Option<String> {
+    let default_branch = cfg
+        .repo
+        .as_ref()
+        .map(|r| r.default_branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let script = format!(
+        "mkdir -p .symphony\n\
+         base=\"{default_branch}\"\n\
+         git rev-parse --verify \"$base\" >/dev/null 2>&1 || base=\"origin/{default_branch}\"\n\
+         merge_base=$(git merge-base HEAD \"$base\" 2>/dev/null || echo \"$base\")\n\
+         git diff \"$merge_base\"..HEAD > .symphony/review.diff 2>/dev/null || true\n"
+    );
+    match hooks::run_hook_maybe_containerized(
+        "review_diff",
+        &script,
+        &cfg.workflow_dir,
+        workspace_path,
+        cfg.hook_timeout_ms,
+        container,
+    )
+    .await
+    {
+        Ok(()) => Some(".symphony/review.diff".to_string()),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to compute the working diff for the reviewer stage (it will run without one)");
+            None
+        }
+    }
+}
+
+/// Index of the nearest `role: developer` stage at or before `before_idx` -- AIR-7's
+/// rework loop resends the cycle to the Developer stage that most recently fed this
+/// Reviewer run, not always the pipeline's first one (a later hardening pass could
+/// also be `role: developer`).
+fn developer_stage_index(stages: &[config::StageConfig], before_idx: usize) -> Option<usize> {
+    stages[..before_idx]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, s)| s.role.trim().to_lowercase() == "developer")
+        .map(|(i, _)| i)
+}
+
+/// Whether recording one more rework round for `issue_id` would exceed
+/// `max_rework_rounds` -- computed *before* the round is actually recorded so
+/// `eventlog::record_rework_round`'s stored `escalated` flag reflects the outcome this
+/// round produced, for the `/reviews` dashboard's explanation surface.
+fn round_exceeds_limit(db_path: &Path, issue_id: &str, max_rework_rounds: u32) -> bool {
+    let already = crate::eventlog::rework_rounds_for_issue(db_path, issue_id)
+        .map(|rows| rows.len())
+        .unwrap_or(0);
+    (already as u32 + 1) > max_rework_rounds
+}
+
+/// The most recent `review_findings` artifact `stage_id` recorded this cycle, if any:
+/// `(recommendation, summary)`. `summary` is the artifact's own human-readable
+/// one-liner (`record_artifact`'s `summary` argument) rather than something re-derived
+/// from the findings array -- already exactly what a human/the next Developer turn
+/// needs, no second summarization step.
+fn latest_review_recommendation(
+    workflow_dir: &Path,
+    db_path: &Path,
+    issue_id: &str,
+    stage_id: &str,
+) -> Option<(String, String)> {
+    let row = crate::artifacts::list_for_cycle(db_path, issue_id)
+        .into_iter()
+        .rfind(|r| r.kind == "review_findings" && r.stage_id.as_deref() == Some(stage_id))?;
+    let bytes = crate::artifacts::read_content(workflow_dir, &row).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let recommendation = value.get("recommendation")?.as_str()?.to_string();
+    Some((recommendation, row.summary))
+}
+
+fn backend_label(backend: AgentBackendKind) -> &'static str {
+    match backend {
+        AgentBackendKind::Claude => "claude",
+        AgentBackendKind::Codex => "codex",
+        AgentBackendKind::OpenCode => "opencode",
+    }
+}
+
+/// Parks `issue_id` in `pipeline.blocked_state` after a blocking stage's failure or a
+/// blocking clarification (AIR-4) -- deliberately host-side
+/// (`TrackerAdapter::set_issue_state`, not the agent-facing `update_issue_state`
+/// tool): the decision to stop the cycle is the orchestrator's, not something to ask
+/// the (just-failed) agent to report on its own behalf. A tracker adapter that doesn't
+/// support this (the default) logs a warning rather than failing the cycle outright --
+/// the cycle still stops via `ExitReason::Normal` either way, this only affects
+/// whether the tracker's own state reflects why.
+///
+/// `clarification` is `Some(question)` for a blocking `raise_clarification` call, in
+/// which case the question is also posted as a comment on the issue where the tracker
+/// adapter supports it (`TrackerAdapter::post_comment`, also default-unsupported --
+/// the question is still visible either way via the `clarification_raised` event
+/// already recorded when the tool was called). AIR-5 reuses this same function (with
+/// `clarification: None`) to park a cycle in `pipeline.awaiting_approval_state` too --
+/// same host-side "the orchestrator decided this, not the agent" shape, just a
+/// different target state and no clarification text to post.
+async fn block_issue(
+    snapshot: &DispatchSnapshot,
+    issue_id: &str,
+    blocked_state: &str,
+    clarification: Option<&str>,
+) {
     if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
         tracing::warn!(
             issue_id = %issue_id,
@@ -1748,28 +2533,247 @@ async fn block_issue(snapshot: &DispatchSnapshot, issue_id: &str, blocked_state:
             "failed to park issue in pipeline.blocked_state after a blocking stage failure"
         );
     }
+    if let Some(question) = clarification {
+        let body = format!(
+            "**Symphony: clarification needed before this cycle can continue.**\n\n\
+             {question}\n\n\
+             Reply on this issue (or edit its file directly, for the local tracker) \
+             with an answer, then move it back to an active state to resume."
+        );
+        if let Err(e) = snapshot.tracker.post_comment(issue_id, &body).await {
+            tracing::info!(
+                issue_id = %issue_id,
+                error = %e,
+                "tracker adapter does not support post_comment; clarification is recorded in the event log/dashboard only"
+            );
+        }
+    }
 }
 
+/// `symphony.db` lives alongside the eventlog, keyed by `workflow_dir` the same way
+/// `eventlog::spawn_writer`'s caller resolves it -- one SQLite file, several tables,
+/// not a second database to keep track of.
+fn approvals_db_path(cfg: &EffectiveConfig) -> PathBuf {
+    cfg.workflow_dir.join(crate::eventlog::DB_FILENAME)
+}
+
+/// A `requires_approval` stage just completed successfully. Either it matches
+/// `pipeline.approval.auto_approve_when` (no human needed -- returns `true`, the
+/// caller moves straight to the next stage) or it's parked: a pending-approval row is
+/// recorded and the issue is moved to `pipeline.awaiting_approval_state` (host-side,
+/// like `block_issue` -- this is the orchestrator's decision, not the agent's), and
+/// the caller returns `ExitReason::Normal` to release the worker slot.
+async fn handle_stage_approval(
+    issue_id: &str,
+    issue: &Issue,
+    stage: &config::StageConfig,
+    next_stage_id: Option<String>,
+    last_message: Option<String>,
+    snapshot: &DispatchSnapshot,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) -> bool {
+    let cfg = &snapshot.config;
+    let plan_json = last_message.as_deref().and_then(extract_plan_json);
+
+    if let Some(cond) = &cfg.pipeline.approval.auto_approve_when
+        && evaluate_auto_approve(plan_json.as_deref(), cond)
+    {
+        let _ = tx.send(OrchMsg::ApprovalAutoApproved {
+            issue_id: issue_id.to_string(),
+            stage_id: stage.id.clone(),
+        });
+        return true;
+    }
+
+    let db_path = approvals_db_path(cfg);
+    let new = approvals::NewApproval {
+        issue_id: issue_id.to_string(),
+        identifier: issue.identifier.clone(),
+        title: issue.title.clone(),
+        stage_id: stage.id.clone(),
+        next_stage_id,
+        plan_text: last_message,
+        plan_json,
+    };
+    let approval_id = match approvals::create_pending(&db_path, &new) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, stage_id = %stage.id, error = %e, "failed to record pending approval; falling back to the plain blocking-stage park so the cycle doesn't silently spin");
+            block_issue(snapshot, issue_id, &cfg.pipeline.awaiting_approval_state, None).await;
+            return false;
+        }
+    };
+    if let Err(e) = snapshot
+        .tracker
+        .set_issue_state(issue_id, &cfg.pipeline.awaiting_approval_state)
+        .await
+    {
+        tracing::warn!(
+            issue_id = %issue_id,
+            awaiting_approval_state = %cfg.pipeline.awaiting_approval_state,
+            error = %e,
+            "failed to park issue in pipeline.awaiting_approval_state after a requires_approval stage"
+        );
+    }
+    let _ = tx.send(OrchMsg::ApprovalRequested {
+        issue_id: issue_id.to_string(),
+        stage_id: stage.id.clone(),
+        approval_id,
+    });
+    false
+}
+
+/// A `requires_approval` stage's output, as far as `auto_approve_when` can see it --
+/// parsed from a fenced ```json block in the stage's last turn message (the same
+/// convention `swebot`'s `qa`/`drafting`/`review` drivers already use to get
+/// structured output from a free-text turn). Fields absent or unparseable never
+/// satisfy a condition that checks them (see `evaluate_auto_approve`), so a stage that
+/// didn't emit structured output simply never auto-approves.
+#[derive(Debug, Default, serde::Deserialize)]
+struct PlanSummary {
+    #[serde(default)]
+    risk: Option<String>,
+    #[serde(default)]
+    impacted_components: Vec<String>,
+    #[serde(default)]
+    estimate_turns: Option<u32>,
+}
+
+fn extract_plan_json(text: &str) -> Option<String> {
+    let v = crate::swebot::extract_json_block(text).ok()?;
+    serde_json::to_string_pretty(&v).ok()
+}
+
+/// Every condition set on `cond` (`None` fields are simply not checked) must hold
+/// against `plan_json` for a `requires_approval` stage to skip the human. `plan_json`
+/// being absent/unparseable fails every *set* condition -- never auto-approve on
+/// missing information.
+fn evaluate_auto_approve(plan_json: Option<&str>, cond: &config::AutoApproveWhen) -> bool {
+    let plan: PlanSummary = plan_json
+        .and_then(|j| serde_json::from_str(j).ok())
+        .unwrap_or_default();
+
+    if let Some(want) = &cond.risk {
+        match &plan.risk {
+            Some(r) if r.trim().eq_ignore_ascii_case(want.trim()) => {}
+            _ => return false,
+        }
+    }
+    if let Some(allowlist) = &cond.impacted_components_allowlist {
+        let allowed: HashSet<String> = allowlist.iter().map(|s| s.trim().to_lowercase()).collect();
+        if !plan
+            .impacted_components
+            .iter()
+            .all(|c| allowed.contains(&c.trim().to_lowercase()))
+        {
+            return false;
+        }
+    }
+    if let Some(max_turns) = cond.max_estimate_turns {
+        match plan.estimate_turns {
+            Some(t) if t <= max_turns => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Feeds the test stage's results into the same `OrchMsg::AgentEvent` pipe every other
+/// agent event flows through (`run_one_turn`'s forwarder above) -- no new persistence
+/// or dashboard-refresh mechanism: `handle_msg` already records every `AgentEvent` to
+/// the event log and republishes the live status snapshot, and `/events` already lets
+/// an operator browse by `event_type`. Three events, cheapest-to-richest: a one-line
+/// summary for the dashboard/report column, then the full `test_report` and `coverage`
+/// JSON for anyone who clicks through to see the per-suite/per-AC evidence.
+fn emit_test_stage_events(
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+    issue_id: &str,
+    outcome: &crate::quality::TestStageOutcome,
+) {
+    let mut summary = AgentEvent::new("test_summary");
+    summary.message = Some(outcome.report.summary_line());
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: summary,
+    });
+
+    let mut coverage_summary = AgentEvent::new("coverage_summary");
+    coverage_summary.message = Some(match outcome.coverage.line_percent() {
+        Some(p) => format!("{p:.1}%"),
+        None => "not measured".to_string(),
+    });
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: coverage_summary,
+    });
+
+    if let Ok(report_json) = serde_json::to_string(&outcome.report) {
+        let mut ev = AgentEvent::new("test_report");
+        ev.message = Some(report_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
+    }
+    if let Ok(coverage_json) = serde_json::to_string(&outcome.coverage) {
+        let mut ev = AgentEvent::new("coverage");
+        ev.message = Some(coverage_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
+    }
+}
+
+/// Returns the turn's outcome, plus two things extracted while forwarding its event
+/// stream (so nothing needs a second pass over it): `Some(question)` if this turn
+/// called `raise_clarification` with `blocking: true` (AIR-4, lets `run_turn_loop`
+/// stop the cycle), and the turn's final text message, if any (AIR-5's approval gate
+/// uses a `requires_approval` stage's last words as the plan content shown to a
+/// human, `handle_stage_approval`).
 async fn run_one_turn(
     session: &mut dyn AgentSession,
     prompt: &str,
     issue_id: &str,
     tx: &mpsc::UnboundedSender<OrchMsg>,
-) -> Result<TurnOutcome, crate::agent::AgentError> {
+) -> (
+    Result<TurnOutcome, crate::agent::AgentError>,
+    Option<String>,
+    Option<String>,
+) {
     let (etx, mut erx) = mpsc::unbounded_channel::<AgentEvent>();
     let fwd_issue_id = issue_id.to_string();
     let fwd_tx = tx.clone();
     let forward = tokio::spawn(async move {
+        let mut blocked_on: Option<String> = None;
+        let mut last_message: Option<String> = None;
         while let Some(ev) = erx.recv().await {
+            if ev.event == "clarification_raised"
+                && let Some(msg) = &ev.message
+                && let Ok(payload) = serde_json::from_str::<Value>(msg)
+                && payload.get("blocking").and_then(|b| b.as_bool()) == Some(true)
+            {
+                blocked_on = Some(
+                    payload
+                        .get("question")
+                        .and_then(|q| q.as_str())
+                        .unwrap_or("(no question given)")
+                        .to_string(),
+                );
+            }
+            if let Some(m) = &ev.message {
+                last_message = Some(m.clone());
+            }
             let _ = fwd_tx.send(OrchMsg::AgentEvent {
                 issue_id: fwd_issue_id.clone(),
                 event: ev,
             });
         }
+        (blocked_on, last_message)
     });
     let result = session.run_turn(prompt, etx).await;
-    let _ = forward.await;
-    result
+    let (blocked_on, last_message) = forward.await.unwrap_or((None, None));
+    (result, blocked_on, last_message)
 }
 
 fn render_turn_prompt(
@@ -1778,12 +2782,32 @@ fn render_turn_prompt(
     attempt: Option<u32>,
     turn_number: u32,
     max_turns: u32,
+    // AIR-2's `cycle.*` template namespace, with AIR-3's real per-cycle artifact index
+    // already folded into its `"artifacts"` field by `run_pipeline` -- see that
+    // function's own doc comment. `None` for the legacy single-stage path (its
+    // `WORKFLOW.md` prompt never references `cycle.*`, so omitting the key entirely is
+    // safe under `template::render`'s strict mode, which only errors on a *referenced*
+    // unknown variable); every built-in pipeline role prompt that references
+    // `cycle.artifacts` only ever runs with `Some(cycle)` supplied.
+    cycle: Option<&serde_json::Value>,
 ) -> Result<String, template::TemplateError> {
     if turn_number == 1 {
-        let ctx = json!({
+        let mut ctx = json!({
             "issue": serde_json::to_value(issue).unwrap_or(serde_json::Value::Null),
             "attempt": attempt,
+            // AIR-7: always present (like `cycle.artifacts`), not just for the
+            // Reviewer role -- the same persona/checklist text `swebot::review` holds
+            // its PR reviews to (`crate::review_rubric`), so a project that overrides
+            // `roles.reviewer.prompt` can still reference `{{ rubric.* }}` and get the
+            // same quality bar rather than having to copy-paste it.
+            "rubric": {
+                "persona": crate::review_rubric::PERSONA,
+                "checklist": crate::review_rubric::CHECKLIST,
+            },
         });
+        if let Some(cycle) = cycle {
+            ctx["cycle"] = cycle.clone();
+        }
         template::render(template_str, &ctx)
     } else {
         Ok(format!(
@@ -1836,7 +2860,7 @@ mod tests {
 
     /// Regression test for the AR-8 incident: a running worker that gets aborted by
     /// reconciliation (terminal state, non-active state, or a stall timeout) must
-    /// still get its `after_run` hook run before its workspace is touched — not just
+    /// still get its `after_run` hook run before its workspace is touched â€” not just
     /// a worker that exits on its own via the normal WorkerExit message path.
     #[tokio::test]
     async fn abort_and_run_after_run_runs_the_hook_against_a_real_workspace() {
@@ -1906,6 +2930,26 @@ mod tests {
     struct ScriptedBackend {
         calls: Arc<Mutex<u32>>,
         failures: HashMap<u32, String>,
+        /// Per-turn-number final message, captured by `run_one_turn`/`run_turn_loop`
+        /// as the stage's `last_message` -- AIR-5's approval-gate tests need to control
+        /// this (a plan's fenced ```json block) the same way `failures` controls
+        /// outcomes. Absent turns just report "turn_completed" with no message, as
+        /// every pre-AIR-5 test here already assumed.
+        messages: HashMap<u32, String>,
+        /// Every prompt run, in order -- AIR-5's "request changes" test asserts the
+        /// reviewer's comment actually landed in the resumed stage's first prompt.
+        prompts_seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(calls: Arc<Mutex<u32>>, failures: HashMap<u32, String>) -> Self {
+            Self {
+                calls,
+                failures,
+                messages: HashMap::new(),
+                prompts_seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1916,10 +2960,13 @@ mod tests {
             _issue_id: &str,
             _title: &str,
             _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
         ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
             Ok(Box::new(ScriptedSession {
                 calls: self.calls.clone(),
                 failures: self.failures.clone(),
+                messages: self.messages.clone(),
+                prompts_seen: self.prompts_seen.clone(),
             }))
         }
     }
@@ -1927,6 +2974,8 @@ mod tests {
     struct ScriptedSession {
         calls: Arc<Mutex<u32>>,
         failures: HashMap<u32, String>,
+        messages: HashMap<u32, String>,
+        prompts_seen: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -1937,15 +2986,20 @@ mod tests {
 
         async fn run_turn(
             &mut self,
-            _prompt: &str,
+            prompt: &str,
             events: mpsc::UnboundedSender<AgentEvent>,
         ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            self.prompts_seen.lock().unwrap().push(prompt.to_string());
             let n = {
                 let mut calls = self.calls.lock().unwrap();
                 *calls += 1;
                 *calls
             };
-            let _ = events.send(AgentEvent::new("turn_completed"));
+            let event = match self.messages.get(&n) {
+                Some(msg) => AgentEvent::new("turn_completed").with_message(msg.clone()),
+                None => AgentEvent::new("turn_completed"),
+            };
+            let _ = events.send(event);
             match self.failures.get(&n) {
                 Some(reason) => Ok(TurnOutcome::Failed {
                     reason: reason.clone(),
@@ -1978,7 +3032,12 @@ mod tests {
              pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n{stages_yaml}"
         ))
         .unwrap();
-        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        // `tracker_dir` doubles as `workflow_dir` here (both are throwaway per-test
+        // tempdirs already): AIR-3's artifact store and AIR-5's approvals store both
+        // derive their db/blob paths from `cfg.workflow_dir`, and using "." like the
+        // other tests below would make `run_pipeline` write `symphony.db`/`.symphony/`
+        // into this crate's own working directory during `cargo test`.
+        let cfg = config::resolve(&cfg_yaml, tracker_dir).unwrap();
 
         let provider: serde_yaml::Value =
             serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
@@ -1992,6 +3051,39 @@ mod tests {
             // Never touched by these tests (`run_pipeline` doesn't create workspaces
             // itself -- that's `run_agent_attempt`'s job), so an unused placeholder
             // path is fine; `WorkspaceManager::new` does no I/O at construction.
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    /// Like `pipeline_snapshot`, but with a real (tempdir) `workflow_dir` so
+    /// `approvals_db_path` resolves to an isolated `symphony.db` instead of the repo's
+    /// own working directory -- required for every AIR-5 test below, which all read or
+    /// write approval rows. `extra_pipeline_yaml` lets a test add
+    /// `awaiting_approval_state:`/`approval:` on top of the stage list.
+    fn approval_pipeline_snapshot(
+        tracker_dir: &Path,
+        workflow_dir: &Path,
+        extra_pipeline_yaml: &str,
+        stages_yaml: &str,
+        backend: ScriptedBackend,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n{extra_pipeline_yaml}  stages:\n{stages_yaml}"
+        ))
+        .unwrap();
+        let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        cfg.workflow_dir = workflow_dir.to_path_buf();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(backend),
             workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
         }
     }
@@ -2024,10 +3116,7 @@ mod tests {
             tracker_dir.path(),
             "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
              \x20\x20- id: implement\n    role: developer\n    max_turns: 2\n",
-            ScriptedBackend {
-                calls: calls.clone(),
-                failures: HashMap::new(),
-            },
+            ScriptedBackend::new(calls.clone(), HashMap::new()),
         );
 
         let mut issue = snapshot
@@ -2037,14 +3126,31 @@ mod tests {
             .unwrap()
             .remove(0);
 
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2062,6 +3168,180 @@ mod tests {
         );
     }
 
+    /// AIR-2: the dashboard shows *which role* is driving a running stage
+    /// (`status::RunningRow::stage`, fed by `OrchMsg::StageStarted::role_summary`), not
+    /// just the stage id -- this is the human-observability surface for role
+    /// resolution. A stage whose role doesn't override `agent.backend` gets a plain
+    /// "stage — role" summary; a stage that does gets the backend/model appended too
+    /// (covered by `roles::tests::build_backend_for_an_overriding_role_...` for the
+    /// backend-selection mechanics themselves).
+    #[tokio::test]
+    async fn stage_started_role_summary_names_the_resolved_role() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-3");
+        let snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: review\n    role: reviewer\n    max_turns: 1\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let msgs = drain(rx).await;
+        let role_summary = msgs
+            .iter()
+            .find_map(|m| match m {
+                OrchMsg::StageStarted { role_summary, .. } => Some(role_summary.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(role_summary, "review — reviewer");
+    }
+
+    /// End-to-end AIR-6 wiring test: a `pipeline.test` stage actually runs the
+    /// configured suite/coverage commands against `workspace_path` (not just the
+    /// agent's own turns), emits `test_report`/`coverage` evidence, and -- since the
+    /// stage is `blocking: true` and coverage is below `min_line_percent` -- parks the
+    /// issue exactly like any other blocking stage failure.
+    #[tokio::test]
+    async fn test_stage_runs_suites_and_blocks_on_coverage_gate_when_stage_is_blocking() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "T-1");
+        let workspace_dir = tempdir().unwrap();
+        std::fs::write(
+            workspace_dir.path().join("coverage.json"),
+            r#"{"data":[{"files":[{"filename":"a.rs","summary":{"lines":{"count":10,"covered":1}}}]}]}"#,
+        )
+        .unwrap();
+
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n    \
+             - id: test\n      role: test\n      max_turns: 1\n      blocking: true\n  \
+             test:\n    commands:\n      unit: exit 0\n    coverage:\n      command: \"true\"\n      \
+             format: llvm-cov\n      min_line_percent: 90\n",
+        )
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        let snapshot = DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new())),
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        };
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace_dir.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let msgs = drain(rx).await;
+        let event_types: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::AgentEvent { event, .. } => Some(event.event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            event_types.contains(&"test_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"test_report".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage".to_string()),
+            "{event_types:?}"
+        );
+
+        let outcomes: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::StageFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outcomes.iter().any(|o| o.starts_with("blocked: coverage")),
+            "{outcomes:?}"
+        );
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(refreshed.normalized_state(), "blocked");
+    }
+
     #[tokio::test]
     async fn blocking_stage_failure_parks_the_issue_in_blocked_state() {
         let tracker_dir = tempdir().unwrap();
@@ -2071,10 +3351,7 @@ mod tests {
         let snapshot = pipeline_snapshot(
             tracker_dir.path(),
             "  - id: review\n    role: reviewer\n    max_turns: 1\n    blocking: true\n",
-            ScriptedBackend {
-                calls: Arc::new(Mutex::new(0)),
-                failures,
-            },
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), failures),
         );
 
         let mut issue = snapshot
@@ -2083,14 +3360,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2103,11 +3397,9 @@ mod tests {
         assert_eq!(refreshed[0].state, "blocked");
 
         let msgs = drain(rx).await;
-        assert!(
-            msgs.iter().any(
-                |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
-            )
-        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.starts_with("failed"))
+        ));
     }
 
     #[tokio::test]
@@ -2120,10 +3412,7 @@ mod tests {
             tracker_dir.path(),
             "  - id: requirements\n    role: requirements\n    max_turns: 1\n    on_failure: skip\n\
              \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
-            ScriptedBackend {
-                calls: Arc::new(Mutex::new(0)),
-                failures,
-            },
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), failures),
         );
 
         let mut issue = snapshot
@@ -2132,14 +3421,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2167,10 +3473,7 @@ mod tests {
         let snapshot = pipeline_snapshot(
             tracker_dir.path(),
             "  - id: implement\n    role: developer\n    max_turns: 1\n    on_failure: retry\n",
-            ScriptedBackend {
-                calls: calls.clone(),
-                failures,
-            },
+            ScriptedBackend::new(calls.clone(), failures),
         );
 
         let mut issue = snapshot
@@ -2179,16 +3482,37 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
-        assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            2,
+            "the failed turn plus one retry turn"
+        );
 
         let msgs = drain(rx).await;
         assert!(msgs.iter().any(
@@ -2206,10 +3530,7 @@ mod tests {
             tracker_dir.path(),
             "  - id: implement\n    role: developer\n    max_turns: 1\n\
              \x20\x20- id: review\n    role: reviewer\n    max_turns: 1\n",
-            ScriptedBackend {
-                calls: Arc::new(Mutex::new(0)),
-                failures,
-            },
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), failures),
         );
 
         let mut issue = snapshot
@@ -2218,20 +3539,40 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None)
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
         let stages = stage_events(&msgs);
         // The second stage never starts -- default `escalate` stops the whole cycle.
-        assert_eq!(stages, vec![("started", "implement"), ("finished", "implement")]);
+        assert_eq!(
+            stages,
+            vec![("started", "implement"), ("finished", "implement")]
+        );
     }
 
     #[test]
@@ -2257,7 +3598,9 @@ mod tests {
         assert!(is_plan_rate_limited(
             "stage 'implement' failed: agent turn error: You've hit your session limit \u{b7} resets 12:30am (Europe/Paris)"
         ));
-        assert!(is_plan_rate_limited("You've hit your usage limit for today"));
+        assert!(is_plan_rate_limited(
+            "You've hit your usage limit for today"
+        ));
     }
 
     #[test]
@@ -2271,11 +3614,7 @@ mod tests {
     async fn rate_limited_worker_exit_pauses_dispatch_without_escalating_attempt() {
         let root = tempdir().unwrap();
         let tracker_dir = tempdir().unwrap();
-        let shared = test_shared(
-            "true",
-            root.path().to_path_buf(),
-            tracker_dir.path(),
-        );
+        let shared = test_shared("true", root.path().to_path_buf(), tracker_dir.path());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = OrchestratorState::default();
 
@@ -2353,11 +3692,16 @@ mod tests {
         )
         .unwrap();
 
-        let cfg_yaml: serde_yaml::Value =
-            serde_yaml::from_str("tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n")
-                .unwrap();
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n",
+        )
+        .unwrap();
         let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
         cfg.workspace_root = root.path().to_path_buf();
+        // `on_tick` now always calls AIR-5's `poll_approval_comments`/
+        // `apply_resolved_approvals`, which touch `approvals_db_path(cfg)` -- keep
+        // that inside this test's own tempdir rather than the real repo root.
+        cfg.workflow_dir = root.path().to_path_buf();
 
         let provider: serde_yaml::Value =
             serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
@@ -2402,5 +3746,1220 @@ mod tests {
             state.rate_limited_until.is_none(),
             "an expired pause must be cleared"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-4: raise_clarification (blocking/non-blocking), optional stage skip, and
+    // the requirements stage picking up its builtin role prompt (`roles::resolve`,
+    // AIR-3/AIR-2's role machinery -- AIR-4's own now-removed `builtin_prompt` helper
+    // did the same lookup before roles were generalized).
+    // -----------------------------------------------------------------------------
+
+    /// Like `ScriptedBackend`, but additionally records every prompt it's given (to
+    /// prove a stage with a matching `role` actually runs the builtin role prompt
+    /// instead of the project's own template -- via `roles::resolve`) and can be
+    /// scripted to report a `raise_clarification` call (as the real agent event
+    /// stream would: a `clarification_raised` event alongside `turn_completed`,
+    /// exactly what `agent/claude.rs::handle_message` emits) on a given turn.
+    struct ClarifyingBackend {
+        calls: Arc<Mutex<u32>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        /// `(turn number, blocking)` -- `None` means never raise a clarification.
+        clarify_on_turn: Option<(u32, bool)>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ClarifyingBackend {
+        async fn start_session(
+            &self,
+            _workspace: &Path,
+            _issue_id: &str,
+            _title: &str,
+            _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
+        ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
+            Ok(Box::new(ClarifyingSession {
+                calls: self.calls.clone(),
+                prompts: self.prompts.clone(),
+                clarify_on_turn: self.clarify_on_turn,
+            }))
+        }
+    }
+
+    struct ClarifyingSession {
+        calls: Arc<Mutex<u32>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+        clarify_on_turn: Option<(u32, bool)>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for ClarifyingSession {
+        fn session_id(&self) -> &str {
+            "clarifying-session"
+        }
+
+        async fn run_turn(
+            &mut self,
+            prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let n = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if let Some((turn, blocking)) = self.clarify_on_turn
+                && turn == n
+            {
+                let _ = events.send(AgentEvent::new("clarification_raised").with_message(
+                    json!({"question": "which auth scheme?", "blocking": blocking}).to_string(),
+                ));
+            }
+            let _ = events.send(AgentEvent::new("turn_completed"));
+            Ok(TurnOutcome::Completed { usage: None })
+        }
+
+        async fn stop(self: Box<Self>) {}
+    }
+
+    fn clarifying_snapshot(
+        tracker_dir: &Path,
+        stages_yaml: &str,
+        backend: ClarifyingBackend,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n{stages_yaml}"
+        ))
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(backend),
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_clarification_stops_the_cycle_and_parks_the_issue() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-6");
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 3\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: Some((1, true)),
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-6".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-6".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "blocked");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        // Stopped right after the first turn of the first stage -- never even
+        // finished out that stage's own turn budget (3), let alone started the
+        // second stage.
+        assert_eq!(stages, vec![("started", "requirements"), ("finished", "requirements")]);
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.contains("blocked: clarification"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_blocking_clarification_does_not_stop_the_cycle() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-7");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: calls.clone(),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: Some((1, false)),
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-7".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        assert_eq!(*calls.lock().unwrap(), 2, "both stages' turns ran");
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-7".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "todo", "non-blocking clarification must not park the issue");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_stage_is_skipped_when_issue_carries_its_skip_label() {
+        let tracker_dir = tempdir().unwrap();
+        std::fs::write(
+            tracker_dir.path().join("P-8.md"),
+            "---\nidentifier: P-8\ntitle: Test issue\nstate: todo\nlabels: [skip-requirements]\n---\nbody\n",
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n    optional: true\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: calls.clone(),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-8".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        // Only `implement`'s one turn ran -- `requirements` was skipped entirely.
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "requirements"),
+                ("finished", "requirements"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::StageFinished { stage_id, outcome, .. } if stage_id == "requirements" && outcome.starts_with("skipped"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn requirements_stage_runs_the_builtin_role_prompt() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-9");
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n\
+             \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: prompts.clone(),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-9".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        // The `requirements` stage got the builtin role prompt (mentions the tools
+        // it's meant to call)...
+        assert!(prompts[0].contains("record_requirements"));
+        assert!(prompts[0].contains("raise_clarification"));
+        // ...while `implement` (role "developer") got *its own* built-in role prompt
+        // (AIR-2/AIR-3's `roles::resolve` -- "developer" is one of the eight roadmap
+        // roles, not a fallback to the project's own `WORKFLOW.md` template).
+        assert!(prompts[1].contains("Developer agent"));
+        assert_ne!(prompts[0], prompts[1]);
+    }
+
+    /// AIR-4 acceptance criterion: "Requirements with `depends_on` blockers list them
+    /// under `dependency`." The requirements stage's prompt (`roles::resolve`)
+    /// is the thing that has to make the blocker visible to the agent so it can put it
+    /// in the `dependency` field it hands to `record_requirements` -- this proves
+    /// `issue.blocked_by` (populated by `depends_on` resolution, `tracker::depends_on`)
+    /// actually reaches the rendered prompt text.
+    #[tokio::test]
+    async fn requirements_prompt_surfaces_depends_on_blockers() {
+        let tracker_dir = tempdir().unwrap();
+        std::fs::write(
+            tracker_dir.path().join("BLOCKER.md"),
+            "---\nidentifier: BLOCKER\ntitle: Prerequisite\nstate: todo\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tracker_dir.path().join("P-10.md"),
+            "---\nidentifier: P-10\ntitle: Test issue\nstate: todo\ndepends_on: [BLOCKER]\n---\nbody\n",
+        )
+        .unwrap();
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = clarifying_snapshot(
+            tracker_dir.path(),
+            "  - id: requirements\n    role: requirements\n    max_turns: 1\n",
+            ClarifyingBackend {
+                calls: Arc::new(Mutex::new(0)),
+                prompts: prompts.clone(),
+                clarify_on_turn: None,
+            },
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-10".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            issue.blocked_by[0].identifier.as_deref(),
+            Some("BLOCKER"),
+            "sanity check: depends_on resolution populated blocked_by"
+        );
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts[0].contains("BLOCKER"), "{}", prompts[0]);
+    }
+    // AIR-5: the human approval gate
+    // -----------------------------------------------------------------------------
+
+    /// Like `test_shared`, but with a real (tempdir) `workflow_dir` and a pipeline
+    /// config -- for the tick-loop halves of the approval gate
+    /// (`poll_approval_comments`/`apply_resolved_approvals`), which need a full
+    /// `Shared` (tracker + event log), not just a `DispatchSnapshot`.
+    fn approval_shared(
+        tracker_dir: &Path,
+        workflow_dir: &Path,
+        extra_pipeline_yaml: &str,
+        stages_yaml: &str,
+    ) -> Shared {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n{extra_pipeline_yaml}  stages:\n{stages_yaml}"
+        ))
+        .unwrap();
+        let mut cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        cfg.workflow_dir = workflow_dir.to_path_buf();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        Shared {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(claude::ClaudeBackend {
+                command: "claude".to_string(),
+                extra_args: Vec::new(),
+                model: None,
+                permission_mode: "bypassPermissions".to_string(),
+                turn_timeout_ms: 1000,
+                mcp_wiring: None,
+                workflow_dir: Path::new(".").to_path_buf(),
+            }),
+            workspace_mgr: Arc::new(WorkspaceManager::new(workflow_dir.to_path_buf())),
+            event_tx,
+        }
+    }
+
+    const TWO_STAGE_PLAN_REQUIRES_APPROVAL: &str = "  - id: plan\n    role: planner\n    max_turns: 1\n    requires_approval: true\n\
+         \x20\x20- id: implement\n    role: developer\n    max_turns: 1\n";
+
+    #[tokio::test]
+    async fn requires_approval_stage_parks_the_cycle_without_running_the_next_stage() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            ScriptedBackend::new(calls.clone(), HashMap::new()),
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["AP-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        // Only "plan" ran -- parking must happen *before* "implement" starts, and the
+        // worker's own turn budget is spent, i.e. the slot is free to be reclaimed by
+        // the caller (`run_agent_attempt`/`handle_msg`'s normal WorkerExit path).
+        assert_eq!(*calls.lock().unwrap(), 1);
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(stages, vec![("started", "plan"), ("finished", "plan")]);
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::ApprovalRequested { stage_id, .. } if stage_id == "plan")
+        ));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["AP-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "awaiting approval");
+
+        let db_path = approvals_db_path(&snapshot.config);
+        let pending = approvals::list_pending(&db_path).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].stage_id, "plan");
+        assert_eq!(pending[0].next_stage_id.as_deref(), Some("implement"));
+    }
+
+    #[tokio::test]
+    async fn requires_approval_stage_auto_approves_when_policy_matches() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-2");
+        let calls = Arc::new(Mutex::new(0));
+        let mut backend = ScriptedBackend::new(calls.clone(), HashMap::new());
+        backend.messages.insert(
+            1,
+            "design done.\n```json\n{\"risk\": \"low\"}\n```".to_string(),
+        );
+        let snapshot = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "  approval:\n    auto_approve_when:\n      risk: low\n",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            backend,
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["AP-2".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        // Both stages ran in the same cycle -- auto-approval never parked it.
+        assert_eq!(*calls.lock().unwrap(), 2);
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert_eq!(
+            stages,
+            vec![
+                ("started", "plan"),
+                ("finished", "plan"),
+                ("started", "implement"),
+                ("finished", "implement"),
+            ]
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::ApprovalAutoApproved { stage_id, .. } if stage_id == "plan")
+        ));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, OrchMsg::ApprovalRequested { .. }))
+        );
+
+        let db_path = approvals_db_path(&snapshot.config);
+        assert!(approvals::list_pending(&db_path).unwrap().is_empty());
+        // The issue was never moved out of its active state.
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["AP-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "todo");
+    }
+
+    #[tokio::test]
+    async fn auto_approve_when_never_fires_without_matching_structured_output() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-3");
+        // The stage completes but never emits a ```json block -- auto_approve_when
+        // must not fire on missing information, even though it's configured.
+        let snapshot = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "  approval:\n    auto_approve_when:\n      risk: low\n",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["AP-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let db_path = approvals_db_path(&snapshot.config);
+        assert_eq!(approvals::list_pending(&db_path).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approve_decision_resumes_at_the_next_stage_without_rerunning_the_first() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-4");
+
+        // First cycle: park at "plan".
+        let snapshot1 = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        let mut issue = snapshot1
+            .tracker
+            .fetch_issues_by_ids(&["AP-4".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot1
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot1,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let db_path = approvals_db_path(&snapshot1.config);
+        let pending = approvals::list_pending(&db_path).unwrap();
+        assert_eq!(pending.len(), 1);
+        let approval_id = pending[0].id;
+
+        // A human approves via whichever channel -- simulate exactly what
+        // `apply_resolved_approvals` does once a decision is resolved.
+        assert!(
+            approvals::resolve(
+                &db_path,
+                approval_id,
+                approvals::Decision::Approve,
+                "alice",
+                None
+            )
+            .unwrap()
+        );
+        approvals::mark_applied(&db_path, approval_id, pending[0].next_stage_id.as_deref())
+            .unwrap();
+
+        // Second cycle, fresh session/backend: "plan" must NOT run again.
+        let calls2 = Arc::new(Mutex::new(0));
+        let snapshot2 = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            ScriptedBackend::new(calls2.clone(), HashMap::new()),
+        );
+        let mut issue2 = snapshot2
+            .tracker
+            .fetch_issues_by_ids(&["AP-4".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace2 = tempdir().unwrap();
+        let mut session2 = snapshot2
+            .agent_backend
+            .start_session(
+                workspace2.path(),
+                &issue2.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        let exit = run_pipeline(
+            &issue2.id.clone(),
+            &mut issue2,
+            None,
+            session2.as_mut(),
+            &snapshot2,
+            workspace2.path(),
+            None,
+            &tx2,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+        assert_eq!(*calls2.lock().unwrap(), 1, "only 'implement' should run");
+
+        let msgs2 = drain(rx2).await;
+        let stages = stage_events(&msgs2);
+        assert_eq!(
+            stages,
+            vec![("started", "implement"), ("finished", "implement")]
+        );
+
+        assert!(
+            approvals::take_resume(&db_path, "AP-4").unwrap().is_none(),
+            "a resume point must only be consumed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_changes_resumes_the_same_stage_with_the_reviewer_comment_injected() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-5");
+
+        let snapshot1 = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        let mut issue = snapshot1
+            .tracker
+            .fetch_issues_by_ids(&["AP-5".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace = tempdir().unwrap();
+        let mut session = snapshot1
+            .agent_backend
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot1,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+
+        let db_path = approvals_db_path(&snapshot1.config);
+        let approval_id = approvals::list_pending(&db_path).unwrap()[0].id;
+        let reviewer_comment = "please add a rollback plan for the migration";
+        assert!(
+            approvals::resolve(
+                &db_path,
+                approval_id,
+                approvals::Decision::RequestChanges,
+                "alice",
+                Some(reviewer_comment),
+            )
+            .unwrap()
+        );
+        // "changes" resumes at the *same* stage ("plan"), not `next_stage_id`.
+        approvals::mark_applied(&db_path, approval_id, Some("plan")).unwrap();
+
+        let backend2 = ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new());
+        let prompts_seen = backend2.prompts_seen.clone();
+        let snapshot2 = approval_pipeline_snapshot(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+            backend2,
+        );
+        let mut issue2 = snapshot2
+            .tracker
+            .fetch_issues_by_ids(&["AP-5".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let workspace2 = tempdir().unwrap();
+        let mut session2 = snapshot2
+            .agent_backend
+            .start_session(
+                workspace2.path(),
+                &issue2.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        run_pipeline(
+            &issue2.id.clone(),
+            &mut issue2,
+            None,
+            session2.as_mut(),
+            &snapshot2,
+            workspace2.path(),
+            None,
+            &tx2,
+        )
+        .await;
+
+        // "plan" ran again (re-parked awaiting another approval, since it still
+        // requires one), "implement" never started.
+        let msgs2 = drain(rx2).await;
+        let stages = stage_events(&msgs2);
+        assert_eq!(stages, vec![("started", "plan"), ("finished", "plan")]);
+
+        let prompts = prompts_seen.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains(reviewer_comment),
+            "resumed stage's first prompt must include the reviewer's comment: {}",
+            prompts[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_channel_approve_resolves_and_applies_through_the_tick_helpers() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-6");
+        std::fs::write(tracker_dir.path().join("AP-6.comments.txt"), "/approve\n").unwrap();
+
+        let shared = approval_shared(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+        );
+        let db_path = approvals_db_path(&shared.config);
+        let approval_id = approvals::create_pending(
+            &db_path,
+            &approvals::NewApproval {
+                issue_id: "AP-6".to_string(),
+                identifier: "AP-6".to_string(),
+                title: "Test issue".to_string(),
+                stage_id: "plan".to_string(),
+                next_stage_id: Some("implement".to_string()),
+                plan_text: Some("design summary".to_string()),
+                plan_json: None,
+            },
+        )
+        .unwrap();
+        shared
+            .tracker
+            .set_issue_state("AP-6", &shared.config.pipeline.awaiting_approval_state)
+            .await
+            .unwrap();
+
+        poll_approval_comments(&shared).await;
+        let row = approvals::get(&db_path, approval_id).unwrap().unwrap();
+        assert_eq!(row.decision.as_deref(), Some("approve"));
+        assert_eq!(row.actor.as_deref(), Some("issue-comment"));
+        assert!(!row.is_pending());
+
+        apply_resolved_approvals(&shared).await;
+
+        let refreshed = shared
+            .tracker
+            .fetch_issues_by_ids(&["AP-6".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "todo");
+
+        let resume = approvals::take_resume(&db_path, "AP-6").unwrap().unwrap();
+        assert_eq!(resume.stage_id, "implement");
+    }
+
+    #[tokio::test]
+    async fn comment_channel_reject_parks_in_blocked_state_with_no_resume() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "AP-7");
+        std::fs::write(
+            tracker_dir.path().join("AP-7.comments.txt"),
+            "/reject not aligned with the architecture\n",
+        )
+        .unwrap();
+
+        let shared = approval_shared(
+            tracker_dir.path(),
+            workflow_dir.path(),
+            "",
+            TWO_STAGE_PLAN_REQUIRES_APPROVAL,
+        );
+        let db_path = approvals_db_path(&shared.config);
+        approvals::create_pending(
+            &db_path,
+            &approvals::NewApproval {
+                issue_id: "AP-7".to_string(),
+                identifier: "AP-7".to_string(),
+                title: "Test issue".to_string(),
+                stage_id: "plan".to_string(),
+                next_stage_id: Some("implement".to_string()),
+                plan_text: None,
+                plan_json: None,
+            },
+        )
+        .unwrap();
+
+        poll_approval_comments(&shared).await;
+        apply_resolved_approvals(&shared).await;
+
+        let refreshed = shared
+            .tracker
+            .fetch_issues_by_ids(&["AP-7".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].state, "blocked");
+        assert!(approvals::take_resume(&db_path, "AP-7").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_approval_command_recognizes_all_three_commands_case_insensitively() {
+        assert_eq!(
+            parse_approval_command("/approve"),
+            Some((approvals::Decision::Approve, None))
+        );
+        assert_eq!(
+            parse_approval_command("/Approve looks great"),
+            Some((
+                approvals::Decision::Approve,
+                Some("looks great".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_approval_command("/changes please split the migration"),
+            Some((
+                approvals::Decision::RequestChanges,
+                Some("please split the migration".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_approval_command("/REJECT too risky"),
+            Some((approvals::Decision::Reject, Some("too risky".to_string())))
+        );
+        assert_eq!(parse_approval_command("just a regular comment"), None);
+        assert_eq!(
+            parse_approval_command("I'd like to /approve this once tests are green"),
+            None,
+            "the command must anchor the comment, not just appear somewhere in it"
+        );
+    }
+
+    #[test]
+    fn evaluate_auto_approve_requires_every_configured_condition() {
+        let cond = config::AutoApproveWhen {
+            risk: Some("low".to_string()),
+            impacted_components_allowlist: Some(vec!["src/foo.rs".to_string()]),
+            max_estimate_turns: Some(4),
+        };
+        let matching = serde_json::json!({
+            "risk": "low",
+            "impacted_components": ["src/foo.rs"],
+            "estimate_turns": 3,
+        })
+        .to_string();
+        assert!(evaluate_auto_approve(Some(&matching), &cond));
+
+        let wrong_risk = serde_json::json!({
+            "risk": "high",
+            "impacted_components": ["src/foo.rs"],
+            "estimate_turns": 3,
+        })
+        .to_string();
+        assert!(!evaluate_auto_approve(Some(&wrong_risk), &cond));
+
+        let disallowed_component = serde_json::json!({
+            "risk": "low",
+            "impacted_components": ["src/foo.rs", "src/secrets.rs"],
+            "estimate_turns": 3,
+        })
+        .to_string();
+        assert!(!evaluate_auto_approve(Some(&disallowed_component), &cond));
+
+        let too_many_turns = serde_json::json!({
+            "risk": "low",
+            "impacted_components": ["src/foo.rs"],
+            "estimate_turns": 10,
+        })
+        .to_string();
+        assert!(!evaluate_auto_approve(Some(&too_many_turns), &cond));
+
+        assert!(
+            !evaluate_auto_approve(None, &cond),
+            "missing structured output must never satisfy a configured condition"
+        );
+    }
+
+    #[test]
+    fn extract_plan_json_parses_a_fenced_block_and_is_none_without_one() {
+        let text = "Here's my plan.\n\n```json\n{\"risk\": \"low\"}\n```\n";
+        let json = extract_plan_json(text).unwrap();
+        assert!(json.contains("\"risk\""));
+        assert!(extract_plan_json("just prose, no JSON here").is_none());
+    }
+
+    fn stage(id: &str, role: &str) -> config::StageConfig {
+        config::StageConfig {
+            id: id.to_string(),
+            role: role.to_string(),
+            max_turns: 1,
+            on_failure: StageFailureAction::Retry,
+            blocking: false,
+            optional: false,
+            requires_approval: false,
+        }
+    }
+
+    /// AIR-7: the rework loop resends to the *nearest* earlier `role: developer`
+    /// stage, not always the pipeline's first one.
+    #[test]
+    fn developer_stage_index_finds_the_nearest_earlier_developer_stage() {
+        let stages = vec![
+            stage("implement", "developer"),
+            stage("harden", "developer"),
+            stage("review", "reviewer"),
+        ];
+        assert_eq!(developer_stage_index(&stages, 2), Some(1));
+    }
+
+    #[test]
+    fn developer_stage_index_is_none_when_no_earlier_developer_stage_exists() {
+        let stages = vec![stage("review", "reviewer")];
+        assert_eq!(developer_stage_index(&stages, 0), None);
+    }
+
+    /// AIR-7 acceptance criterion: exceeding `pipeline.review.max_rework_rounds`
+    /// escalates instead of looping.
+    #[test]
+    fn round_exceeds_limit_flips_once_the_next_round_would_pass_the_cap() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("symphony.db");
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 1 of 2 is within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 1",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(!round_exceeds_limit(&db, "1", 2), "round 2 of 2 is still within the cap");
+        crate::eventlog::record_rework_round(
+            &db,
+            &crate::eventlog::NewReworkRound {
+                issue_id: "1",
+                identifier: "AIR-7",
+                title: "t",
+                stage_id: "review",
+                recommendation: "request_changes",
+                summary: "round 2",
+                escalated: false,
+            },
+        )
+        .unwrap();
+        assert!(round_exceeds_limit(&db, "1", 2), "round 3 of 2 exceeds the cap");
+    }
+
+    /// AIR-7 acceptance criterion: the stage produces a schema-valid `review_findings`
+    /// artifact that the rework loop can read a recommendation back out of.
+    #[tokio::test]
+    async fn latest_review_recommendation_reads_the_recorded_artifact_back() {
+        let dir = tempdir().unwrap();
+        let workflow_dir = dir.path().to_path_buf();
+        let db = workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(workspace.join(".symphony")).unwrap();
+        std::fs::write(workspace.join(".symphony/current-stage"), "review").unwrap();
+
+        let content = json!({
+            "schema_version": 1,
+            "recommendation": "request_changes",
+            "findings": [],
+            "unmet_acceptance_criteria": ["AC3"],
+            "over_implementation": []
+        })
+        .to_string();
+        let result = crate::artifacts::execute_tool(
+            &db,
+            &workflow_dir,
+            &workspace,
+            "issue-1",
+            "issue-1",
+            json!({
+                "kind": "review_findings",
+                "content_type": "application/json",
+                "content": content,
+                "summary": "requests changes: AC3 unmet"
+            }),
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
+
+        let (recommendation, summary) =
+            latest_review_recommendation(&workflow_dir, &db, "issue-1", "review").unwrap();
+        assert_eq!(recommendation, "request_changes");
+        assert_eq!(summary, "requests changes: AC3 unmet");
     }
 }

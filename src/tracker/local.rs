@@ -37,7 +37,7 @@
 //! without touching tracker files directly (Section 11.5) — see `execute_agent_tool`.
 
 use super::depends_on::{RawIssue, resolve_dependencies};
-use super::{ToolResult, ToolSpec, TrackerAdapter, TrackerError};
+use super::{IssueComment, ToolResult, ToolSpec, TrackerAdapter, TrackerError};
 use crate::domain::Issue;
 use crate::envsub;
 use crate::frontmatter;
@@ -125,6 +125,29 @@ impl LocalTrackerAdapter {
             format!("---\n{yaml}---\n{body}\n")
         };
         std::fs::write(&path, new_contents).map_err(|e| e.to_string())
+    }
+
+    /// Finds the issue file matching `issue_id` and appends `text` to its Markdown
+    /// body, preserving front matter verbatim. Shared by `post_comment`.
+    fn append_to_body(&self, issue_id: &str, text: &str) -> Result<(), String> {
+        let all = self.read_all().map_err(|e| e.to_string())?;
+        let path = all
+            .into_iter()
+            .find_map(|(key, parsed)| match parsed {
+                Ok(issue) if issue.id == issue_id => Some(self.dir.join(format!("{key}.md"))),
+                _ => None,
+            })
+            .ok_or_else(|| format!("no issue file found for id '{issue_id}'"))?;
+
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let (fm, body) = frontmatter::split(&raw).map_err(|e| e.to_string())?;
+        let yaml = serde_yaml::to_string(&fm).map_err(|e| e.to_string())?;
+        let new_body = if body.is_empty() {
+            text.to_string()
+        } else {
+            format!("{body}\n\n{text}")
+        };
+        std::fs::write(&path, format!("---\n{yaml}---\n{new_body}\n")).map_err(|e| e.to_string())
     }
 }
 
@@ -281,6 +304,46 @@ impl TrackerAdapter for LocalTrackerAdapter {
     async fn set_issue_state(&self, issue_id: &str, state: &str) -> Result<(), TrackerError> {
         self.update_issue_state(issue_id, state)
             .map_err(TrackerError::Request)
+    }
+
+    /// Appends `body` to the issue file's Markdown body -- this adapter has no
+    /// separate comment thread, so "a comment on the tracker issue" (AIR-4) means the
+    /// question becomes part of the same body the agent reads every turn. A human
+    /// answers by editing the file directly, same as they'd flip `state:` by hand.
+    async fn post_comment(&self, issue_id: &str, body: &str) -> Result<(), TrackerError> {
+        self.append_to_body(issue_id, body)
+            .map_err(TrackerError::Request)
+    }
+
+    /// Reads `<dir>/<issue_id>.comments.txt`, one comment per line (blank lines
+    /// skipped), 1-based line number as the comment id -- there is no real comment
+    /// thread for a plain Markdown file, so an operator (or a test) appends a line
+    /// like `/approve` to simulate one. Missing file means no comments yet, not an
+    /// error.
+    async fn fetch_issue_comments(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<IssueComment>, TrackerError> {
+        let path = self.dir.join(format!("{issue_id}.comments.txt"));
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Ok(Vec::new());
+        };
+        Ok(raw
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let body = line.trim();
+                if body.is_empty() {
+                    None
+                } else {
+                    Some(IssueComment {
+                        id: (i + 1) as u64,
+                        author: None,
+                        body: body.to_string(),
+                    })
+                }
+            })
+            .collect())
     }
 }
 
@@ -615,6 +678,44 @@ mod tests {
         assert!(
             !downstream.dispatchable,
             "a cancelled dependency must not satisfy depends_on"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_comments_reads_the_sidecar_file_skipping_blank_lines() {
+        let dir = tempdir().unwrap();
+        write_issue(
+            dir.path(),
+            "a.md",
+            "---\nidentifier: A-1\ntitle: Task A\nstate: todo\n---\nbody\n",
+        );
+        std::fs::write(
+            dir.path().join("a.comments.txt"),
+            "/approve\n\n/changes please split this up\n",
+        )
+        .unwrap();
+        let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
+        let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
+
+        let comments = adapter.fetch_issue_comments("a").await.unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].id, 1);
+        assert_eq!(comments[0].body, "/approve");
+        assert_eq!(comments[1].id, 3);
+        assert_eq!(comments[1].body, "/changes please split this up");
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_comments_with_no_sidecar_file_is_empty() {
+        let dir = tempdir().unwrap();
+        let provider: Value = serde_yaml::from_str(&format!("dir: {:?}", dir.path())).unwrap();
+        let adapter = LocalTrackerAdapter::new(&provider, Path::new(".")).unwrap();
+        assert!(
+            adapter
+                .fetch_issue_comments("missing")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

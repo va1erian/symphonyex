@@ -68,7 +68,9 @@
 //! `.env()` on the host), same delivery mechanism `permission_config` already uses.
 
 use super::claude::McpToolWiring;
-use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use super::{
+    AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome,
+};
 use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -85,15 +87,6 @@ pub struct OpenCodeBackend {
     pub extra_args: Vec<String>,
     pub auto_approve: bool,
     pub turn_timeout_ms: u64,
-    /// When set, restrict this backend's turns by passing an opencode `permission`
-    /// config JSON (see `opencode`'s own Permissions docs) as the
-    /// `OPENCODE_PERMISSION` env var on every spawned subprocess. `"deny"` rules are
-    /// enforced even under `--auto` (which only auto-approves what is *not* already
-    /// denied), so this is the mechanism for a read-only restricted session: e.g.
-    /// `{"edit":"deny"}` blocks edit/write/patch while leaving bash/read free.
-    /// `None` (the default) leaves permissions untouched -- SweBot's restricted
-    /// sessions set it, ticket dispatch does not.
-    pub permission_config: Option<String>,
     /// Section 10.5's provider-native-tool wiring (`open_pull_request`,
     /// `update_issue_state`) -- the same `McpToolWiring` `ClaudeBackend` uses.
     /// `opencode` supports MCP servers via its own config (`"mcp": {...}`, deep-merged
@@ -116,6 +109,7 @@ impl AgentBackend for OpenCodeBackend {
         issue_id: &str,
         _title: &str,
         container: Option<&ContainerHandle>,
+        tool_policy: &ToolPolicy,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         if !workspace.is_dir() {
             return Err(AgentError::InvalidCwd(format!(
@@ -137,7 +131,7 @@ impl AgentBackend for OpenCodeBackend {
             extra_args: self.extra_args.clone(),
             auto_approve: self.auto_approve,
             turn_timeout_ms: self.turn_timeout_ms,
-            permission_config: self.permission_config.clone(),
+            permission_config: tool_policy_permission_json(tool_policy),
             mcp_config_env,
             workspace: workspace.to_path_buf(),
             container: container.cloned(),
@@ -520,9 +514,32 @@ fn shallow_find_str(v: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+/// Translate a `ToolPolicy` (AIR-2) into opencode's own `permission` config JSON (see
+/// `opencode`'s own Permissions docs), or `None` for an unrestricted policy. `"deny"`
+/// rules are enforced even under `--auto` (which only auto-approves what is *not*
+/// already denied) -- this is the mechanism for a restricted session: e.g.
+/// `{"edit":"deny"}` blocks edit/write/patch while leaving bash/read free. This used to
+/// be SweBot's own hardcoded `{"edit":"deny"}` literal (see `swebot::mod`'s history);
+/// now any restricted session (SweBot, or a pipeline role with
+/// `tools.allow_edits: false`) drives the same translation.
+fn tool_policy_permission_json(policy: &ToolPolicy) -> Option<String> {
+    let mut obj = serde_json::Map::new();
+    if !policy.allow_edits {
+        obj.insert("edit".to_string(), json!("deny"));
+    }
+    if !policy.allow_commands {
+        obj.insert("bash".to_string(), json!("deny"));
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj).to_string())
+    }
+}
+
 /// The `OPENCODE_PERMISSION` env `(key, value)` pair for a permission config, if set
 /// -- how a restricted session's deny rules reach the spawned `opencode` subprocess
-/// (see `OpenCodeBackend::permission_config`). Kept as its own function so the Docker
+/// (see `tool_policy_permission_json`). Kept as its own function so the Docker
 /// branch above can emit `-e KEY=VALUE` and the host branch can `.env(key, value)`.
 fn permission_env(config: Option<&str>) -> Option<(String, String)> {
     config.map(|c| ("OPENCODE_PERMISSION".to_string(), c.to_string()))
@@ -585,6 +602,9 @@ fn mcp_config_env(
     if let Some(repo_pr_json) = &wiring.repo_pr_json {
         argv.push("--repo-pr".to_string());
         argv.push(repo_pr_json.clone());
+    }
+    if wiring.pipeline_enabled {
+        argv.push("--pipeline-enabled".to_string());
     }
     let config = json!({
         "mcp": {
@@ -809,6 +829,7 @@ mod tests {
             tracker_provider_json: r#"{"dir":"issues"}"#.to_string(),
             workflow_dir: PathBuf::from("/wf"),
             repo_pr_json: None,
+            pipeline_enabled: false,
         }
     }
 
@@ -860,6 +881,26 @@ mod tests {
     }
 
     #[test]
+    fn mcp_config_env_includes_pipeline_enabled_flag_when_the_pipeline_is_on() {
+        let mut wiring = test_wiring();
+        wiring.pipeline_enabled = true;
+        let (_, value) = mcp_config_env(&wiring, "42", Path::new("/wf/ws-42"), None);
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(argv.contains(&"--pipeline-enabled"));
+    }
+
+    #[test]
+    fn mcp_config_env_omits_pipeline_enabled_flag_by_default() {
+        let (_, value) = mcp_config_env(&test_wiring(), "42", Path::new("/wf/ws-42"), None);
+        let parsed: Value = serde_json::from_str(&value).unwrap();
+        let argv = parsed["mcp"]["symphony"]["command"].as_array().unwrap();
+        let argv: Vec<&str> = argv.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(!argv.contains(&"--pipeline-enabled"));
+    }
+
+    #[test]
     fn mcp_config_env_uses_in_container_paths_when_containerized() {
         let container = ContainerHandle {
             name: "symphony-abc-42".to_string(),
@@ -881,6 +922,33 @@ mod tests {
         let workspace_dir_idx = argv.iter().position(|a| *a == "--workspace-dir").unwrap() + 1;
         // "/wf/ws-42" is under the workflow_dir "/wf" mapped to container_root "/project".
         assert_eq!(argv[workspace_dir_idx], "/project/ws-42");
+    }
+
+    #[test]
+    fn unrestricted_tool_policy_yields_no_permission_config() {
+        assert_eq!(tool_policy_permission_json(&ToolPolicy::default()), None);
+    }
+
+    #[test]
+    fn edits_denied_yields_edit_deny_permission_config() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: true,
+        };
+        let value: Value =
+            serde_json::from_str(&tool_policy_permission_json(&policy).unwrap()).unwrap();
+        assert_eq!(value, json!({"edit": "deny"}));
+    }
+
+    #[test]
+    fn commands_denied_yields_bash_deny_permission_config() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: false,
+        };
+        let value: Value =
+            serde_json::from_str(&tool_policy_permission_json(&policy).unwrap()).unwrap();
+        assert_eq!(value, json!({"edit": "deny", "bash": "deny"}));
     }
 
     #[test]

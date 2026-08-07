@@ -21,7 +21,7 @@
 //! (`--allowedTools mcp__symphony__*`) independent of `permission_mode`, since they are
 //! host-mediated and adapter-scoped, not raw command/file access.
 
-use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome};
 use crate::container::{self, ContainerHandle, ContainerKillGuard};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -46,6 +46,10 @@ pub struct McpToolWiring {
     /// branch workflow"). Independent of `tracker_kind`/`tracker_provider_json`: a
     /// pull request is a property of the code host, not the issue tracker.
     pub repo_pr_json: Option<String>,
+    /// `pipeline.enabled` (AIR-3) -- gates whether `record_artifact` is wired in
+    /// alongside whatever tracker/repo-host tools are already exposed. See
+    /// `crate::artifacts`'s own doc comment.
+    pub pipeline_enabled: bool,
 }
 
 pub struct ClaudeBackend {
@@ -68,6 +72,7 @@ impl AgentBackend for ClaudeBackend {
         issue_id: &str,
         _title: &str,
         container: Option<&ContainerHandle>,
+        tool_policy: &ToolPolicy,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         let mcp_config_path = match &self.mcp_wiring {
             Some(wiring) => match write_mcp_config(workspace, wiring, issue_id, container) {
@@ -85,7 +90,7 @@ impl AgentBackend for ClaudeBackend {
 
         Ok(Box::new(ClaudeSession {
             command: self.command.clone(),
-            extra_args: self.extra_args.clone(),
+            extra_args: tool_policy_extra_args(&self.extra_args, tool_policy),
             model: self.model.clone(),
             permission_mode: self.permission_mode.clone(),
             turn_timeout_ms: self.turn_timeout_ms,
@@ -100,6 +105,27 @@ impl AgentBackend for ClaudeBackend {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
+}
+
+/// Translate a `ToolPolicy` (AIR-2) into `claude`'s own `--disallowedTools` flag,
+/// appended after `base` -- the backend-native mechanism this used to be SweBot's own
+/// hardcoded `--disallowedTools Edit,Write,NotebookEdit` (see `swebot::mod`'s history),
+/// now shared by any restricted session (SweBot, or a pipeline role with
+/// `tools.allow_edits: false`).
+fn tool_policy_extra_args(base: &[String], policy: &ToolPolicy) -> Vec<String> {
+    let mut args = base.to_vec();
+    let mut disallowed: Vec<&str> = Vec::new();
+    if !policy.allow_edits {
+        disallowed.extend(["Edit", "Write", "NotebookEdit"]);
+    }
+    if !policy.allow_commands {
+        disallowed.push("Bash");
+    }
+    if !disallowed.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(disallowed.join(","));
+    }
+    args
 }
 
 /// Write `<workspace>/.symphony-mcp.json` pointing back at `symphony __mcp_tool_server`
@@ -152,6 +178,9 @@ fn write_mcp_config(
     if let Some(repo_pr_json) = &wiring.repo_pr_json {
         args.push("--repo-pr".to_string());
         args.push(repo_pr_json.clone());
+    }
+    if wiring.pipeline_enabled {
+        args.push("--pipeline-enabled".to_string());
     }
     let config = json!({
         "mcpServers": {
@@ -359,7 +388,19 @@ impl ClaudeSession {
                 if let Some(text) = extract_text(v) {
                     let _ = events.send(AgentEvent::new("notification").with_message(text));
                 }
-                for tool_name in extract_tool_uses(v) {
+                for (tool_name, input) in extract_tool_uses(v) {
+                    // `raise_clarification` (AIR-4) is the one provider-native tool whose
+                    // arguments the orchestrator itself must see, not just the coding
+                    // agent: a `blocking: true` call has to stop the cycle promptly
+                    // rather than run out the stage's turn budget first. Surfaced as its
+                    // own event (alongside the generic `tool_call`) so `run_turn_loop`
+                    // can detect it without every other tool call needing this.
+                    if tool_name.ends_with("raise_clarification") {
+                        let _ = events.send(
+                            AgentEvent::new("clarification_raised")
+                                .with_message(input.to_string()),
+                        );
+                    }
                     let _ = events.send(AgentEvent::new("tool_call").with_message(tool_name));
                 }
                 None
@@ -417,10 +458,12 @@ fn extract_text(v: &Value) -> Option<String> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Names of every `tool_use` content block in an assistant message (Section 10.4's
-/// event vocabulary doesn't name tool calls explicitly; we surface them as our own
-/// `tool_call` event for usage metrics).
-fn extract_tool_uses(v: &Value) -> Vec<String> {
+/// `(name, input)` of every `tool_use` content block in an assistant message (Section
+/// 10.4's event vocabulary doesn't name tool calls explicitly; we surface them as our
+/// own `tool_call` event for usage metrics, plus `input` so a handful of tools whose
+/// arguments matter to the orchestrator itself -- currently just `raise_clarification`,
+/// AIR-4 -- can be inspected without a second parse pass).
+fn extract_tool_uses(v: &Value) -> Vec<(String, Value)> {
     let Some(content) = v
         .get("message")
         .and_then(|m| m.get("content"))
@@ -431,7 +474,11 @@ fn extract_tool_uses(v: &Value) -> Vec<String> {
     content
         .iter()
         .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
-        .filter_map(|block| block.get("name").and_then(|n| n.as_str()).map(String::from))
+        .filter_map(|block| {
+            let name = block.get("name").and_then(|n| n.as_str())?.to_string();
+            let input = block.get("input").cloned().unwrap_or(json!({}));
+            Some((name, input))
+        })
         .collect()
 }
 
@@ -486,7 +533,10 @@ mod tests {
         let v = json!({"message": {"content": [
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
         ]}});
-        assert_eq!(extract_tool_uses(&v), vec!["Bash".to_string()]);
+        assert_eq!(
+            extract_tool_uses(&v),
+            vec![("Bash".to_string(), json!({"command": "ls"}))]
+        );
         assert_eq!(extract_text(&v), None);
     }
 
@@ -501,9 +551,45 @@ mod tests {
         assert_eq!(
             extract_tool_uses(&v),
             vec![
-                "Read".to_string(),
-                "mcp__symphony__update_issue_state".to_string()
+                ("Read".to_string(), json!({})),
+                (
+                    "mcp__symphony__update_issue_state".to_string(),
+                    json!({"state": "done"})
+                )
             ]
+        );
+    }
+
+    #[test]
+    fn raise_clarification_tool_call_also_emits_clarification_raised_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let v = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__symphony__raise_clarification",
+             "input": {"question": "which auth scheme?", "blocking": true}}
+        ]}});
+        let mut session = ClaudeSession {
+            command: "claude".to_string(),
+            extra_args: Vec::new(),
+            model: None,
+            permission_mode: "default".to_string(),
+            turn_timeout_ms: 1000,
+            workspace: PathBuf::from("."),
+            container: None,
+            container_workspace_path: None,
+            mcp_config_path: None,
+            session_id: None,
+        };
+        session.handle_message(&v, &tx);
+        drop(tx);
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| e.event == "clarification_raised"
+            && e.message.as_deref()
+                == Some(r#"{"blocking":true,"question":"which auth scheme?"}"#)));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event == "tool_call"
+                    && e.message.as_deref() == Some("mcp__symphony__raise_clarification"))
         );
     }
 
@@ -512,5 +598,37 @@ mod tests {
         let v = json!({"type": "system"});
         assert_eq!(extract_text(&v), None);
         assert!(extract_tool_uses(&v).is_empty());
+    }
+
+    #[test]
+    fn unrestricted_tool_policy_adds_no_flags() {
+        let args = tool_policy_extra_args(&["--verbose".to_string()], &ToolPolicy::default());
+        assert_eq!(args, vec!["--verbose".to_string()]);
+    }
+
+    #[test]
+    fn edits_denied_produces_disallowed_tools_flag() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: true,
+        };
+        let args = tool_policy_extra_args(&[], &policy);
+        assert_eq!(
+            args,
+            vec![
+                "--disallowedTools".to_string(),
+                "Edit,Write,NotebookEdit".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_denied_adds_bash_to_disallowed_tools() {
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: false,
+        };
+        let args = tool_policy_extra_args(&[], &policy);
+        assert_eq!(args[1], "Edit,Write,NotebookEdit,Bash");
     }
 }

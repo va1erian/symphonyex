@@ -87,10 +87,38 @@ pub enum ConfigError {
     UnknownChatConnector(String, String),
     #[error("invalid_config: pipeline.enabled is true but pipeline.stages is empty")]
     EmptyPipelineStages,
-    #[error(
-        "invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field"
-    )]
+    #[error("invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field")]
     InvalidPipelineStage(usize),
+    #[error(
+        "invalid_config: pipeline.stages[{0}] references role '{1}', which is neither a \
+         built-in role (known: {2}) nor defined under roles.{1}"
+    )]
+    UnknownStageRole(usize, String, String),
+    #[error("invalid_config: roles.{0}.prompt_file '{1}' could not be read: {2}")]
+    UnreadableRolePromptFile(String, String, String),
+}
+
+/// AIR-5: `pipeline.approval.auto_approve_when` -- every condition set (non-`None`)
+/// must hold for a `requires_approval` stage's output to be approved without a human.
+/// Absent entirely (the `Default`), nothing ever auto-approves -- the roadmap's
+/// autonomy measure is *reduced* human interventions, not zero governance.
+#[derive(Debug, Clone, Default)]
+pub struct AutoApproveWhen {
+    /// Matched case-insensitively against the stage output's `risk` field. `None`
+    /// (the plan didn't state a risk, or the stage's output couldn't be parsed as
+    /// structured JSON) never satisfies this when set.
+    pub risk: Option<String>,
+    /// Every entry in the stage output's `impacted_components` must appear in this
+    /// list (case-insensitive). An empty/absent `impacted_components` trivially
+    /// satisfies this.
+    pub impacted_components_allowlist: Option<Vec<String>>,
+    /// The stage output's `estimate_turns` must be present and `<=` this.
+    pub max_estimate_turns: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalConfig {
+    pub auto_approve_when: Option<AutoApproveWhen>,
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -397,7 +425,58 @@ pub struct PipelineConfig {
     /// responsibility to arrange, same convention `repo.pull_request`'s "in review"
     /// state already documents), so the orchestrator's existing eligibility checks
     /// simply stop selecting it for dispatch rather than needing new logic of their own.
+    /// Also where AIR-5's "request changes reviewed" -- a rejected approval reuses
+    /// this same parked state rather than adding a second one.
     pub blocked_state: String,
+    /// AIR-5: tracker state a `requires_approval` stage's completion parks the issue
+    /// in while a human (or `approval.auto_approve_when`) decides. Same "outside
+    /// active/terminal states, orchestrator dispatch just stops selecting it"
+    /// convention as `blocked_state`.
+    pub awaiting_approval_state: String,
+    pub approval: ApprovalConfig,
+    /// How the project's tests actually run (AIR-6) -- `None` unless `pipeline.test` is
+    /// configured, in which case a stage identified as `id: test` runs these suites
+    /// through the hook plumbing instead of (in addition to) the agent's own turns.
+    pub test: Option<TestConfig>,
+    pub review: ReviewConfig,
+}
+
+/// `pipeline.test` (AIR-6): the project declares how its own suites and coverage tool
+/// run, since Symphony has no built-in notion of "run the tests" for an arbitrary
+/// language/toolchain.
+#[derive(Debug, Clone)]
+pub struct TestConfig {
+    /// Suite name -> shell command, in declaration order (`commands:` is a mapping in
+    /// YAML, but order still matters for a stable, readable `test_report`).
+    pub commands: Vec<(String, String)>,
+    pub coverage: Option<CoverageConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageConfig {
+    pub command: String,
+    pub format: crate::quality::CoverageFormat,
+    /// Advisory unless the stage itself is `blocking: true` (`StageConfig::blocking`).
+    pub min_line_percent: Option<f64>,
+    /// Where the coverage command writes its report, relative to the workspace root.
+    /// Defaults to a sensible filename per `format` when not given explicitly.
+    pub path: String,
+}
+
+/// AIR-7: bounds the Reviewer stage's rework loop (`orchestrator::run_pipeline`) -- a
+/// `request_changes` recommendation sends the cycle back to the Developer stage rather
+/// than failing it outright, but only up to `max_rework_rounds` times before escalating
+/// to a human. The roadmap treats rework as a measured quantity (§11), so every round
+/// is recorded (`eventlog::record_rework_round`), not just counted in memory.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewConfig {
+    pub max_rework_rounds: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self { max_rework_rounds: 2 }
+    }
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -429,19 +508,47 @@ impl StageFailureAction {
 #[derive(Debug, Clone)]
 pub struct StageConfig {
     pub id: String,
-    /// A stage's role identity. Not yet resolved to a distinct prompt/backend/tool
-    /// policy (that's AIR-2) -- every stage today runs the project's one `WORKFLOW.md`
-    /// prompt template. Kept as a plain string now so `pipeline.stages[].role` in
-    /// `WORKFLOW.md` doesn't need to change shape once AIR-2 lands. Parsed and
-    /// validated (non-empty) today; not read anywhere beyond that until AIR-2 gives it
-    /// something to select.
-    #[allow(dead_code)]
+    /// A stage's role identity: a key into `EffectiveConfig::roles` (a project's own
+    /// `roles:` override) or, absent one, a built-in role name (`src/roles/builtin`) --
+    /// see `roles::resolve`. Validated against both at `resolve()` time (below), so a
+    /// stage naming an undefined role is a config error, not a runtime surprise.
     pub role: String,
     pub max_turns: u32,
     pub on_failure: StageFailureAction,
     /// Whether this stage's failure parks the issue in `pipeline.blocked_state` rather
     /// than falling back to the whole-attempt retry backoff.
     pub blocking: bool,
+    /// Lets a project skip this stage per-issue by labeling the issue
+    /// `skip-<stage id>` (e.g. `skip-requirements`), for tickets already written as
+    /// specs (AIR-4) that don't need the requirements stage to re-derive anything.
+    /// `false` (the default) means the stage always runs, matching AIR-1's original
+    /// pre-`optional` behavior exactly.
+    pub optional: bool,
+    /// AIR-5: whether this stage's *successful* completion still isn't enough to move
+    /// on -- the cycle parks in `pipeline.awaiting_approval_state` and waits for a
+    /// human decision (dashboard or issue-comment `/approve`/`/changes`/`/reject`),
+    /// unless `pipeline.approval.auto_approve_when` matches the stage's output first.
+    pub requires_approval: bool,
+}
+
+/// AIR-2: a project's override of one of the eight built-in roadmap roles
+/// (`roles.<name>` in `WORKFLOW.md`), or a wholly project-defined one. Every field is
+/// optional -- an unset one falls back to the built-in prompt (`src/roles/builtin`) and
+/// to `agent.*`/an unrestricted `ToolPolicy`, exactly like having no `roles.<name>`
+/// entry at all. See `roles::resolve` for how these combine.
+#[derive(Debug, Clone, Default)]
+pub struct RoleConfig {
+    /// Inline prompt template overriding the built-in one. `prompt_file` (read and
+    /// substituted in here at resolve time, relative to `workflow_dir`) takes the same
+    /// slot -- exactly one of the two, or neither (built-in), is expected; `prompt_file`
+    /// wins if both are set, matching "a project-supplied prompt_file overrides the
+    /// built-in" from the ticket without needing a third precedence rule for "both set."
+    pub prompt: Option<String>,
+    pub backend: Option<AgentBackendKind>,
+    /// Backend-specific model id, e.g. `fireworks/<model-id>` for `opencode`.
+    pub model: Option<String>,
+    pub max_turns: Option<u32>,
+    pub tool_policy: crate::agent::ToolPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -468,6 +575,11 @@ pub struct EffectiveConfig {
     pub repo: Option<RepoConfig>,
     pub swebot: SwebotConfig,
     pub pipeline: PipelineConfig,
+    /// AIR-2: project overrides of the built-in roadmap roles (`roles:` in
+    /// `WORKFLOW.md`), keyed by role name. A role a stage names but that's absent here
+    /// falls back to its built-in default (`src/roles/builtin`) entirely -- see
+    /// `roles::resolve`.
+    pub roles: HashMap<String, RoleConfig>,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -572,6 +684,21 @@ fn get_vec_str(v: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Conventional output filename per coverage format, used when `pipeline.test.coverage`
+/// doesn't set an explicit `path:` -- matches what each tool's docs use as its own
+/// default (e.g. `cargo llvm-cov --json --output-path coverage.json`'s own example).
+fn default_coverage_path(format: crate::quality::CoverageFormat) -> String {
+    use crate::quality::CoverageFormat as F;
+    match format {
+        F::LlvmCov => "coverage.json",
+        F::Lcov => "lcov.info",
+        F::Cobertura => "cobertura.xml",
+        F::Jacoco => "jacoco.xml",
+        F::None => "coverage",
+    }
+    .to_string()
 }
 
 fn get_map(v: &Value, key: &str) -> Value {
@@ -865,6 +992,10 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                             .map(|v| StageFailureAction::parse(&v))
                             .unwrap_or(StageFailureAction::Escalate),
                         blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
+                        optional: get(s, "optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                        requires_approval: get(s, "requires_approval")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     })
                 })
                 .collect()
@@ -874,12 +1005,118 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     if pipeline_enabled && pipeline_stages.is_empty() {
         return Err(ConfigError::EmptyPipelineStages);
     }
+    let auto_approve_raw = get(pipeline_raw, "approval").and_then(|a| get(a, "auto_approve_when"));
+    let auto_approve_when = auto_approve_raw.map(|a| AutoApproveWhen {
+        risk: get_str(a, "risk"),
+        impacted_components_allowlist: get(a, "impacted_components")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            }),
+        max_estimate_turns: get(a, "estimate_turns_max")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    });
+    let test_raw = get(pipeline_raw, "test");
+    let test_cfg = test_raw.map(|t| {
+        let commands = get_map(t, "commands")
+            .as_mapping()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let coverage_raw = get(t, "coverage");
+        let coverage = coverage_raw.and_then(|c| {
+            let command = get_str(c, "command")?;
+            let format =
+                crate::quality::CoverageFormat::parse(&get_str(c, "format").unwrap_or_default());
+            let path = get_str(c, "path").unwrap_or_else(|| default_coverage_path(format));
+            Some(CoverageConfig {
+                command,
+                format,
+                min_line_percent: get(c, "min_line_percent").and_then(|v| v.as_f64()),
+                path,
+            })
+        });
+        TestConfig { commands, coverage }
+    });
+
+    let review_raw = get(pipeline_raw, "review").unwrap_or(&empty);
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
         blocked_state: get_str(pipeline_raw, "blocked_state")
             .unwrap_or_else(|| "blocked".to_string()),
+        awaiting_approval_state: get_str(pipeline_raw, "awaiting_approval_state")
+            .unwrap_or_else(|| "awaiting approval".to_string()),
+        approval: ApprovalConfig { auto_approve_when },
+        test: test_cfg,
+        review: ReviewConfig {
+            max_rework_rounds: (get_u64(review_raw, "max_rework_rounds", 2) as u32).max(1),
+        },
     };
+
+    let roles_raw = get(config, "roles").unwrap_or(&empty);
+    let mut roles_cfg: HashMap<String, RoleConfig> = HashMap::new();
+    if let Some(mapping) = roles_raw.as_mapping() {
+        for (k, v) in mapping {
+            let Some(name) = k.as_str() else { continue };
+            let name = name.trim().to_lowercase();
+            // `prompt_file` (relative to `workflow_dir`, same convention
+            // `workspace.root` uses) wins over inline `prompt` when both are set --
+            // matches the ticket's "a project-supplied prompt_file overrides the
+            // built-in" without needing a separate precedence rule for "both set."
+            let prompt = match get_str(v, "prompt_file") {
+                Some(rel) => {
+                    let path = envsub::resolve_path(&rel, workflow_dir);
+                    let content = std::fs::read_to_string(&path).map_err(|e| {
+                        ConfigError::UnreadableRolePromptFile(name.clone(), rel.clone(), e.to_string())
+                    })?;
+                    Some(content)
+                }
+                None => get_str(v, "prompt"),
+            };
+            let tools = get(v, "tools").unwrap_or(&empty);
+            let tool_policy = crate::agent::ToolPolicy {
+                allow_edits: get(tools, "allow_edits")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true),
+                allow_commands: get(tools, "allow_commands")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true),
+            };
+            roles_cfg.insert(
+                name,
+                RoleConfig {
+                    prompt,
+                    backend: get_str(v, "backend").map(|s| AgentBackendKind::parse(&s)),
+                    model: get_str(v, "model"),
+                    max_turns: get(v, "max_turns")
+                        .and_then(|x| x.as_u64())
+                        .map(|n| n.max(1) as u32),
+                    tool_policy,
+                },
+            );
+        }
+    }
+
+    // A stage naming an undefined, non-built-in role is a config error, not a runtime
+    // surprise -- checked here (both `roles_cfg` and `pipeline_cfg.stages` exist by
+    // this point) rather than left for `roles::resolve` to discover mid-cycle.
+    for (i, stage) in pipeline_cfg.stages.iter().enumerate() {
+        let role_key = stage.role.trim().to_lowercase();
+        if !roles_cfg.contains_key(&role_key) && !crate::roles::builtin::is_known(&role_key) {
+            return Err(ConfigError::UnknownStageRole(
+                i,
+                stage.role.clone(),
+                crate::roles::builtin::ROLE_NAMES.join(", "),
+            ));
+        }
+    }
 
     let cfg = EffectiveConfig {
         tracker_kind,
@@ -899,6 +1136,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         repo: repo_cfg,
         swebot: swebot_cfg,
         pipeline: pipeline_cfg,
+        roles: roles_cfg,
 
         hook_after_create,
         hook_before_run,
@@ -2137,5 +2375,203 @@ mod tests {
         assert_eq!(second.max_turns, 3);
         assert_eq!(second.on_failure, StageFailureAction::Skip);
         assert!(second.blocking);
+        assert!(!first.optional);
+        assert!(!second.optional);
+    }
+
+    #[test]
+    fn pipeline_stage_optional_flag_parses_and_defaults_false() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: requirements\n      role: requirements\n      optional: true\n    \
+             - id: implement\n      role: developer\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.pipeline.stages[0].optional);
+        assert!(!cfg.pipeline.stages[1].optional);
+    }
+
+    /// AIR-2 acceptance criterion: "A stage referencing an unknown role fails config
+    /// resolution with a helpful message."
+    #[test]
+    fn pipeline_stage_referencing_an_unknown_role_fails_resolution() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: made-up\n      role: not-a-real-role\n",
+        );
+        let err = resolve(&cfg_yaml, Path::new(".")).unwrap_err();
+        match &err {
+            ConfigError::UnknownStageRole(idx, role, known) => {
+                assert_eq!(*idx, 0);
+                assert_eq!(role, "not-a-real-role");
+                assert!(known.contains("reviewer"));
+            }
+            other => panic!("expected UnknownStageRole, got {other:?}"),
+        }
+        assert!(err.to_string().contains("not-a-real-role"));
+    }
+
+    /// A stage naming a role only defined under `roles:` (not one of the eight
+    /// built-ins) resolves fine -- `roles:` isn't limited to overriding built-ins.
+    #[test]
+    fn pipeline_stage_referencing_a_wholly_custom_role_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: custom\n      role: my-custom-role\n\
+             roles:\n  my-custom-role:\n    prompt: \"do the custom thing\"\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.stages[0].role, "my-custom-role");
+        assert_eq!(
+            cfg.roles.get("my-custom-role").unwrap().prompt.as_deref(),
+            Some("do the custom thing")
+        );
+    }
+
+    #[test]
+    fn roles_block_parses_backend_model_and_tool_policy_overrides() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nroles:\n  reviewer:\n    backend: opencode\n    \
+             model: fireworks/kimi\n    max_turns: 3\n    tools:\n      \
+             allow_edits: false\n      allow_commands: false\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let role = cfg.roles.get("reviewer").unwrap();
+        assert_eq!(role.backend, Some(AgentBackendKind::OpenCode));
+        assert_eq!(role.model.as_deref(), Some("fireworks/kimi"));
+        assert_eq!(role.max_turns, Some(3));
+        assert!(!role.tool_policy.allow_edits);
+        assert!(!role.tool_policy.allow_commands);
+    }
+
+    #[test]
+    fn roles_block_defaults_tool_policy_to_unrestricted() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nroles:\n  reviewer:\n    model: x\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let role = cfg.roles.get("reviewer").unwrap();
+        assert!(role.tool_policy.allow_edits);
+        assert!(role.tool_policy.allow_commands);
+    }
+
+    #[test]
+    fn roles_block_prompt_file_is_read_relative_to_workflow_dir_and_wins_over_inline_prompt() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("reviewer.md"), "custom file prompt").unwrap();
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nroles:\n  reviewer:\n    prompt: \"inline, should lose\"\n    \
+             prompt_file: ./reviewer.md\n",
+        );
+        let cfg = resolve(&cfg_yaml, dir.path()).unwrap();
+        assert_eq!(
+            cfg.roles.get("reviewer").unwrap().prompt.as_deref(),
+            Some("custom file prompt")
+        );
+    }
+
+    #[test]
+    fn roles_block_unreadable_prompt_file_is_a_clear_config_error() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nroles:\n  reviewer:\n    prompt_file: ./does-not-exist.md\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::UnreadableRolePromptFile(..))
+        ));
+    }
+
+    #[test]
+    fn pipeline_awaiting_approval_state_defaults_and_stage_requires_approval_parses() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: plan\n      role: planner\n      requires_approval: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.awaiting_approval_state, "awaiting approval");
+        assert!(cfg.pipeline.stages[0].requires_approval);
+        assert!(cfg.pipeline.approval.auto_approve_when.is_none());
+    }
+
+    #[test]
+    fn pipeline_auto_approve_when_parses_all_conditions() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  \
+             awaiting_approval_state: pending review\n  \
+             approval:\n    auto_approve_when:\n      risk: low\n      \
+             impacted_components: [src/foo.rs, src/bar.rs]\n      estimate_turns_max: 4\n  \
+             stages:\n    - id: plan\n      role: planner\n      requires_approval: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.awaiting_approval_state, "pending review");
+        let auto = cfg.pipeline.approval.auto_approve_when.as_ref().unwrap();
+        assert_eq!(auto.risk.as_deref(), Some("low"));
+        assert_eq!(
+            auto.impacted_components_allowlist.as_deref(),
+            Some(&["src/foo.rs".to_string(), "src/bar.rs".to_string()][..])
+        );
+        assert_eq!(auto.max_estimate_turns, Some(4));
+    }
+
+    #[test]
+    fn pipeline_test_absent_resolves_to_none() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.pipeline.test.is_none());
+    }
+
+    #[test]
+    fn pipeline_test_parses_commands_and_coverage() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    \
+             commands:\n      unit: cargo test\n      integration: ./scripts/it.sh\n    \
+             coverage:\n      command: cargo llvm-cov --json --output-path coverage.json\n      \
+             format: llvm-cov\n      min_line_percent: 70\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let test = cfg.pipeline.test.expect("pipeline.test should be Some");
+        assert_eq!(test.commands.len(), 2);
+        assert!(
+            test.commands
+                .contains(&("unit".to_string(), "cargo test".to_string()))
+        );
+        assert!(
+            test.commands
+                .contains(&("integration".to_string(), "./scripts/it.sh".to_string()))
+        );
+        let coverage = test.coverage.expect("coverage should be Some");
+        assert_eq!(
+            coverage.command,
+            "cargo llvm-cov --json --output-path coverage.json"
+        );
+        assert_eq!(coverage.format, crate::quality::CoverageFormat::LlvmCov);
+        assert_eq!(coverage.min_line_percent, Some(70.0));
+        // Default path derived from format when `path:` isn't given.
+        assert_eq!(coverage.path, "coverage.json");
+    }
+
+    #[test]
+    fn pipeline_test_coverage_format_none_degrades_without_min_percent() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    \
+             commands:\n      unit: cargo test\n    \
+             coverage:\n      command: echo skip\n      format: none\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let coverage = cfg.pipeline.test.unwrap().coverage.unwrap();
+        assert_eq!(coverage.format, crate::quality::CoverageFormat::None);
+        assert_eq!(coverage.min_line_percent, None);
+    }
+
+    #[test]
+    fn pipeline_test_without_coverage_block_is_none() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  test:\n    commands:\n      unit: cargo test\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let test = cfg.pipeline.test.unwrap();
+        assert_eq!(
+            test.commands,
+            vec![("unit".to_string(), "cargo test".to_string())]
+        );
+        assert!(test.coverage.is_none());
     }
 }

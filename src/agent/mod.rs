@@ -84,6 +84,52 @@ pub enum AgentError {
     ProcessExit(String),
     #[error("response_error: {0}")]
     ResponseError(String),
+    /// A backend was asked to start a session under a `ToolPolicy` it cannot honor
+    /// (AIR-2: `codex` has no known native tool-denial mechanism yet). Refusing to
+    /// start is the correct posture -- silently running unrestricted would defeat the
+    /// whole point of a role's tool restriction (e.g. a Reviewer that can edit files).
+    #[error("unsupported_tool_policy: {0}")]
+    UnsupportedToolPolicy(String),
+}
+
+/// Backend-agnostic tool restriction a session starts under (roadmap §4: "a Reviewer
+/// that can edit files is not a reviewer"). Originally SweBot's own hardcoded
+/// `--disallowedTools`/`OPENCODE_PERMISSION` construction (see `swebot::mod` history);
+/// generalized here (AIR-2) so both SweBot and pipeline roles (`src/roles/`) drive the
+/// same mechanism. Each `AgentBackend` translates this into its own native denial
+/// mechanism in `start_session` -- `claude.rs` appends `--disallowedTools`, `opencode.rs`
+/// sets `OPENCODE_PERMISSION` -- and `codex.rs` returns
+/// `AgentError::UnsupportedToolPolicy` for any restricted policy rather than silently
+/// running unrestricted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolPolicy {
+    pub allow_edits: bool,
+    pub allow_commands: bool,
+}
+
+impl Default for ToolPolicy {
+    /// The high-trust posture every backend already defaults to (Section 10.5 example):
+    /// nothing denied.
+    fn default() -> Self {
+        Self {
+            allow_edits: true,
+            allow_commands: true,
+        }
+    }
+}
+
+impl ToolPolicy {
+    /// SweBot's own restriction (`allow_edits: false`, unchanged from before this
+    /// refactor): file-mutating tools denied, Bash/Read stay free so it can still
+    /// explore the repo and run tests during review.
+    pub const SWEBOT: ToolPolicy = ToolPolicy {
+        allow_edits: false,
+        allow_commands: true,
+    };
+
+    pub fn is_restricted(&self) -> bool {
+        !self.allow_edits || !self.allow_commands
+    }
 }
 
 #[async_trait]
@@ -107,13 +153,16 @@ pub trait AgentBackend: Send + Sync {
     /// opaque dispatch id (used to bind any provider-native tool wiring to this issue);
     /// `title` is used for turn/session titling where the backend supports it (Section
     /// 10.2). `container` is `Some` in Docker mode (see README.md) -- backends that
-    /// don't support it (currently: Codex) may ignore it.
+    /// don't support it (currently: Codex) may ignore it. `tool_policy` (AIR-2) is this
+    /// session's tool restriction, translated into whichever native denial mechanism
+    /// this backend has -- see `ToolPolicy`'s doc comment.
     async fn start_session(
         &self,
         workspace: &Path,
         issue_id: &str,
         title: &str,
         container: Option<&ContainerHandle>,
+        tool_policy: &ToolPolicy,
     ) -> Result<Box<dyn AgentSession>, AgentError>;
 
     /// Downcast hook, mainly so tests can inspect which concrete backend a factory

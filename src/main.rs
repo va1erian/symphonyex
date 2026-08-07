@@ -1,4 +1,6 @@
 mod agent;
+mod approvals;
+mod artifacts;
 mod config;
 mod container;
 mod daemon;
@@ -10,8 +12,11 @@ mod hooks;
 mod mcp;
 mod metrics;
 mod orchestrator;
+mod quality;
 mod registry;
 mod repo_host;
+mod review_rubric;
+mod roles;
 mod service;
 mod status;
 mod swebot;
@@ -87,6 +92,14 @@ enum Command {
         /// path. Unused by every other tool.
         #[arg(long)]
         workspace_dir: PathBuf,
+        /// `pipeline.enabled` (AIR-3) -- gates whether `record_artifact` is exposed and
+        /// executable at all, same posture as `repo_pr`'s presence gating
+        /// `open_pull_request`/`attach_evidence`. The artifact store's own db/blob
+        /// paths need no separate argument: both are derived from `workflow_dir`
+        /// above (`eventlog::DB_FILENAME` for the db, `.symphony/cycles/` for blobs),
+        /// reusing that plumbing rather than inventing a second one.
+        #[arg(long)]
+        pipeline_enabled: bool,
     },
 
     /// Run Symphony itself as a long-lived, auto-restarting, single-instance Docker
@@ -159,6 +172,7 @@ async fn main() -> std::process::ExitCode {
             issue_id,
             repo_pr,
             workspace_dir,
+            pipeline_enabled,
         }) => {
             return run_mcp_tool_server(
                 &tracker_kind,
@@ -167,6 +181,7 @@ async fn main() -> std::process::ExitCode {
                 &issue_id,
                 repo_pr.as_deref(),
                 &workspace_dir,
+                pipeline_enabled,
             )
             .await;
         }
@@ -248,6 +263,7 @@ async fn run_mcp_tool_server(
     issue_id: &str,
     repo_pr_json: Option<&str>,
     workspace_dir: &std::path::Path,
+    pipeline_enabled: bool,
 ) -> std::process::ExitCode {
     let provider: serde_yaml::Value = match serde_yaml::from_str(tracker_provider_json) {
         Ok(v) => v,
@@ -276,7 +292,27 @@ async fn run_mcp_tool_server(
         },
         None => None,
     };
-    match mcp::run_stdio_server(adapter, repo_host, issue_id, workspace_dir).await {
+    let artifacts_wiring = pipeline_enabled.then(|| mcp::ArtifactsWiring {
+        db_path: workflow_dir.join(eventlog::DB_FILENAME),
+        workflow_dir: workflow_dir.to_path_buf(),
+    });
+    // AIR-4's own tools (`record_requirements`/`record_acceptance_criteria`/
+    // `raise_clarification`) are gated on the same already-threaded `pipeline_enabled`
+    // flag `artifacts_wiring` above uses, rather than AIR-4's original approach of
+    // re-loading and re-resolving WORKFLOW.md from scratch inside this subprocess.
+    let pipeline = pipeline_enabled.then(|| mcp::PipelineToolCtx {
+        db_path: workflow_dir.join(eventlog::DB_FILENAME),
+    });
+    match mcp::run_stdio_server(
+        adapter,
+        repo_host,
+        artifacts_wiring,
+        pipeline,
+        issue_id,
+        workspace_dir,
+    )
+    .await
+    {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "mcp tool server exited with error");

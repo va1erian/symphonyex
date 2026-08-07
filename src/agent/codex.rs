@@ -13,7 +13,9 @@
 //! field named like `*token*`). Treat the method names as a starting point to adjust
 //! against the schema for your installed Codex build, not as a verified contract.
 
-use super::{AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, TurnOutcome};
+use super::{
+    AgentBackend, AgentError, AgentEvent, AgentSession, TokenUsage, ToolPolicy, TurnOutcome,
+};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -41,11 +43,25 @@ impl AgentBackend for CodexBackend {
         _issue_id: &str,
         title: &str,
         _container: Option<&crate::container::ContainerHandle>,
+        tool_policy: &ToolPolicy,
     ) -> Result<Box<dyn AgentSession>, AgentError> {
         if !workspace.is_dir() {
             return Err(AgentError::InvalidCwd(format!(
                 "{workspace:?} is not a directory"
             )));
+        }
+
+        // AIR-2: `codex` has no known native tool-denial mechanism (no
+        // `--disallowedTools`-equivalent flag in the app-server protocol as
+        // documented). Refuse to start rather than silently running an unrestricted
+        // session under a role/SweBot config that asked for one -- the same posture
+        // `swebot::build_restricted_backend` already takes for this backend.
+        if tool_policy.is_restricted() {
+            return Err(AgentError::UnsupportedToolPolicy(
+                "codex backend has no native tool-restriction mechanism yet -- \
+                 a restricted role or SweBot session cannot run on codex"
+                    .to_string(),
+            ));
         }
 
         // Unlike hooks (see src/hooks.rs's module doc for the argv-corruption pitfalls
@@ -302,5 +318,54 @@ fn extract_usage_leniently(msg: &Value) -> Option<TokenUsage> {
                 total_tokens: i + o,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// AIR-2 acceptance criterion: `allow_edits: false` must produce "a clean startup
+    /// error for `codex`" -- codex has no native tool-denial mechanism, so a restricted
+    /// session must be refused outright rather than silently running unrestricted.
+    #[tokio::test]
+    async fn restricted_tool_policy_is_refused_before_spawning_anything() {
+        let backend = CodexBackend {
+            command: "definitely-not-a-real-binary-xyz".to_string(),
+            approval_policy: None,
+            thread_sandbox: None,
+            turn_sandbox_policy: None,
+            turn_timeout_ms: 1_000,
+            read_timeout_ms: 1_000,
+        };
+        let workspace = tempdir().unwrap();
+        let policy = ToolPolicy {
+            allow_edits: false,
+            allow_commands: true,
+        };
+        let result = backend
+            .start_session(workspace.path(), "issue-1", "t", None, &policy)
+            .await;
+        assert!(matches!(result, Err(AgentError::UnsupportedToolPolicy(_))));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_tool_policy_proceeds_past_the_refusal_check() {
+        let backend = CodexBackend {
+            command: "definitely-not-a-real-binary-xyz".to_string(),
+            approval_policy: None,
+            thread_sandbox: None,
+            turn_sandbox_policy: None,
+            turn_timeout_ms: 1_000,
+            read_timeout_ms: 1_000,
+        };
+        let workspace = tempdir().unwrap();
+        let result = backend
+            .start_session(workspace.path(), "issue-1", "t", None, &ToolPolicy::default())
+            .await;
+        // Fails later for an unrelated reason (no such binary/RPC handshake), not on
+        // the tool-policy check.
+        assert!(!matches!(result, Err(AgentError::UnsupportedToolPolicy(_))));
     }
 }
