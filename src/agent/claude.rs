@@ -46,6 +46,10 @@ pub struct McpToolWiring {
     /// branch workflow"). Independent of `tracker_kind`/`tracker_provider_json`: a
     /// pull request is a property of the code host, not the issue tracker.
     pub repo_pr_json: Option<String>,
+    /// `pipeline.enabled` (AIR-3) -- gates whether `record_artifact` is wired in
+    /// alongside whatever tracker/repo-host tools are already exposed. See
+    /// `crate::artifacts`'s own doc comment.
+    pub pipeline_enabled: bool,
 }
 
 pub struct ClaudeBackend {
@@ -174,6 +178,9 @@ fn write_mcp_config(
     if let Some(repo_pr_json) = &wiring.repo_pr_json {
         args.push("--repo-pr".to_string());
         args.push(repo_pr_json.clone());
+    }
+    if wiring.pipeline_enabled {
+        args.push("--pipeline-enabled".to_string());
     }
     let config = json!({
         "mcpServers": {

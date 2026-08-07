@@ -214,7 +214,13 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
         .filter(|r| r.pull_request)
         .map(serde_json::to_string)
         .transpose()?;
-    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty() && repo_pr_json.is_none() {
+    // AIR-3: `pipeline.enabled` on its own also needs the MCP subprocess wired up, even
+    // when the tracker has no tools of its own and `repo.pull_request` is off --
+    // `record_artifact` is a property of the cycle, not of either of those.
+    let mcp_wiring = if tracker_adapter.agent_tool_specs().is_empty()
+        && repo_pr_json.is_none()
+        && !cfg.pipeline.enabled
+    {
         None
     } else {
         Some(claude::McpToolWiring {
@@ -222,6 +228,7 @@ fn build_shared(workflow_path: &Path) -> anyhow::Result<Shared> {
             tracker_provider_json: serde_json::to_string(&cfg.tracker_provider)?,
             workflow_dir: cfg.workflow_dir.clone(),
             repo_pr_json,
+            pipeline_enabled: cfg.pipeline.enabled,
         })
     };
     let agent_backend: Arc<dyn AgentBackend> = match cfg.agent_backend {
@@ -1624,7 +1631,9 @@ async fn run_turn_loop(
     // for a pipeline stage's own role prompt. `None` for the legacy single-stage path,
     // whose `WORKFLOW.md` prompt never references `cycle.*` -- `template::render`'s
     // strict mode only errors on a *referenced* unknown variable, so omitting the key
-    // entirely is safe there.
+    // entirely is safe there. AIR-3's real per-cycle artifact index is folded into this
+    // object's `"artifacts"` field by `run_pipeline` before it's passed down here,
+    // rather than threaded through as a separate parameter.
     cycle: Option<&serde_json::Value>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> LoopExit {
@@ -1702,8 +1711,15 @@ async fn run_pipeline(
     tx: &mpsc::UnboundedSender<OrchMsg>,
 ) -> ExitReason {
     let cfg = &snapshot.config;
+    // AIR-2's own display-facing id (used only in `cycle.id`, e.g. distinguishing
+    // retried attempts of the same issue in a rendered prompt). The artifact store
+    // (AIR-3) deliberately keys on plain `issue_id` instead, matching what
+    // `record_artifact`'s MCP wiring (`src/mcp.rs`) actually threads through today --
+    // one shared artifact index per issue, not one per attempt, so a retry still sees
+    // what earlier attempts already recorded rather than starting over.
     let cycle_id = format!("{issue_id}-{}", attempt.unwrap_or(1));
     let mut previous_stage_summary = String::new();
+    let artifacts_db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
 
     for stage in &cfg.pipeline.stages {
         let role = match crate::roles::resolve(&stage.role, cfg) {
@@ -1730,14 +1746,23 @@ async fn run_pipeline(
             role_summary,
         });
 
-        // `cycle.artifacts` is a placeholder empty object until AIR-3 lands the
-        // per-cycle artifact index; the key must still exist so a built-in role
-        // prompt referencing `cycle.artifacts` renders under `template.rs`'s strict
-        // mode (an unknown-but-referenced variable is a render error).
+        // AIR-3: tag the workspace with the stage now running (read back by
+        // `record_artifact`, executing in the separate `__mcp_tool_server`
+        // subprocess) and refresh its `.symphony/artifacts/` copies with whatever
+        // earlier stages of this cycle have recorded so far -- covers a workspace
+        // recreated since the last stage ran, not just a continuously-running one.
+        crate::artifacts::prepare_workspace_for_stage(
+            &artifacts_db_path,
+            &cfg.workflow_dir,
+            issue_id,
+            workspace_path,
+            &stage.id,
+        );
+        let cycle_artifacts = crate::artifacts::list_index(&artifacts_db_path, issue_id);
         let cycle_ctx = json!({
             "id": cycle_id,
             "stage": stage.id,
-            "artifacts": {},
+            "artifacts": cycle_artifacts,
             "previous_stage_summary": previous_stage_summary,
         });
 
@@ -1897,6 +1922,13 @@ fn render_turn_prompt(
     attempt: Option<u32>,
     turn_number: u32,
     max_turns: u32,
+    // AIR-2's `cycle.*` template namespace, with AIR-3's real per-cycle artifact index
+    // already folded into its `"artifacts"` field by `run_pipeline` -- see that
+    // function's own doc comment. `None` for the legacy single-stage path (its
+    // `WORKFLOW.md` prompt never references `cycle.*`, so omitting the key entirely is
+    // safe under `template::render`'s strict mode, which only errors on a *referenced*
+    // unknown variable); every built-in pipeline role prompt that references
+    // `cycle.artifacts` only ever runs with `Some(cycle)` supplied.
     cycle: Option<&serde_json::Value>,
 ) -> Result<String, template::TemplateError> {
     if turn_number == 1 {
@@ -2102,7 +2134,12 @@ mod tests {
              pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n{stages_yaml}"
         ))
         .unwrap();
-        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        // `tracker_dir` doubles as `workflow_dir` here (both are throwaway per-test
+        // tempdirs already): AIR-3's artifact store derives its db/blob paths from
+        // `cfg.workflow_dir`, and using "." like the other tests below would make
+        // `run_pipeline` write `symphony.db`/`.symphony/` into this crate's own
+        // working directory during `cargo test`.
+        let cfg = config::resolve(&cfg_yaml, tracker_dir).unwrap();
 
         let provider: serde_yaml::Value =
             serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
@@ -2161,14 +2198,31 @@ mod tests {
             .unwrap()
             .remove(0);
 
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         // requirements (1 turn) + implement (2 turns) = 3 turns total, in one session.
         assert_eq!(*calls.lock().unwrap(), 3);
@@ -2211,9 +2265,16 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2223,7 +2284,7 @@ mod tests {
             None,
             session.as_mut(),
             &snapshot,
-            Path::new("."),
+            workspace.path(),
             None,
             &tx,
         )
@@ -2261,14 +2322,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         // Blocking failure ends the cycle cleanly (not an attempt-level error) --
         // the issue's own state is what now says it stopped, and why.
         assert!(matches!(exit, ExitReason::Normal));
@@ -2310,14 +2388,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
 
         let msgs = drain(rx).await;
@@ -2357,14 +2452,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Normal));
         assert_eq!(*calls.lock().unwrap(), 2, "the failed turn plus one retry turn");
 
@@ -2396,14 +2508,31 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
+        let workspace = tempdir().unwrap();
         let mut session = snapshot
             .agent_backend
-            .start_session(Path::new("."), &issue.id, "t", None, &crate::agent::ToolPolicy::default())
+            .start_session(
+                workspace.path(),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
             .await
             .unwrap();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let exit = run_pipeline(&issue.id.clone(), &mut issue, None, session.as_mut(), &snapshot, Path::new("."), None, &tx).await;
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
         assert!(matches!(exit, ExitReason::Error(_)));
 
         let msgs = drain(rx).await;
