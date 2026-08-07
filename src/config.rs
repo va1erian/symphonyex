@@ -87,9 +87,7 @@ pub enum ConfigError {
     UnknownChatConnector(String, String),
     #[error("invalid_config: pipeline.enabled is true but pipeline.stages is empty")]
     EmptyPipelineStages,
-    #[error(
-        "invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field"
-    )]
+    #[error("invalid_config: pipeline.stages[{0}] is missing a non-empty 'id' or 'role' field")]
     InvalidPipelineStage(usize),
     #[error(
         "invalid_config: pipeline.stages[{0}] references role '{1}', which is neither a \
@@ -98,6 +96,29 @@ pub enum ConfigError {
     UnknownStageRole(usize, String, String),
     #[error("invalid_config: roles.{0}.prompt_file '{1}' could not be read: {2}")]
     UnreadableRolePromptFile(String, String, String),
+}
+
+/// AIR-5: `pipeline.approval.auto_approve_when` -- every condition set (non-`None`)
+/// must hold for a `requires_approval` stage's output to be approved without a human.
+/// Absent entirely (the `Default`), nothing ever auto-approves -- the roadmap's
+/// autonomy measure is *reduced* human interventions, not zero governance.
+#[derive(Debug, Clone, Default)]
+pub struct AutoApproveWhen {
+    /// Matched case-insensitively against the stage output's `risk` field. `None`
+    /// (the plan didn't state a risk, or the stage's output couldn't be parsed as
+    /// structured JSON) never satisfies this when set.
+    pub risk: Option<String>,
+    /// Every entry in the stage output's `impacted_components` must appear in this
+    /// list (case-insensitive). An empty/absent `impacted_components` trivially
+    /// satisfies this.
+    pub impacted_components_allowlist: Option<Vec<String>>,
+    /// The stage output's `estimate_turns` must be present and `<=` this.
+    pub max_estimate_turns: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalConfig {
+    pub auto_approve_when: Option<AutoApproveWhen>,
 }
 
 /// Extension: which coding-agent backend implementation to launch.
@@ -404,7 +425,15 @@ pub struct PipelineConfig {
     /// responsibility to arrange, same convention `repo.pull_request`'s "in review"
     /// state already documents), so the orchestrator's existing eligibility checks
     /// simply stop selecting it for dispatch rather than needing new logic of their own.
+    /// Also where AIR-5's "request changes reviewed" -- a rejected approval reuses
+    /// this same parked state rather than adding a second one.
     pub blocked_state: String,
+    /// AIR-5: tracker state a `requires_approval` stage's completion parks the issue
+    /// in while a human (or `approval.auto_approve_when`) decides. Same "outside
+    /// active/terminal states, orchestrator dispatch just stops selecting it"
+    /// convention as `blocked_state`.
+    pub awaiting_approval_state: String,
+    pub approval: ApprovalConfig,
 }
 
 /// What a stage's failure (a turn erroring out, not a judgement about work quality --
@@ -452,6 +481,11 @@ pub struct StageConfig {
     /// `false` (the default) means the stage always runs, matching AIR-1's original
     /// pre-`optional` behavior exactly.
     pub optional: bool,
+    /// AIR-5: whether this stage's *successful* completion still isn't enough to move
+    /// on -- the cycle parks in `pipeline.awaiting_approval_state` and waits for a
+    /// human decision (dashboard or issue-comment `/approve`/`/changes`/`/reject`),
+    /// unless `pipeline.approval.auto_approve_when` matches the stage's output first.
+    pub requires_approval: bool,
 }
 
 /// AIR-2: a project's override of one of the eight built-in roadmap roles
@@ -901,6 +935,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                             .unwrap_or(StageFailureAction::Escalate),
                         blocking: get(s, "blocking").and_then(|v| v.as_bool()).unwrap_or(false),
                         optional: get(s, "optional").and_then(|v| v.as_bool()).unwrap_or(false),
+                        requires_approval: get(s, "requires_approval")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     })
                 })
                 .collect()
@@ -910,11 +947,28 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     if pipeline_enabled && pipeline_stages.is_empty() {
         return Err(ConfigError::EmptyPipelineStages);
     }
+    let auto_approve_raw = get(pipeline_raw, "approval").and_then(|a| get(a, "auto_approve_when"));
+    let auto_approve_when = auto_approve_raw.map(|a| AutoApproveWhen {
+        risk: get_str(a, "risk"),
+        impacted_components_allowlist: get(a, "impacted_components")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            }),
+        max_estimate_turns: get(a, "estimate_turns_max")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    });
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
         blocked_state: get_str(pipeline_raw, "blocked_state")
             .unwrap_or_else(|| "blocked".to_string()),
+        awaiting_approval_state: get_str(pipeline_raw, "awaiting_approval_state")
+            .unwrap_or_else(|| "awaiting approval".to_string()),
+        approval: ApprovalConfig { auto_approve_when },
     };
 
     let roles_raw = get(config, "roles").unwrap_or(&empty);
@@ -2334,5 +2388,37 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::UnreadableRolePromptFile(..))
         ));
+    }
+
+    #[test]
+    fn pipeline_awaiting_approval_state_defaults_and_stage_requires_approval_parses() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  stages:\n    \
+             - id: plan\n      role: planner\n      requires_approval: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.awaiting_approval_state, "awaiting approval");
+        assert!(cfg.pipeline.stages[0].requires_approval);
+        assert!(cfg.pipeline.approval.auto_approve_when.is_none());
+    }
+
+    #[test]
+    fn pipeline_auto_approve_when_parses_all_conditions() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  enabled: true\n  \
+             awaiting_approval_state: pending review\n  \
+             approval:\n    auto_approve_when:\n      risk: low\n      \
+             impacted_components: [src/foo.rs, src/bar.rs]\n      estimate_turns_max: 4\n  \
+             stages:\n    - id: plan\n      role: planner\n      requires_approval: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.pipeline.awaiting_approval_state, "pending review");
+        let auto = cfg.pipeline.approval.auto_approve_when.as_ref().unwrap();
+        assert_eq!(auto.risk.as_deref(), Some("low"));
+        assert_eq!(
+            auto.impacted_components_allowlist.as_deref(),
+            Some(&["src/foo.rs".to_string(), "src/bar.rs".to_string()][..])
+        );
+        assert_eq!(auto.max_estimate_turns, Some(4));
     }
 }

@@ -224,7 +224,7 @@ async fn run_turn_collect_text(
 /// the fence) out of a turn's free-text response. `qa`/`drafting`/`review` each ask
 /// for a specific shape at the end of their prompt; this just locates and parses it,
 /// independent of what shape the caller expects.
-fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
+pub(crate) fn extract_json_block(text: &str) -> Result<serde_json::Value, String> {
     let candidate = match text.rfind("```json") {
         Some(start) => text[start + "```json".len()..].trim_start(),
         None => text.trim(),

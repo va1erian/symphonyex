@@ -1,4 +1,5 @@
 mod agent;
+mod approvals;
 mod artifacts;
 mod config;
 mod container;
