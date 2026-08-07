@@ -88,6 +88,12 @@ struct AppState {
     /// still lands within the same mount point -- without it, a nested dashboard's
     /// own links would silently escape to the service's top-level routes instead.
     base_path: String,
+    /// Whether `/chat` is actually mounted alongside this router -- i.e. whether the
+    /// caller is about to (or already did) `.nest("/chat", ...)` a chat UI next to it.
+    /// Purely a nav-rendering signal (BUG-2): this module never mounts `/chat` itself,
+    /// so without this the nav would advertise a "Chat" tab pointing at a route that
+    /// doesn't exist whenever chat is off (the common case).
+    chat_enabled: bool,
 }
 
 impl AppState {
@@ -124,11 +130,13 @@ pub fn router(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
     base_path: &str,
+    chat_enabled: bool,
 ) -> Router {
     let state = AppState {
         status_rx,
         workflow_dir,
         base_path: base_path.to_string(),
+        chat_enabled,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -157,7 +165,7 @@ pub async fn serve_composite(
     workflow_dir: PathBuf,
     chat: Option<Router>,
 ) -> anyhow::Result<()> {
-    let mut app = router(status_rx, workflow_dir, "");
+    let mut app = router(status_rx, workflow_dir, "", chat.is_some());
     if let Some(chat) = chat {
         app = app.nest("/chat", chat);
     }
@@ -172,11 +180,18 @@ pub async fn serve_composite(
     Ok(())
 }
 
-fn page_shell(title: &str, active_nav: &str, body: &str, extra_head: &str, base: &str) -> String {
+fn page_shell(
+    title: &str,
+    active_nav: &str,
+    body: &str,
+    extra_head: &str,
+    base: &str,
+    chat_enabled: bool,
+) -> String {
     crate::web::page_shell(
         "Symphony",
         title,
-        &crate::web::nav(crate::web::NAV_LINKS, active_nav, base),
+        &crate::web::nav(&crate::web::nav_links(chat_enabled), active_nav, base),
         body,
         extra_head,
     )
@@ -258,6 +273,7 @@ new EventSource('{base}/fragment-stream').onmessage = function (e) {{
         &body,
         &script,
         &state.base_path,
+        state.chat_enabled,
     ))
 }
 
@@ -529,7 +545,14 @@ async fn events_page(State(state): State<AppState>, Query(q): Query<EventsQuery>
         prev = prev,
         next = next,
     );
-    Html(page_shell("events", "/events", &body, "", base))
+    Html(page_shell(
+        "events",
+        "/events",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 /// Which active filter a "clear" chip link should drop -- see `chips()` below.
@@ -729,10 +752,21 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
         eventlog::latest_message_by_type(&db_path, "test_summary").unwrap_or_default();
     let coverage_summaries =
         eventlog::latest_message_by_type(&db_path, "coverage_summary").unwrap_or_default();
+    // FEAT-1: an open dispatch span (no `worker_exit` yet) reads very differently
+    // depending on whether the issue is actually running right now -- a live worker vs.
+    // a process that got killed mid-attempt and never recorded one. `StatusSnapshot` is
+    // the one place that distinction already lives.
+    let running_issue_ids: std::collections::HashSet<String> = state
+        .status_rx
+        .borrow()
+        .running
+        .iter()
+        .map(|r| r.issue_id.clone())
+        .collect();
 
     let base = state.base_path.as_str();
     let issue_rows: String = if by_issue.is_empty() {
-        "<tr><td colspan=\"10\" class=\"empty\">No usage recorded yet.</td></tr>".to_string()
+        "<tr><td colspan=\"11\" class=\"empty\">No usage recorded yet.</td></tr>".to_string()
     } else {
         by_issue
             .iter()
@@ -742,6 +776,7 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
                     base,
                     test_summaries.get(&r.issue_id).map(String::as_str),
                     coverage_summaries.get(&r.issue_id).map(String::as_str),
+                    running_issue_ids.contains(r.issue_id.as_str()),
                 )
             })
             .collect()
@@ -760,7 +795,7 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
 <h3>Per issue</h3>
 <div class="table-wrap">
 <table>
-<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th>Last event</th><th>Tests</th><th>Coverage</th></tr></thead>
+<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th data-sort>Duration</th><th>Last event</th><th>Tests</th><th>Coverage</th></tr></thead>
 <tbody>
 {issue_rows}
 </tbody>
@@ -775,7 +810,14 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
         total_tokens = summary.total_tokens,
         issue_rows = issue_rows,
     );
-    Html(page_shell("usage", "/usage", &body, "", base))
+    Html(page_shell(
+        "usage",
+        "/usage",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 fn issue_usage_row(
@@ -783,6 +825,7 @@ fn issue_usage_row(
     base: &str,
     test_summary: Option<&str>,
     coverage_summary: Option<&str>,
+    currently_running: bool,
 ) -> String {
     let issue_link = urlencode(&r.issue_id);
     // Each cell links through to `/events` filtered to the full `test_report`/
@@ -802,8 +845,9 @@ fn issue_usage_row(
         ),
         None => "<span class=\"empty\">not run</span>".to_string(),
     };
+    let duration_cell = format_issue_duration(r.duration_secs, r.duration_open, currently_running);
     format!(
-        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td><td>{tests_cell}</td><td>{coverage_cell}</td></tr>",
+        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{duration_cell}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td><td>{tests_cell}</td><td>{coverage_cell}</td></tr>",
         identifier = escape(&r.identifier),
         title = escape(&r.title),
         dispatches = r.dispatch_count,
@@ -815,6 +859,29 @@ fn issue_usage_row(
         last_event = escape(&r.last_event_type),
         last_at = escape(&r.last_event_at),
     )
+}
+
+/// FEAT-1: render a per-issue Duration cell. A closed total (every dispatch attempt
+/// accounted for by a matching `worker_exit`) renders plain. An open span -- the last
+/// `dispatched` has no `worker_exit` yet -- renders plain too *while the issue is
+/// actually running right now* (it's expected to keep advancing); otherwise it's a
+/// stale/uncertain span from a process that was killed rather than stopped cleanly, so
+/// it's prefixed with `~` and gets a `title` tooltip explaining why, rather than
+/// silently reading as an exact number.
+fn format_issue_duration(
+    duration_secs: f64,
+    duration_open: bool,
+    currently_running: bool,
+) -> String {
+    let text = crate::metrics::format_duration(duration_secs.round() as u64);
+    if !duration_open || currently_running {
+        escape(&text)
+    } else {
+        format!(
+            "<span title=\"open dispatch span with no worker_exit event; the process likely stopped without exiting cleanly, so this may be an undercount or stale\">~{}</span>",
+            escape(&text)
+        )
+    }
 }
 
 // --------------------------------------------------------------------------------
@@ -878,7 +945,14 @@ async fn artifacts_page(
         filter_chip = filter_chip,
         table_rows = table_rows,
     );
-    Html(page_shell("artifacts", "/artifacts", &body, "", base))
+    Html(page_shell(
+        "artifacts",
+        "/artifacts",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 fn artifact_row(r: &artifacts::ArtifactRow, base: &str) -> String {
@@ -937,6 +1011,7 @@ async fn artifact_raw_page(
         &body,
         "",
         base,
+        state.chat_enabled,
     )))
 }
 
@@ -965,7 +1040,14 @@ async fn requirements_page(
             r#"<p>Pass an issue id, e.g. <code>{base}/requirements?issue=1</code>. \
                Find one on the <a href="{base}/events">Events</a> page.</p>"#
         );
-        return Html(page_shell("requirements", "/requirements", &body, "", base));
+        return Html(page_shell(
+            "requirements",
+            "/requirements",
+            &body,
+            "",
+            base,
+            state.chat_enabled,
+        ));
     };
 
     let db = state.eventlog_db_path();
@@ -1081,7 +1163,14 @@ async fn requirements_page(
         clarification_items = clarification_items,
         unblock_form = unblock_form,
     );
-    Html(page_shell("requirements", "/requirements", &body, "", base))
+    Html(page_shell(
+        "requirements",
+        "/requirements",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 fn requirement_row(r: &serde_json::Value) -> String {
@@ -1186,7 +1275,14 @@ async fn reviews_page(
             r#"<p>Pass an issue id, e.g. <code>{base}/reviews?issue=1</code>. \
                Find one on the <a href="{base}/events">Events</a> page.</p>"#
         );
-        return Html(page_shell("reviews", "/reviews", &body, "", base));
+        return Html(page_shell(
+            "reviews",
+            "/reviews",
+            &body,
+            "",
+            base,
+            state.chat_enabled,
+        ));
     };
 
     let db = state.eventlog_db_path();
@@ -1270,7 +1366,14 @@ async fn reviews_page(
         round_rows = round_rows,
         unblock_form = unblock_form,
     );
-    Html(page_shell("reviews", "/reviews", &body, "", base))
+    Html(page_shell(
+        "reviews",
+        "/reviews",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 /// One recorded `review_findings` artifact, rendered as the explanation surface a
@@ -1610,7 +1713,14 @@ async fn approvals_page(State(state): State<AppState>) -> Html<String> {
         pending_html = pending_html,
         history_rows = history_rows,
     );
-    Html(page_shell("approvals", "/approvals", &body, "", base))
+    Html(page_shell(
+        "approvals",
+        "/approvals",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
 }
 
 /// One pending request: the requesting stage's own output (the "why" -- roadmap §4's
@@ -1717,7 +1827,7 @@ mod tests {
     async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.path().to_path_buf(), "");
+        let app = router(rx, dir.path().to_path_buf(), "", false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1799,14 +1909,47 @@ mod tests {
     }
 
     async fn spawn_router(dir: &std::path::Path) -> String {
+        spawn_router_with_chat(dir, false).await
+    }
+
+    async fn spawn_router_with_chat(dir: &std::path::Path, chat_enabled: bool) -> String {
         let (_tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.to_path_buf(), "");
+        let app = router(rx, dir.to_path_buf(), "", chat_enabled);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// Regression test for BUG-2: without chat enabled, the dashboard nav must not
+    /// advertise a `/chat` link that 404s.
+    #[tokio::test]
+    async fn dashboard_nav_omits_chat_link_when_chat_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = spawn_router_with_chat(dir.path(), false).await;
+        let body = reqwest::get(format!("{base}/events"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!body.contains("href=\"/chat\""), "{body}");
+        assert!(body.contains("href=\"/events\""), "{body}");
+    }
+
+    #[tokio::test]
+    async fn dashboard_nav_includes_chat_link_when_chat_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = spawn_router_with_chat(dir.path(), true).await;
+        let body = reqwest::get(format!("{base}/events"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(body.contains("href=\"/chat\""), "{body}");
     }
 
     fn approval_fixture(issue_id: &str, next_stage_id: Option<&str>) -> approvals::NewApproval {
@@ -1971,7 +2114,7 @@ mod tests {
             title: "Scaffold".to_string(),
             ..Default::default()
         };
-        let html = issue_usage_row(&r, "", Some("3 passed, 1 failed"), Some("82.3%"));
+        let html = issue_usage_row(&r, "", Some("3 passed, 1 failed"), Some("82.3%"), false);
         assert!(html.contains("3 passed, 1 failed"));
         assert!(html.contains("82.3%"));
         assert!(html.contains("type=test_report"));
@@ -1984,8 +2127,42 @@ mod tests {
             issue_id: "issue-1".to_string(),
             ..Default::default()
         };
-        let html = issue_usage_row(&r, "", None, None);
+        let html = issue_usage_row(&r, "", None, None, false);
         assert!(html.contains("not run"));
+    }
+
+    /// Regression test for FEAT-1: the Duration cell's three states.
+    #[test]
+    fn issue_usage_row_shows_duration_states() {
+        let closed = eventlog::IssueUsageRow {
+            issue_id: "issue-1".to_string(),
+            duration_secs: 125.0,
+            duration_open: false,
+            ..Default::default()
+        };
+        let html = issue_usage_row(&closed, "", None, None, false);
+        assert!(html.contains("2m 5s"), "{html}");
+        assert!(!html.contains('~'), "{html}");
+
+        let open_running = eventlog::IssueUsageRow {
+            issue_id: "issue-2".to_string(),
+            duration_secs: 30.0,
+            duration_open: true,
+            ..Default::default()
+        };
+        let html = issue_usage_row(&open_running, "", None, None, true);
+        assert!(html.contains("30s"), "{html}");
+        assert!(!html.contains('~'), "{html}");
+
+        let open_stale = eventlog::IssueUsageRow {
+            issue_id: "issue-3".to_string(),
+            duration_secs: 30.0,
+            duration_open: true,
+            ..Default::default()
+        };
+        let html = issue_usage_row(&open_stale, "", None, None, false);
+        assert!(html.contains("~30s"), "{html}");
+        assert!(html.contains("title="), "{html}");
     }
 
     #[test]
@@ -2237,6 +2414,7 @@ mod tests {
             status_rx: rx,
             workflow_dir: dir.path().to_path_buf(),
             base_path: String::new(),
+            chat_enabled: false,
         };
         let Html(body) = reviews_page(State(state), Query(ReviewsQuery { issue: None })).await;
         assert!(body.contains("Pass an issue id"));
@@ -2266,6 +2444,7 @@ mod tests {
             status_rx: rx.clone(),
             workflow_dir: workflow_dir.clone(),
             base_path: String::new(),
+            chat_enabled: false,
         };
         let Html(body) = reviews_page(
             State(state),
@@ -2293,6 +2472,7 @@ mod tests {
             status_rx: rx,
             workflow_dir,
             base_path: String::new(),
+            chat_enabled: false,
         };
         let Html(body) = reviews_page(
             State(state),

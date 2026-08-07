@@ -1,11 +1,36 @@
 ---
 identifier: FEAT-1
 title: Show run duration in the per-issue usage table
-state: todo
+state: done
 priority: 3
 labels: [dashboard, metrics]
 dispatchable: true
 ---
+
+## Resolution
+
+- `eventlog::IssueUsageRow` gained `duration_secs: f64` and `duration_open: bool`.
+  `eventlog::issue_durations` folds each issue's `"dispatched"`/`"worker_exit"` events
+  (ordered by `id`) into closed spans in one pass, summing them; an unmatched trailing
+  `"dispatched"` becomes an open span reported up to "now" and flagged `duration_open`.
+  Computed in Rust rather than SQL -- pairing rows across an ordered sequence is far
+  more direct this way than a self-join/window-function query.
+- `status.rs`'s `/usage` page gained a Duration column. `eventlog` only knows whether a
+  span is *open*; `status.rs` is what already has the live `StatusSnapshot`, so it
+  cross-references the open issue's id against `state.status_rx`'s `running` list to
+  decide how to render it: plain while genuinely running (expected to keep advancing),
+  `~`-prefixed with an explanatory tooltip when open but not running (a process killed
+  mid-attempt, not a precise number).
+- Reused `metrics::format_duration` (made `pub`) for the `12m 4s`-style rendering
+  instead of a second formatter.
+- Tests: `eventlog`'s `usage_by_issue_sums_multiple_closed_dispatch_spans`,
+  `usage_by_issue_reports_an_open_span_for_an_unmatched_dispatch`,
+  `usage_by_issue_sums_closed_spans_plus_a_trailing_open_one` (via a new `insert_at`
+  test helper for controllable timestamps); `status`'s
+  `issue_usage_row_shows_duration_states` covers all three render states.
+
+Verified: `cargo build`, `cargo test` (446 passed), `cargo clippy --all-targets`, `cargo fmt` clean.
+
 ## Context
 
 `/usage` (`src/status.rs::usage_page`, backed by `eventlog::usage_by_issue`) already

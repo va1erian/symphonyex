@@ -288,11 +288,22 @@ impl AgentSession for ClaudeSession {
         let stdout = child.stdout.take().expect("piped stdout");
         let mut lines = BufReader::new(stdout).lines();
 
+        // Kept around (last few lines only) so the "no result event" fallback below can
+        // surface *something* diagnostic on `/events` instead of a bare "no result
+        // event" with no clue why -- see BUG-1.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         if let Some(stderr) = child.stderr.take() {
+            let stderr_tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::warn!(target: "claude_stderr", "{line}");
+                    let mut tail = stderr_tail.lock().unwrap();
+                    tail.push(line);
+                    let len = tail.len();
+                    if len > 5 {
+                        tail.drain(0..len - 5);
+                    }
                 }
             });
         }
@@ -357,7 +368,25 @@ impl AgentSession for ClaudeSession {
 
         match outcome {
             Some(o) => Ok(o),
-            None if status.success() => Ok(TurnOutcome::Completed { usage: None }),
+            None if status.success() => {
+                // The subprocess exited cleanly but stdout hit EOF before a `"type":
+                // "result"` line ever arrived -- BUG-1's "narrow race" (reconciliation
+                // preempting a turn) or an unrecognized terminal message shape. Either
+                // way, surface it on `/events` rather than let this look like an
+                // ordinary free turn.
+                let tail = stderr_tail.lock().unwrap().join(" | ");
+                let msg = if tail.is_empty() {
+                    "no result event seen before stdout EOF; token usage unavailable for this turn"
+                        .to_string()
+                } else {
+                    format!(
+                        "no result event seen before stdout EOF; token usage unavailable for this turn (stderr tail: {tail})"
+                    )
+                };
+                tracing::warn!(issue = "no result event before EOF, usage unavailable", stderr_tail = %tail);
+                let _ = events.send(AgentEvent::new("turn_completed").with_message(msg));
+                Ok(TurnOutcome::Completed { usage: None })
+            }
             None => Ok(TurnOutcome::Failed {
                 reason: format!("subprocess exited with {status} and no result event"),
             }),
@@ -411,6 +440,12 @@ impl ClaudeSession {
                     self.session_id = Some(sid.to_string());
                 }
                 let usage = extract_usage(v);
+                if usage.is_none() {
+                    // Deliberately visible on `/events`, not just tracing -- a `result`
+                    // event with no readable `usage` field looks identical to a free
+                    // turn otherwise, and BUG-1 was exactly that kind of silent gap.
+                    tracing::warn!(raw = %v, "claude result event carried no usage field");
+                }
                 let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
                 if is_error {
                     let reason = v
@@ -424,8 +459,14 @@ impl ClaudeSession {
                 } else {
                     let _ = events.send({
                         let mut e = AgentEvent::new("turn_completed");
-                        if let Some(u) = usage.clone() {
-                            e = e.with_usage(u);
+                        match usage.clone() {
+                            Some(u) => e = e.with_usage(u),
+                            // Visible on `/events` and in `symphony-report.html`'s
+                            // per-issue table (rather than reading as a normal,
+                            // cheap-but-real turn) -- see BUG-1.
+                            None => e = e.with_message(
+                                "usage unavailable: claude's result event carried no usage field",
+                            ),
                         }
                         e
                     });
@@ -627,5 +668,82 @@ mod tests {
         };
         let args = tool_policy_extra_args(&[], &policy);
         assert_eq!(args[1], "Edit,Write,NotebookEdit,Bash");
+    }
+
+    /// Regression test for BUG-1 ("token usage is always 0"): built from a real
+    /// `"type":"result"` line captured from an actual `claude` CLI 2.1.223 run against
+    /// this repo's own MCP wiring (`--resume`, `--mcp-config --strict-mcp-config`,
+    /// `--allowedTools mcp__symphony__*`, ending on an auto-approved MCP tool call) --
+    /// not a hand-written guess at the JSON shape. Extensive live reproduction attempts
+    /// (single turns, `--resume`ed turns, 12-30 tool-call turns, two concurrent
+    /// sessions, and two full end-to-end `symphony` dispatches) all correctly captured
+    /// non-zero usage; the original incident's exact trigger stayed unreproduced. This
+    /// pins the known-good parse path so a future CLI update that silently renames or
+    /// moves the `usage` field is caught here instead of showing up as 0 tokens again.
+    #[test]
+    fn extracts_real_usage_from_a_captured_result_transcript() {
+        let raw = include_str!("testdata/claude_real_result_event.json");
+        let v: Value = serde_json::from_str(raw).expect("captured fixture must be valid JSON");
+        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some("result"));
+
+        let usage = extract_usage(&v).expect("real captured result event must yield usage");
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.output_tokens, 353);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = ClaudeSession {
+            command: "claude".to_string(),
+            extra_args: Vec::new(),
+            model: None,
+            permission_mode: "default".to_string(),
+            turn_timeout_ms: 1000,
+            workspace: PathBuf::from("."),
+            container: None,
+            container_workspace_path: None,
+            mcp_config_path: None,
+            session_id: None,
+        };
+        let outcome = session.handle_message(&v, &tx);
+        drop(tx);
+        match outcome {
+            Some(TurnOutcome::Completed { usage: Some(u) }) => {
+                assert_eq!(u.input_tokens, 8);
+                assert_eq!(u.output_tokens, 353);
+            }
+            other => panic!("expected Completed with usage, got {other:?}"),
+        }
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let completed = events
+            .iter()
+            .find(|e| e.event == "turn_completed")
+            .expect("turn_completed event must be emitted");
+        assert!(completed.usage.is_some());
+    }
+
+    /// A `"result"` event with `is_error: true` and no `usage` field at all (a real
+    /// shape the CLI does emit, e.g. an auth failure) must not be mistaken for a
+    /// successful-but-unmetered turn -- BUG-1's fallback path is for the *EOF-with-no-
+    /// result* case, not this one.
+    #[test]
+    fn errored_result_with_no_usage_is_reported_as_failed_not_completed() {
+        let v = json!({"type": "result", "is_error": true, "result": "boom"});
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = ClaudeSession {
+            command: "claude".to_string(),
+            extra_args: Vec::new(),
+            model: None,
+            permission_mode: "default".to_string(),
+            turn_timeout_ms: 1000,
+            workspace: PathBuf::from("."),
+            container: None,
+            container_workspace_path: None,
+            mcp_config_path: None,
+            session_id: None,
+        };
+        let outcome = session.handle_message(&v, &tx);
+        drop(tx);
+        assert!(matches!(outcome, Some(TurnOutcome::Failed { reason }) if reason == "boom"));
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| e.event == "turn_failed"));
     }
 }

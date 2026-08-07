@@ -1,11 +1,50 @@
 ---
 identifier: BUG-1
 title: Token usage is always 0 for the claude backend in real runs
-state: todo
+state: done
 priority: 1
 labels: [bug, metrics, claude-backend]
 dispatchable: true
 ---
+
+## Resolution (investigated, not root-caused -- see below)
+
+Extensive live reproduction was attempted against the real `claude` CLI 2.1.223
+installed in this repo: a single turn, a `--resume`d follow-up turn, turns with 12-30
+tool calls, two truly concurrent sessions, and two full end-to-end `symphony`
+dispatches through a real `WORKFLOW.md` (one single-file change, one multi-file change
+with a `cargo test` step). Every one of these correctly captured non-zero, correct
+`input_tokens`/`output_tokens` on the `result` event -- the exact original trigger (6/6
+real turns showing 0 tokens with zero `turn_completed`/`turn_failed` events at all)
+never reproduced. It is not the `AGENTS.md`-documented narrow reconciliation race
+either, since that race requires reconciliation to preempt the worker, and none of
+these runs had a competing dispatch touching the same issue.
+
+Per this ticket's own "do not paper over it" clause, since the gap didn't reproduce
+under controlled conditions, the fix implemented is the sanctioned fallback: make both
+ways a turn can end up with `usage: None` **visible** instead of indistinguishable from
+a genuinely free turn.
+- `src/agent/claude.rs`: a `result` event with no readable `usage` field now logs the
+  raw JSON via `tracing::warn!` and attaches an explanatory `message` to the
+  `turn_completed` event (visible on `/events` and in `symphony-report.html`'s
+  per-issue table).
+- The EOF-with-no-`result`-event fallback (previously silent -- it returned
+  `Completed { usage: None }` without sending any event at all) now also sends a
+  `turn_completed` event with a message, including the last few captured stderr lines
+  from the subprocess if any were written, for whoever hits this next to diagnose.
+- Added `extracts_real_usage_from_a_captured_result_transcript`, a regression test
+  built from an actual `claude` CLI 2.1.223 transcript captured during this
+  investigation (`src/agent/testdata/claude_real_result_event.json`), not a
+  hand-written guess at the JSON shape -- pins the known-good parse path so a future
+  CLI update that silently moves the `usage` field is caught here, not as a re-run of
+  this ticket.
+- `AGENTS.md`'s "Usage report" section rewritten to describe this honestly.
+
+If this recurs, the next person should capture the *actual* failing turn's raw stdout
+(the fallback's new stderr-tail logging is a start, but stdout is the side that matters
+here) rather than re-attempting synthetic repro -- see the investigation steps below,
+which are still the right ones, just unconfirmed against a real failure this time.
+
 ## Context
 
 Confirmed live, not theoretical: running the real `claude` backend (Claude Code CLI
