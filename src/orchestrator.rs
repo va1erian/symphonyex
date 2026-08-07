@@ -176,6 +176,14 @@ enum OrchMsg {
         stage_id: String,
         outcome: String,
     },
+    /// A release evidence bundle was assembled and (if a Symphony-opened PR/MR was
+    /// open) consolidated into its body (`repo.release_evidence`, AIR-9). `summary`
+    /// is the verdict plus the rule(s) that produced it (`release::explain_verdict`),
+    /// so `/events` shows *why*, not just the verdict word.
+    ReleaseEvidenceReady {
+        issue_id: String,
+        summary: String,
+    },
 }
 
 /// Load workflow + resolve config + build adapters for the current file contents.
@@ -1428,6 +1436,26 @@ async fn handle_msg(
                 );
             }
         }
+        OrchMsg::ReleaseEvidenceReady { issue_id, summary } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "release_evidence_ready".to_string(),
+                        message: Some(summary),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1559,8 +1587,128 @@ async fn run_attempt_body(
         }
     };
 
+    if matches!(exit, ExitReason::Normal) {
+        finalize_release_evidence(issue_id, &issue, cfg, tx).await;
+    }
+
     session.stop().await;
     exit
+}
+
+/// AIR-9: after a cycle ends normally, with `repo.release_evidence` on, assemble an
+/// evidence bundle from what's actually recorded for this issue (its own description
+/// for requirements/AC, `eventlog` for the timeline and token totals -- see
+/// `release.rs`'s own doc comment on why most other sections are still gaps today),
+/// persist it (locally for `/evidence/<key>`, and durably via `upload_artifact` so it
+/// survives the PR/MR being closed later), and -- if this cycle opened or already had
+/// a Symphony-authored PR/MR open -- rewrite its body to lead with the agent's own
+/// narrative followed by the evidence sections.
+///
+/// Best-effort throughout (mirrors `after_run`'s own "log and ignore" stance just
+/// above this function's call site): a release-evidence failure must never fail the
+/// cycle itself, since `repo.pull_request`'s own success already happened inside the
+/// turn loop this runs after.
+async fn finalize_release_evidence(
+    issue_id: &str,
+    issue: &Issue,
+    cfg: &EffectiveConfig,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) {
+    let Some(repo_cfg) = cfg.repo.as_ref().filter(|r| r.release_evidence) else {
+        return;
+    };
+    let repo_host = match crate::repo_host::build(repo_cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to build repo host (ignored)");
+            return;
+        }
+    };
+
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let filter = crate::eventlog::EventFilter {
+        issue_id: Some(issue_id.to_string()),
+        ..Default::default()
+    };
+    let events = crate::eventlog::recent_events(&db_path, &filter, 5_000, 0).unwrap_or_default();
+    let usage = crate::eventlog::usage_by_issue(&db_path)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.issue_id == issue_id);
+
+    let bundle = crate::release::assemble(issue, &events, usage.as_ref());
+    let verdict = crate::release::compute_verdict(&bundle);
+    let matrix = crate::release::build_traceability_matrix(&bundle);
+    let reasons = crate::release::explain_verdict(&bundle);
+
+    let key = crate::workspace::derive_workspace_key(issue_id);
+    let dir = cfg.workflow_dir.join(".symphony").join("release");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to create local artifact dir (ignored)");
+    } else if let Ok(json) = serde_json::to_vec_pretty(&bundle)
+        && let Err(e) = std::fs::write(dir.join(format!("{key}.json")), &json)
+    {
+        tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to persist bundle locally (ignored)");
+    }
+
+    let mut artifact_links = std::collections::BTreeMap::new();
+    if let Ok(json) = serde_json::to_vec_pretty(&bundle) {
+        match repo_host
+            .upload_artifact(
+                issue_id,
+                "evidence-bundle.json",
+                &json,
+                "Persist release evidence bundle",
+            )
+            .await
+        {
+            Ok(url) => {
+                artifact_links.insert("evidence-bundle.json".to_string(), url);
+            }
+            Err(e) => tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to upload bundle artifact (ignored)"),
+        }
+    }
+    for artifact in &bundle.large_artifacts {
+        if artifact.content.len() > crate::release::INLINE_ARTIFACT_LIMIT {
+            match repo_host
+                .upload_artifact(
+                    issue_id,
+                    &artifact.name,
+                    artifact.content.as_bytes(),
+                    &format!("Attach release artifact: {}", artifact.name),
+                )
+                .await
+            {
+                Ok(url) => {
+                    artifact_links.insert(artifact.name.clone(), url);
+                }
+                Err(e) => tracing::warn!(issue_id = %issue_id, artifact = %artifact.name, error = %e, "release evidence: failed to upload oversized artifact (ignored)"),
+            }
+        }
+    }
+
+    let rendered = crate::release::render_markdown(&bundle, verdict, &matrix, &artifact_links);
+
+    match repo_host.list_open_symphony_prs().await {
+        Ok(prs) => {
+            let head = format!("issue-{key}");
+            if let Some(pr) = prs.iter().find(|p| p.head_ref == head) {
+                let composed = crate::release::compose_pr_body(&pr.body, &rendered);
+                if let Err(e) = repo_host.update_pr_body(pr.number, &composed).await {
+                    tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to update PR/MR body (ignored)");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to list open PRs/MRs (ignored)");
+        }
+    }
+
+    let summary = format!("{}: {}", verdict.as_str(), reasons.join("; "));
+    let _ = tx.send(OrchMsg::ReleaseEvidenceReady {
+        issue_id: issue_id.to_string(),
+        summary,
+    });
 }
 
 /// How a fixed-turn-budget run of `run_turn_loop` ended. `Completed` and
@@ -2402,5 +2550,63 @@ mod tests {
             state.rate_limited_until.is_none(),
             "an expired pause must be cleared"
         );
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-9: release evidence (`finalize_release_evidence`)
+    // -----------------------------------------------------------------------------
+
+    fn test_issue(id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            native_ref: None,
+            identifier: id.to_string(),
+            title: "test issue".to_string(),
+            description: Some("- [x] done thing".to_string()),
+            priority: None,
+            state: "in_progress".to_string(),
+            branch_name: None,
+            url: None,
+            assignee_id: None,
+            labels: vec![],
+            blocked_by: vec![],
+            dispatchable: true,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// `repo.release_evidence` off (the default) must not touch anything -- no PR
+    /// lookup, no artifact upload, no event -- keeping `open_pull_request`'s own
+    /// pipeline-off behavior byte-identical to before this feature existed.
+    #[tokio::test]
+    async fn finalize_release_evidence_is_a_noop_when_the_flag_is_off() {
+        let cfg_yaml: serde_yaml::Value =
+            serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.repo.is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        finalize_release_evidence("issue-1", &test_issue("AIR-TEST-1"), &cfg, &tx).await;
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "no message should be sent when release_evidence is off");
+    }
+
+    /// Same no-op guarantee when `repo:` is configured but `release_evidence` itself
+    /// wasn't turned on -- the common case of a project only using `pull_request`.
+    #[tokio::test]
+    async fn finalize_release_evidence_is_a_noop_without_release_evidence_flag() {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_ORCH_RELEASE_EVIDENCE_OFF\n  pull_request: true\n",
+        )
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.repo.as_ref().unwrap().release_evidence);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        finalize_release_evidence("issue-1", &test_issue("AIR-TEST-2"), &cfg, &tx).await;
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 }

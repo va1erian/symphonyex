@@ -11,6 +11,7 @@ mod mcp;
 mod metrics;
 mod orchestrator;
 mod registry;
+mod release;
 mod repo_host;
 mod service;
 mod status;

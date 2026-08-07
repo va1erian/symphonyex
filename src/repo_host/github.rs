@@ -241,7 +241,31 @@ impl GithubRepoHost {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("evidence.png");
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        match self
+            .put_content_hashed(issue_id, file_name, &bytes, &format!("Attach evidence: {caption}"))
+            .await
+        {
+            Ok(raw_url) => ToolResult::ok(format!(
+                "Evidence uploaded. Paste this into the pull request body to embed it:\n\n![{caption}]({raw_url})"
+            )),
+            Err(e) => ToolResult::error(e),
+        }
+    }
+
+    /// Shared upload plumbing behind both `attach_evidence` (an image, agent-driven)
+    /// and `RepoHost::upload_artifact` (arbitrary bytes, orchestrator-driven, AIR-9):
+    /// content-hash `bytes` into a `.symphony/evidence/<workspace-key>/`-scoped path
+    /// (see `attach_evidence`'s own doc comment for why: a plain create always
+    /// succeeds, no existing-blob `sha` juggling) and PUT it via the Contents API,
+    /// returning the resulting `raw.githubusercontent.com` URL.
+    async fn put_content_hashed(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
         let short_hash = digest
             .iter()
             .take(8)
@@ -256,30 +280,25 @@ impl GithubRepoHost {
             "{}/repos/{}/{}/contents/{repo_path}",
             self.base_url, self.owner, self.repo
         );
-        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let req = self.client.put(&url).json(&json!({
-            "message": format!("Attach evidence: {caption}"),
+            "message": commit_message,
             "content": content_b64,
             "branch": branch,
         }));
         match self.auth_headers(req).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let raw_url = format!(
-                    "https://raw.githubusercontent.com/{}/{}/{branch}/{repo_path}",
-                    self.owner, self.repo
-                );
-                ToolResult::ok(format!(
-                    "Evidence uploaded. Paste this into the pull request body to embed it:\n\n![{caption}]({raw_url})"
-                ))
-            }
+            Ok(resp) if resp.status().is_success() => Ok(format!(
+                "https://raw.githubusercontent.com/{}/{}/{branch}/{repo_path}",
+                self.owner, self.repo
+            )),
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                ToolResult::error(format!(
+                Err(format!(
                     "PUT {url} -> {status}: {text} (has this branch been pushed yet?)"
                 ))
             }
-            Err(e) => ToolResult::error(e.to_string()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -455,6 +474,34 @@ impl RepoHost for GithubRepoHost {
             }
             _ => ToolResult::error(format!("unsupported tool '{name}'")),
         }
+    }
+
+    async fn update_pr_body(&self, pr_number: u64, body: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{pr_number}",
+            self.base_url, self.owner, self.repo
+        );
+        let req = self.client.patch(&url).json(&json!({"body": body}));
+        match self.auth_headers(req).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("PATCH {url} -> {status}: {text}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn upload_artifact(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        self.put_content_hashed(issue_id, file_name, bytes, commit_message)
+            .await
     }
 
     async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String> {
@@ -1027,6 +1074,64 @@ mod tests {
             .await;
         assert!(!result.success);
         assert!(result.content.contains("does-not-exist.png"));
+    }
+
+    #[tokio::test]
+    async fn update_pr_body_patches_just_the_body() {
+        let server = MockServer::start().await;
+        set_token("SYMPHONY_TEST_REPO_HOST_UPDATE_BODY", "t");
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/pulls/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": 9,
+                "html_url": "https://github.com/owner/name/pull/9"
+            })))
+            .mount(&server)
+            .await;
+
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_UPDATE_BODY".to_string()),
+            pull_request: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri());
+
+        let result = host.update_pr_body(9, "new body").await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn upload_artifact_returns_the_raw_content_url() {
+        let server = MockServer::start().await;
+        set_token("SYMPHONY_TEST_REPO_HOST_UPLOAD_ARTIFACT", "t");
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/repos/owner/name/contents/\.symphony/evidence/.*$",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"content": {}})))
+            .mount(&server)
+            .await;
+
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_UPLOAD_ARTIFACT".to_string()),
+            pull_request: true,
+            release_evidence: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri());
+
+        let url = host
+            .upload_artifact("42", "bundle.json", b"{}", "Persist release evidence bundle")
+            .await
+            .unwrap();
+        assert!(url.starts_with("https://raw.githubusercontent.com/owner/name/issue-42/"));
+        assert!(url.ends_with("bundle.json"));
     }
 
     #[test]

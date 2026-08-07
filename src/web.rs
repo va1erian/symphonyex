@@ -70,6 +70,7 @@ pub const STYLE: &str = r#"
   .card .msg.expanded[data-expandable]::after { content: "click to collapse"; }
   .badge { display: inline-block; background: var(--good-bg); color: var(--good-fg); border-radius: 10px; padding: 1px 8px; font-size: 0.72rem; }
   .badge.closed { background: var(--bad-bg); color: var(--bad-fg); }
+  .badge.warn { background: rgba(224,197,107,0.16); color: var(--warn-fg); }
   .table-wrap { overflow-x: auto; max-width: 100%; }
   table { border-collapse: collapse; width: 100%; max-width: 1100px; }
   th, td { text-align: left; padding: 6px 10px; font-size: 0.82rem; border-bottom: 1px solid var(--border-soft); }
@@ -308,6 +309,10 @@ pub const NAV_LINKS: &[NavLink] = &[
     NavLink {
         href: "/usage",
         label: "Usage",
+    },
+    NavLink {
+        href: "/evidence",
+        label: "Evidence",
     },
     NavLink {
         href: "/chat",

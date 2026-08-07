@@ -20,12 +20,14 @@
 //! mounted alongside it for anything that wants a one-shot fetch instead of a stream.
 
 use crate::eventlog;
-use crate::web::{escape, urlencode};
+use crate::release::{self, EvidenceBundle, Verdict};
+use crate::web::{error_banner, escape, urlencode};
 use axum::Router;
-use axum::extract::{Query, State};
-use axum::response::Html;
+use axum::extract::{Form, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -133,6 +135,10 @@ pub fn router(
         .route("/fragment-stream", get(fragment_stream))
         .route("/events", get(events_page))
         .route("/usage", get(usage_page))
+        .route("/evidence", get(evidence_index))
+        .route("/evidence/{key}", get(evidence_page))
+        .route("/evidence/{key}/fragment", get(evidence_fragment))
+        .route("/evidence/{key}/override", post(evidence_override))
         .with_state(state)
 }
 
@@ -734,6 +740,231 @@ fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
     )
 }
 
+// --------------------------------------------------------------------------------
+// /evidence -- AIR-9 release evidence bundles, persisted by
+// `orchestrator::finalize_release_evidence` under `<workflow_dir>/.symphony/release/
+// <key>.json` (`key` is `workspace::derive_workspace_key(issue_id)`, the same
+// sanitized key `issue-<key>` branch names use -- see that function's own doc
+// comment). Live-updates by re-fetching `/evidence/<key>/fragment` off the same
+// `/fragment-stream` connection the dashboard already holds open (`dashboard`'s own
+// doc comment), rather than opening a second stream just for this page.
+// --------------------------------------------------------------------------------
+
+fn release_dir(workflow_dir: &std::path::Path) -> PathBuf {
+    workflow_dir.join(".symphony").join("release")
+}
+
+fn load_bundle(workflow_dir: &std::path::Path, key: &str) -> Option<EvidenceBundle> {
+    let bytes = std::fs::read(release_dir(workflow_dir).join(format!("{key}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_bundle(workflow_dir: &std::path::Path, key: &str, bundle: &EvidenceBundle) -> std::io::Result<()> {
+    let dir = release_dir(workflow_dir);
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_vec_pretty(bundle).unwrap_or_default();
+    std::fs::write(dir.join(format!("{key}.json")), json)
+}
+
+/// Every persisted bundle's key, newest first by file modification time -- a plain
+/// directory scan, not an index: there are at most a handful of open cycles at once,
+/// so scanning on every request is cheap enough (same posture `eventlog`'s
+/// per-request connection open takes -- see that module's own doc comment).
+fn list_bundle_keys(workflow_dir: &std::path::Path) -> Vec<String> {
+    let mut entries: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(release_dir(workflow_dir))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                return None;
+            }
+            let key = path.file_stem()?.to_str()?.to_string();
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, key))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.into_iter().map(|(_, k)| k).collect()
+}
+
+fn verdict_badge(v: Verdict) -> String {
+    let (class, label) = match v {
+        Verdict::Ready => ("badge", "READY"),
+        Verdict::ReadyWithRisk => ("badge warn", "READY WITH RISK"),
+        Verdict::Blocked => ("badge closed", "BLOCKED"),
+    };
+    format!(r#"<span class="{class}">{label}</span>"#)
+}
+
+/// Render a bundle's evidence sections as HTML for the dashboard view (the "why"
+/// surface the global constraints require: verdict badge, the rule(s) that produced
+/// it, then every section `release::render_markdown` builds). Reuses
+/// `release::render_markdown`'s own Markdown -- already redacted -- and converts it
+/// with `pulldown-cmark` rather than hand-rolling a second HTML renderer (see
+/// `release.rs`'s own doc comment: "reuse pulldown-cmark only for HTML views").
+fn render_evidence_content(bundle: &EvidenceBundle) -> String {
+    let verdict = release::compute_verdict(bundle);
+    let matrix = release::build_traceability_matrix(bundle);
+    let markdown = release::render_markdown(bundle, verdict, &matrix, &std::collections::BTreeMap::new());
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    let parser = pulldown_cmark::Parser::new_ext(&markdown, options);
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, parser);
+    format!(
+        r#"<div class="row">{badge}</div>
+<div class="post-body">{html}</div>"#,
+        badge = verdict_badge(verdict),
+    )
+}
+
+async fn evidence_index(State(state): State<AppState>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let keys = list_bundle_keys(&state.workflow_dir);
+    let rows: String = if keys.is_empty() {
+        "<p class=\"empty\">No release evidence bundles recorded yet.</p>".to_string()
+    } else {
+        keys.iter()
+            .filter_map(|k| load_bundle(&state.workflow_dir, k).map(|b| (k, b)))
+            .map(|(key, bundle)| {
+                let verdict = release::compute_verdict(&bundle);
+                format!(
+                    r#"<div class="thread-row"><a href="{base}/evidence/{key_link}">{title}</a>{badge}</div>"#,
+                    key_link = urlencode(key),
+                    title = escape(&bundle.title),
+                    badge = verdict_badge(verdict),
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r#"<section><h3>Release evidence</h3><div class="thread-list">{rows}</div></section>"#
+    );
+    Html(page_shell("release evidence", "/evidence", &body, "", base))
+}
+
+async fn evidence_page(State(state): State<AppState>, Path(key): Path<String>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let Some(bundle) = load_bundle(&state.workflow_dir, &key) else {
+        return Html(page_shell(
+            "release evidence",
+            "/evidence",
+            &error_banner(&format!(
+                "No evidence bundle found for &lsquo;{}&rsquo;.",
+                escape(&key)
+            )),
+            "",
+            base,
+        ));
+    };
+    let script = format!(
+        r#"<script>
+new EventSource('{base}/fragment-stream').onmessage = function () {{
+  fetch('{base}/evidence/{key_link}/fragment').then(function (r) {{ return r.text(); }}).then(function (html) {{
+    document.getElementById('evidence-content').innerHTML = html;
+  }});
+}};
+</script>"#,
+        base = base,
+        key_link = urlencode(&key),
+    );
+    let body = format!(
+        r#"<div class="meta">generated {generated} &middot; live-updates when a new bundle lands (no page reload)</div>
+<div id="evidence-content">{content}</div>
+<form class="admin" method="post" action="{base}/evidence/{key_link}/override" data-confirm="Override every unresolved blocking security finding with this justification?">
+  <label for="reason">Override unresolved blocking security findings (admin token required)</label>
+  <input id="reason" name="reason" required maxlength="500">
+  <button type="submit">Override &amp; re-verdict</button>
+</form>"#,
+        generated = escape(&bundle.generated_at),
+        content = render_evidence_content(&bundle),
+        base = base,
+        key_link = urlencode(&key),
+    );
+    Html(page_shell(
+        &format!("evidence: {}", bundle.title),
+        "/evidence",
+        &body,
+        &script,
+        base,
+    ))
+}
+
+async fn evidence_fragment(State(state): State<AppState>, Path(key): Path<String>) -> Html<String> {
+    match load_bundle(&state.workflow_dir, &key) {
+        Some(bundle) => Html(render_evidence_content(&bundle)),
+        None => Html(error_banner("No evidence bundle found for this cycle.")),
+    }
+}
+
+#[derive(Deserialize)]
+struct OverrideForm {
+    reason: String,
+}
+
+/// `SYMPHONY_ADMIN_TOKEN` must be set and match `Authorization: Bearer <token>` --
+/// mirrors `service.rs::extract_admin_token`'s bearer-token check (that module's own
+/// cookie/login-form half doesn't apply here: the single-project dashboard has no
+/// login flow, only this one state-changing action). Unlike `service.rs`, an unset
+/// token means "reject", not "allow": `service.rs` refuses to even start without one
+/// because registering/removing whole repos is destructive; this dashboard stays
+/// read-only by default (its own module doc comment) and this is the one exception,
+/// so the safer default when nobody configured a token is "this action is off."
+fn evidence_override_authorized(headers: &HeaderMap) -> bool {
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.trim().is_empty() {
+        return false;
+    }
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected)
+}
+
+/// Human override with justification (Roadmap §4's "security checklist, risk
+/// classification and any human override with justification"): marks every currently
+/// unresolved blocking security finding as overridden with `reason`, moving a
+/// `Blocked` verdict to `ReadyWithRisk` (`release::compute_verdict`'s own rule --
+/// nothing here computes a verdict directly, so this can never silently disagree with
+/// what the bundle itself would report). A no-op, but not an error, when there's
+/// nothing blocking to override (e.g. before AIR-8 ever records a security finding).
+async fn evidence_override(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<OverrideForm>,
+) -> Response {
+    if !evidence_override_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin token required (SYMPHONY_ADMIN_TOKEN)",
+        )
+            .into_response();
+    }
+    let Some(mut bundle) = load_bundle(&state.workflow_dir, &key) else {
+        return (StatusCode::NOT_FOUND, "no evidence bundle for this cycle").into_response();
+    };
+    let reason = form.reason.trim();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, "reason is required").into_response();
+    }
+    for finding in bundle
+        .security_findings
+        .iter_mut()
+        .filter(|f| f.blocking && f.override_reason.is_none())
+    {
+        finding.override_reason = Some(reason.to_string());
+    }
+    if let Err(e) = save_bundle(&state.workflow_dir, &key, &bundle) {
+        tracing::warn!(key = %key, error = %e, "failed to persist evidence override");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to save override").into_response();
+    }
+    Redirect::to(&format!("{}/evidence/{}", state.base_path, urlencode(&key))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,5 +1184,185 @@ mod tests {
         let html = chips(&q, "");
         assert!(html.contains("issue: 42"));
         assert!(!html.contains("clear all"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-9: /evidence
+    // -----------------------------------------------------------------------------
+
+    fn test_bundle(cycle_id: &str) -> EvidenceBundle {
+        release::assemble(
+            &crate::domain::Issue {
+                id: cycle_id.to_string(),
+                native_ref: None,
+                identifier: "AIR-9".to_string(),
+                title: "Release agent".to_string(),
+                description: Some("- [x] ships evidence bundle".to_string()),
+                priority: None,
+                state: "in_progress".to_string(),
+                branch_name: None,
+                url: None,
+                assignee_id: None,
+                labels: vec![],
+                blocked_by: vec![],
+                dispatchable: true,
+                created_at: None,
+                updated_at: None,
+            },
+            &[],
+            None,
+        )
+    }
+
+    #[test]
+    fn evidence_index_lists_no_bundles_when_none_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = list_bundle_keys(dir.path());
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_bundle_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = test_bundle("issue-1");
+        save_bundle(dir.path(), "issue-1", &bundle).unwrap();
+        let loaded = load_bundle(dir.path(), "issue-1").unwrap();
+        assert_eq!(loaded.cycle_id, "issue-1");
+        assert_eq!(list_bundle_keys(dir.path()), vec!["issue-1".to_string()]);
+    }
+
+    #[test]
+    fn evidence_override_flips_blocked_to_ready_with_risk() {
+        let mut bundle = test_bundle("issue-1");
+        bundle.security_findings.push(release::SecurityFinding {
+            id: "S1".to_string(),
+            description: "sql injection".to_string(),
+            severity: release::SecuritySeverity::Critical,
+            blocking: true,
+            override_reason: None,
+        });
+        assert_eq!(release::compute_verdict(&bundle), Verdict::Blocked);
+
+        for finding in bundle
+            .security_findings
+            .iter_mut()
+            .filter(|f| f.blocking && f.override_reason.is_none())
+        {
+            finding.override_reason = Some("accepted, ticket SEC-1".to_string());
+        }
+        assert_eq!(release::compute_verdict(&bundle), Verdict::ReadyWithRisk);
+    }
+
+    #[tokio::test]
+    async fn evidence_page_shows_not_found_for_an_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/evidence/does-not-exist"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("No evidence bundle found"));
+    }
+
+    #[tokio::test]
+    async fn evidence_page_renders_a_persisted_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        save_bundle(dir.path(), "issue-1", &test_bundle("issue-1")).unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/evidence/issue-1"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("READY"));
+        assert!(body.contains("ships evidence bundle"));
+    }
+
+    /// One test, not two: `SYMPHONY_ADMIN_TOKEN` is a process-global env var, and
+    /// cargo runs tests concurrently by default -- two tests each setting it to a
+    /// different expected value would race. Exercising "wrong token rejected" then
+    /// "correct token accepted" sequentially, inside a single test, sidesteps that
+    /// entirely rather than trying to serialize two separate test functions.
+    #[tokio::test]
+    async fn evidence_override_requires_a_matching_admin_token() {
+        // SAFETY: test-only env var, scoped to this test's own token value.
+        unsafe {
+            std::env::set_var("SYMPHONY_ADMIN_TOKEN", "test-token-air9-override");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut bundle = test_bundle("issue-1");
+        bundle.security_findings.push(release::SecurityFinding {
+            id: "S1".to_string(),
+            description: "sql injection".to_string(),
+            severity: release::SecuritySeverity::Critical,
+            blocking: true,
+            override_reason: None,
+        });
+        save_bundle(dir.path(), "issue-1", &bundle).unwrap();
+
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(rx, dir.path().to_path_buf(), "");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let rejected = client
+            .post(format!("http://{addr}/evidence/issue-1/override"))
+            .bearer_auth("wrong-token")
+            .form(&[("reason", "accepted")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(
+            load_bundle(dir.path(), "issue-1")
+                .unwrap()
+                .security_findings[0]
+                .override_reason
+                .is_none(),
+            "a rejected request must not modify the bundle"
+        );
+
+        let accepted = client
+            .post(format!("http://{addr}/evidence/issue-1/override"))
+            .bearer_auth("test-token-air9-override")
+            .form(&[("reason", "accepted, ticket SEC-1")])
+            .send()
+            .await
+            .unwrap();
+        assert!(accepted.status().is_redirection(), "{}", accepted.status());
+
+        let updated = load_bundle(dir.path(), "issue-1").unwrap();
+        assert_eq!(
+            updated.security_findings[0].override_reason.as_deref(),
+            Some("accepted, ticket SEC-1")
+        );
+        assert_eq!(release::compute_verdict(&updated), Verdict::ReadyWithRisk);
+
+        unsafe {
+            std::env::remove_var("SYMPHONY_ADMIN_TOKEN");
+        }
     }
 }
