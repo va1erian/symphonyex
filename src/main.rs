@@ -12,6 +12,7 @@ mod hooks;
 mod mcp;
 mod metrics;
 mod orchestrator;
+mod quality;
 mod registry;
 mod repo_host;
 mod roles;

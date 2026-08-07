@@ -716,14 +716,33 @@ fn transcript_bubble(r: &eventlog::EventRow, base: &str) -> String {
 // --------------------------------------------------------------------------------
 
 async fn usage_page(State(state): State<AppState>) -> Html<String> {
-    let summary = eventlog::usage_summary(&state.eventlog_db_path()).unwrap_or_default();
-    let by_issue = eventlog::usage_by_issue(&state.eventlog_db_path()).unwrap_or_default();
+    let db_path = state.eventlog_db_path();
+    let summary = eventlog::usage_summary(&db_path).unwrap_or_default();
+    let by_issue = eventlog::usage_by_issue(&db_path).unwrap_or_default();
+    // Per-issue test/coverage evidence (AIR-6): the latest `test_summary`/
+    // `coverage_summary` event per issue, not just "last event overall" -- a test
+    // stage's summary shouldn't disappear from this column just because a later stage
+    // produced more recent events.
+    let test_summaries =
+        eventlog::latest_message_by_type(&db_path, "test_summary").unwrap_or_default();
+    let coverage_summaries =
+        eventlog::latest_message_by_type(&db_path, "coverage_summary").unwrap_or_default();
 
     let base = state.base_path.as_str();
     let issue_rows: String = if by_issue.is_empty() {
-        "<tr><td colspan=\"8\" class=\"empty\">No usage recorded yet.</td></tr>".to_string()
+        "<tr><td colspan=\"10\" class=\"empty\">No usage recorded yet.</td></tr>".to_string()
     } else {
-        by_issue.iter().map(|r| issue_usage_row(r, base)).collect()
+        by_issue
+            .iter()
+            .map(|r| {
+                issue_usage_row(
+                    r,
+                    base,
+                    test_summaries.get(&r.issue_id).map(String::as_str),
+                    coverage_summaries.get(&r.issue_id).map(String::as_str),
+                )
+            })
+            .collect()
     };
 
     let body = format!(
@@ -739,7 +758,7 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
 <h3>Per issue</h3>
 <div class="table-wrap">
 <table>
-<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th>Last event</th></tr></thead>
+<thead><tr><th data-sort>Issue</th><th data-sort>Dispatches</th><th data-sort>Turns</th><th data-sort>Tool calls</th><th data-sort>Input</th><th data-sort>Output</th><th data-sort>Total</th><th>Last event</th><th>Tests</th><th>Coverage</th></tr></thead>
 <tbody>
 {issue_rows}
 </tbody>
@@ -757,10 +776,32 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     Html(page_shell("usage", "/usage", &body, "", base))
 }
 
-fn issue_usage_row(r: &eventlog::IssueUsageRow, base: &str) -> String {
+fn issue_usage_row(
+    r: &eventlog::IssueUsageRow,
+    base: &str,
+    test_summary: Option<&str>,
+    coverage_summary: Option<&str>,
+) -> String {
+    let issue_link = urlencode(&r.issue_id);
+    // Each cell links through to `/events` filtered to the full `test_report`/
+    // `coverage` JSON for that issue -- the explanation surface: a human can see not
+    // just the pass/fail count but the per-suite/per-AC evidence behind it.
+    let tests_cell = match test_summary {
+        Some(s) => format!(
+            "<a href=\"{base}/events?issue={issue_link}&amp;type=test_report\">{}</a>",
+            escape(s)
+        ),
+        None => "<span class=\"empty\">not run</span>".to_string(),
+    };
+    let coverage_cell = match coverage_summary {
+        Some(s) => format!(
+            "<a href=\"{base}/events?issue={issue_link}&amp;type=coverage\">{}</a>",
+            escape(s)
+        ),
+        None => "<span class=\"empty\">not run</span>".to_string(),
+    };
     format!(
-        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td></tr>",
-        issue_link = urlencode(&r.issue_id),
+        "<tr><td><a href=\"{base}/events?issue={issue_link}\">{identifier}</a> &mdash; {title}</td><td>{dispatches}</td><td>{turns}</td><td>{tools}</td><td>{input}</td><td>{output}</td><td>{total}</td><td>{last_event} <span class=\"empty\">{last_at}</span></td><td>{tests_cell}</td><td>{coverage_cell}</td></tr>",
         identifier = escape(&r.identifier),
         title = escape(&r.title),
         dispatches = r.dispatch_count,
@@ -1640,6 +1681,31 @@ mod tests {
         let html = running_card(&row, "");
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn issue_usage_row_shows_test_and_coverage_evidence_with_links() {
+        let r = eventlog::IssueUsageRow {
+            issue_id: "issue-1".to_string(),
+            identifier: "AR-1".to_string(),
+            title: "Scaffold".to_string(),
+            ..Default::default()
+        };
+        let html = issue_usage_row(&r, "", Some("3 passed, 1 failed"), Some("82.3%"));
+        assert!(html.contains("3 passed, 1 failed"));
+        assert!(html.contains("82.3%"));
+        assert!(html.contains("type=test_report"));
+        assert!(html.contains("type=coverage\""));
+    }
+
+    #[test]
+    fn issue_usage_row_shows_not_run_when_no_test_stage_has_run_yet() {
+        let r = eventlog::IssueUsageRow {
+            issue_id: "issue-1".to_string(),
+            ..Default::default()
+        };
+        let html = issue_usage_row(&r, "", None, None);
+        assert!(html.contains("not run"));
     }
 
     #[test]

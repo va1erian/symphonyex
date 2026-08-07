@@ -1437,13 +1437,36 @@ async fn handle_msg(
             let is_tool_call = event.event == "tool_call";
             let tool_name = event.message.clone().unwrap_or_default();
 
+            // `test_report`/`coverage`'s `message` is the full JSON blob (AIR-6) --
+            // worth persisting (below) and browsing on `/events`, but not worth
+            // clobbering the running card's "last event" line with; the one-line
+            // `test_summary`/`coverage_summary` companions carry the human-readable
+            // version of the same data and update it normally.
+            let is_full_report = matches!(event.event.as_str(), "test_report" | "coverage");
+
             if let Some(e) = state.running.get_mut(&issue_id) {
-                e.last_event = Some(event.event.clone());
-                e.last_event_at = Some(Instant::now());
-                if let Some(m) = &event.message {
-                    e.last_message = Some(m.clone());
+                if !is_full_report {
+                    e.last_event = Some(event.event.clone());
+                    e.last_event_at = Some(Instant::now());
+                    if let Some(m) = &event.message {
+                        e.last_message = Some(m.clone());
+                    }
                 }
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+
+                match event.event.as_str() {
+                    "test_summary" => {
+                        state
+                            .metrics
+                            .issue_entry(&identifier, &title)
+                            .last_test_summary = event.message.clone();
+                    }
+                    "coverage_summary" => {
+                        state.metrics.issue_entry(&identifier, &title).last_coverage =
+                            event.message.clone();
+                    }
+                    _ => {}
+                }
 
                 if let Some(u) = &event.usage {
                     e.tokens.input_tokens += u.input_tokens;
@@ -2022,6 +2045,32 @@ async fn run_pipeline(
             None
         };
 
+        // The test stage (AIR-6) is identified by convention (`id: test` plus a
+        // configured `pipeline.test` block), the same way every other stage's `role`
+        // is just a string until AIR-2 gives roles their own resolved behavior --
+        // no new "stage kind" concept, just a naming convention two config keys agree
+        // on. "Before touching anything" (the ticket's own words for the baseline run)
+        // means literally before this stage's agent turns start writing tests.
+        let is_test_stage = stage.id.eq_ignore_ascii_case("test") && cfg.pipeline.test.is_some();
+        let baseline = if is_test_stage {
+            match (&cfg.pipeline.test, &cfg.repo) {
+                (Some(test_cfg), Some(repo)) => {
+                    crate::quality::collect_baseline(
+                        test_cfg,
+                        &cfg.workflow_dir,
+                        workspace_path,
+                        &repo.default_branch,
+                        cfg.hook_timeout_ms,
+                        container,
+                    )
+                    .await
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // AIR-4: an `optional: true` stage can be opted out of per-issue by labeling
         // the issue `skip-<stage-id>` -- checked before role resolution, since a
         // skipped stage never actually runs a role.
@@ -2150,6 +2199,47 @@ async fn run_pipeline(
 
         if let Some(s) = fresh_session {
             s.stop().await;
+        }
+
+        // Run the configured suites/coverage for real once the agent's own turns are
+        // done writing tests (skipped if the stage's turns errored out -- that failure
+        // is handled by the normal `on_failure` path below, running tests against a
+        // possibly half-written change adds nothing). A blocking coverage-gate miss is
+        // handled exactly like a blocking stage failure: park the issue and stop, same
+        // `block_issue` path `on_failure: escalate` already uses.
+        if is_test_stage && !matches!(outcome, LoopExit::Error(_)) {
+            let test_cfg = cfg
+                .pipeline
+                .test
+                .as_ref()
+                .expect("is_test_stage implies Some");
+            let stage_outcome = crate::quality::run_test_stage(
+                test_cfg,
+                &cfg.workflow_dir,
+                workspace_path,
+                cfg.hook_timeout_ms,
+                container,
+                baseline.as_deref(),
+                stage.blocking,
+            )
+            .await;
+            emit_test_stage_events(tx, issue_id, &stage_outcome);
+
+            if let crate::quality::CoverageGate::Blocking {
+                percent,
+                min_percent,
+            } = stage_outcome.gate
+            {
+                let _ = tx.send(OrchMsg::StageFinished {
+                    issue_id: issue_id.to_string(),
+                    stage_id: stage.id.clone(),
+                    outcome: format!(
+                        "blocked: coverage {percent:.1}% below required {min_percent:.1}%"
+                    ),
+                });
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
+                return ExitReason::Normal;
+            }
         }
 
         let outcome_label = match &outcome {
@@ -2404,6 +2494,53 @@ fn evaluate_auto_approve(plan_json: Option<&str>, cond: &config::AutoApproveWhen
         }
     }
     true
+}
+
+/// Feeds the test stage's results into the same `OrchMsg::AgentEvent` pipe every other
+/// agent event flows through (`run_one_turn`'s forwarder above) -- no new persistence
+/// or dashboard-refresh mechanism: `handle_msg` already records every `AgentEvent` to
+/// the event log and republishes the live status snapshot, and `/events` already lets
+/// an operator browse by `event_type`. Three events, cheapest-to-richest: a one-line
+/// summary for the dashboard/report column, then the full `test_report` and `coverage`
+/// JSON for anyone who clicks through to see the per-suite/per-AC evidence.
+fn emit_test_stage_events(
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+    issue_id: &str,
+    outcome: &crate::quality::TestStageOutcome,
+) {
+    let mut summary = AgentEvent::new("test_summary");
+    summary.message = Some(outcome.report.summary_line());
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: summary,
+    });
+
+    let mut coverage_summary = AgentEvent::new("coverage_summary");
+    coverage_summary.message = Some(match outcome.coverage.line_percent() {
+        Some(p) => format!("{p:.1}%"),
+        None => "not measured".to_string(),
+    });
+    let _ = tx.send(OrchMsg::AgentEvent {
+        issue_id: issue_id.to_string(),
+        event: coverage_summary,
+    });
+
+    if let Ok(report_json) = serde_json::to_string(&outcome.report) {
+        let mut ev = AgentEvent::new("test_report");
+        ev.message = Some(report_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
+    }
+    if let Ok(coverage_json) = serde_json::to_string(&outcome.coverage) {
+        let mut ev = AgentEvent::new("coverage");
+        ev.message = Some(coverage_json);
+        let _ = tx.send(OrchMsg::AgentEvent {
+            issue_id: issue_id.to_string(),
+            event: ev,
+        });
+    }
 }
 
 /// Returns the turn's outcome, plus two things extracted while forwarding its event
@@ -2896,6 +3033,122 @@ mod tests {
             })
             .unwrap();
         assert_eq!(role_summary, "review — reviewer");
+    }
+
+    /// End-to-end AIR-6 wiring test: a `pipeline.test` stage actually runs the
+    /// configured suite/coverage commands against `workspace_path` (not just the
+    /// agent's own turns), emits `test_report`/`coverage` evidence, and -- since the
+    /// stage is `blocking: true` and coverage is below `min_line_percent` -- parks the
+    /// issue exactly like any other blocking stage failure.
+    #[tokio::test]
+    async fn test_stage_runs_suites_and_blocks_on_coverage_gate_when_stage_is_blocking() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "T-1");
+        let workspace_dir = tempdir().unwrap();
+        std::fs::write(
+            workspace_dir.path().join("coverage.json"),
+            r#"{"data":[{"files":[{"filename":"a.rs","summary":{"lines":{"count":10,"covered":1}}}]}]}"#,
+        )
+        .unwrap();
+
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             pipeline:\n  enabled: true\n  blocked_state: blocked\n  stages:\n    \
+             - id: test\n      role: test\n      max_turns: 1\n      blocking: true\n  \
+             test:\n    commands:\n      unit: exit 0\n    coverage:\n      command: \"true\"\n      \
+             format: llvm-cov\n      min_line_percent: 90\n",
+        )
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir.path())).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        let snapshot = DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: Arc::new(ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new())),
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        };
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace_dir.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let msgs = drain(rx).await;
+        let event_types: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::AgentEvent { event, .. } => Some(event.event.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            event_types.contains(&"test_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage_summary".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"test_report".to_string()),
+            "{event_types:?}"
+        );
+        assert!(
+            event_types.contains(&"coverage".to_string()),
+            "{event_types:?}"
+        );
+
+        let outcomes: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                OrchMsg::StageFinished { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outcomes.iter().any(|o| o.starts_with("blocked: coverage")),
+            "{outcomes:?}"
+        );
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["T-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(refreshed.normalized_state(), "blocked");
     }
 
     #[tokio::test]
