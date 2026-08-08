@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-5
 title: Dashboard-style layout (fixed left nav, full-width content) with manual light/dark toggle and emoji nav icons
-state: todo
+state: done
 priority: 3
 labels: [dashboard, ux]
 dispatchable: true
@@ -61,24 +61,24 @@ comment) rather than introducing a second rendering approach alongside it.
 
 ## Acceptance criteria
 
-- [ ] Every page already using `page_shell` renders with the new sidebar layout without
+- [x] Every page already using `page_shell` renders with the new sidebar layout without
       per-page changes beyond whatever `page_shell`'s own signature requires.
-- [ ] The layout is responsive: a narrow viewport collapses the sidebar into a top bar or
+- [x] The layout is responsive: a narrow viewport collapses the sidebar into a top bar or
       drawer rather than clipping/overflowing content, and no page requires horizontal
       scrolling to read.
-- [ ] Toggling the theme persists across a page reload and across navigating to a
+- [x] Toggling the theme persists across a page reload and across navigating to a
       different page (real `localStorage`, not just in-memory state).
-- [ ] A human who has never touched the toggle still gets the correct theme from their OS
+- [x] A human who has never touched the toggle still gets the correct theme from their OS
       preference (`prefers-color-scheme`) — the manual override doesn't regress the
       existing auto-detect behavior.
-- [ ] No flash of the wrong theme on load (the stored/detected preference is applied
+- [x] No flash of the wrong theme on load (the stored/detected preference is applied
       before first paint, not after a visible re-render).
-- [ ] Every `NAV_LINKS` entry has an emoji prefix.
-- [ ] Existing tests covering `web::nav`/`page_shell`/`nav_links`
+- [x] Every `NAV_LINKS` entry has an emoji prefix.
+- [x] Existing tests covering `web::nav`/`page_shell`/`nav_links`
       (`src/web.rs`'s own test module, plus any `status.rs`/`swebot::chat::web` tests
       asserting on rendered nav HTML) are updated for the new markup shape rather than
       left broken.
-- [ ] `cargo test` and `cargo clippy --all-targets` stay clean.
+- [x] `cargo test` and `cargo clippy --all-targets` stay clean.
 
 ## Out of scope
 

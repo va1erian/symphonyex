@@ -166,6 +166,7 @@ fn parse_lcov(content: &str) -> Result<Coverage, String> {
 /// attribute), so rounding in the tool's own summary never leaks into ours.
 fn parse_cobertura(content: &str) -> Result<Coverage, String> {
     use quick_xml::Reader;
+    use quick_xml::XmlVersion;
     use quick_xml::events::Event;
 
     let mut reader = Reader::from_str(content);
@@ -185,7 +186,7 @@ fn parse_cobertura(content: &str) -> Result<Coverage, String> {
                             .attributes()
                             .flatten()
                             .find(|a| a.key.local_name().as_ref() == b"filename")
-                            .and_then(|a| a.unescape_value().ok())
+                            .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
                             .map(|v| v.to_string());
                         if let Some(f) = filename {
                             current = Some((f, 0, 0));
@@ -196,7 +197,7 @@ fn parse_cobertura(content: &str) -> Result<Coverage, String> {
                             .attributes()
                             .flatten()
                             .find(|a| a.key.local_name().as_ref() == b"hits")
-                            .and_then(|a| a.unescape_value().ok())
+                            .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0);
                         if let Some((_, covered, total)) = current.as_mut() {
@@ -234,6 +235,7 @@ fn parse_cobertura(content: &str) -> Result<Coverage, String> {
 /// missed="M" covered="C"/>`. The file path is `<package name>/<sourcefile name>`.
 fn parse_jacoco(content: &str) -> Result<Coverage, String> {
     use quick_xml::Reader;
+    use quick_xml::XmlVersion;
     use quick_xml::events::Event;
 
     let mut reader = Reader::from_str(content);
@@ -251,7 +253,7 @@ fn parse_jacoco(content: &str) -> Result<Coverage, String> {
                     .attributes()
                     .flatten()
                     .find(|a| a.key.local_name().as_ref() == b"name")
-                    .and_then(|a| a.unescape_value().ok())
+                    .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
                     .map(|v| v.to_string())
                     .unwrap_or_default();
             }
@@ -260,7 +262,7 @@ fn parse_jacoco(content: &str) -> Result<Coverage, String> {
                     .attributes()
                     .flatten()
                     .find(|a| a.key.local_name().as_ref() == b"name")
-                    .and_then(|a| a.unescape_value().ok())
+                    .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
                     .map(|v| v.to_string());
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"sourcefile" => {
@@ -274,7 +276,7 @@ fn parse_jacoco(content: &str) -> Result<Coverage, String> {
                 let ty = attrs
                     .iter()
                     .find(|a| a.key.local_name().as_ref() == b"type")
-                    .and_then(|a| a.unescape_value().ok());
+                    .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok());
                 if ty.as_deref() != Some("LINE") {
                     continue;
                 }
@@ -282,7 +284,7 @@ fn parse_jacoco(content: &str) -> Result<Coverage, String> {
                     attrs
                         .iter()
                         .find(|a| a.key.local_name().as_ref() == k)
-                        .and_then(|a| a.unescape_value().ok())
+                        .and_then(|a| a.normalized_value(XmlVersion::Implicit1_0).ok())
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0)
                 };
