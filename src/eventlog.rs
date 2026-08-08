@@ -208,6 +208,17 @@ fn insert(conn: &Connection, ev: &NewEvent) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// One-off write via a short-lived connection, for a caller that isn't the
+/// orchestrator's dedicated writer task and doesn't want to hold a channel to it
+/// (`status.rs`'s `/budget/extend` -- a rare admin action, not the hot dispatch path
+/// `spawn_writer` exists to protect). Same "each request opens its own connection, WAL
+/// mode handles concurrent writers fine at this traffic volume" posture the read-side
+/// functions in this module already use.
+pub fn record_now(db_path: &Path, ev: &NewEvent) -> rusqlite::Result<()> {
+    let conn = open(db_path)?;
+    insert(&conn, ev)
+}
+
 /// Spawn the dedicated writer task and return the channel to feed it. Best-effort: a
 /// write failure is logged and dropped, never propagated back to the orchestrator's
 /// hot dispatch path -- losing one history row is not worth destabilizing dispatch
@@ -413,6 +424,36 @@ pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
             (SELECT COALESCE(SUM(output_tokens), 0) FROM events), \
             (SELECT COALESCE(SUM(total_tokens), 0) FROM events)",
         [],
+        |row| {
+            Ok(UsageSummary {
+                dispatch_count: row.get(0)?,
+                turn_count: row.get(1)?,
+                tool_call_count: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                total_tokens: row.get(5)?,
+            })
+        },
+    )
+}
+
+/// Same aggregation as [`usage_summary`], restricted to events at or after `since`
+/// (an RFC 3339 timestamp -- lexical comparison works because `created_at` is always
+/// written via `chrono::Utc::now().to_rfc3339()`, which sorts identically to time order).
+/// Backs `budget.rs`'s window rollup (Section AIR-11): the event log is the one source
+/// of truth for consumption, so a budget window is just a filtered replay of it rather
+/// than a second counter that could drift.
+pub fn usage_summary_since(db_path: &Path, since: &str) -> rusqlite::Result<UsageSummary> {
+    let conn = open(db_path)?;
+    conn.query_row(
+        "SELECT \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'dispatched' AND created_at >= ?1), \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'turn_started' AND created_at >= ?1), \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'tool_call' AND created_at >= ?1), \
+            (SELECT COALESCE(SUM(input_tokens), 0) FROM events WHERE created_at >= ?1), \
+            (SELECT COALESCE(SUM(output_tokens), 0) FROM events WHERE created_at >= ?1), \
+            (SELECT COALESCE(SUM(total_tokens), 0) FROM events WHERE created_at >= ?1)",
+        [since],
         |row| {
             Ok(UsageSummary {
                 dispatch_count: row.get(0)?,
@@ -823,6 +864,32 @@ mod tests {
         let coverage = latest_message_by_type(&db, "coverage_summary").unwrap();
         assert_eq!(coverage.get("2").map(String::as_str), Some("90%"));
         assert!(!coverage.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn usage_summary_since_only_counts_events_at_or_after_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                total_tokens: Some(100),
+                ..new_event("1", "tool_call")
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        // A cutoff in the future excludes everything already written.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let none_yet = usage_summary_since(&db, &future).unwrap();
+        assert_eq!(none_yet.total_tokens, 0);
+
+        // A cutoff in the past includes it.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let all = usage_summary_since(&db, &past).unwrap();
+        assert_eq!(all.total_tokens, 100);
     }
 
     #[tokio::test]

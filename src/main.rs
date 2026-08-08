@@ -1,6 +1,7 @@
 mod agent;
 mod approvals;
 mod artifacts;
+mod budget;
 mod config;
 mod container;
 mod daemon;

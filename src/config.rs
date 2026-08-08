@@ -444,6 +444,107 @@ pub struct SwebotChatConfig {
     pub first_text_deadline_ms: u64,
 }
 
+/// Extension (AIR-11): a rolling window a `budgets.application`/`budgets.platform` limit
+/// is measured over -- `budgets.window` in `WORKFLOW.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetWindow {
+    Daily,
+    Weekly,
+    #[default]
+    Monthly,
+}
+
+impl BudgetWindow {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "daily" => BudgetWindow::Daily,
+            "weekly" => BudgetWindow::Weekly,
+            _ => BudgetWindow::Monthly,
+        }
+    }
+}
+
+/// What happens when a budget's `tokens` or `cost` limit is exceeded
+/// (`budgets.on_exceeded`) -- one setting shared by every scope (stage/cycle/
+/// application/platform), so a project picks one posture rather than reasoning about
+/// four independent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetAction {
+    /// Record an event and show a dashboard banner; the cycle keeps running.
+    Warn,
+    /// Park the cycle in `pipeline.blocked_state`, same as `Stop`, but tagged
+    /// distinctly so a human knows it's asking for a budget extension rather than
+    /// reporting a hard stop (`status.rs`'s `/budget/extend` control resumes it).
+    Escalate,
+    /// End the cycle cleanly (the current turn finishes, `after_run` still runs) and
+    /// park the issue in `pipeline.blocked_state`.
+    #[default]
+    Stop,
+}
+
+impl BudgetAction {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "warn" => BudgetAction::Warn,
+            "escalate" => BudgetAction::Escalate,
+            _ => BudgetAction::Stop,
+        }
+    }
+}
+
+/// A token and/or currency ceiling for one budget scope. Either half can be omitted;
+/// `None` on both (the zero value) means "no limit at this scope."
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BudgetLimits {
+    pub tokens: Option<u64>,
+    pub cost: Option<f64>,
+}
+
+impl BudgetLimits {
+    fn parse(v: &Value) -> Option<Self> {
+        let tokens = get(v, "tokens").and_then(|x| x.as_u64());
+        let cost = get_f64(v, "cost");
+        if tokens.is_none() && cost.is_none() {
+            None
+        } else {
+            Some(BudgetLimits { tokens, cost })
+        }
+    }
+}
+
+/// Extension (AIR-11): `stop_conditions.*` -- ways a cycle stops itself independent of
+/// any budget, both aimed at the same failure mode (an agent looping to `max_turns`
+/// while accomplishing nothing). `None` disables the corresponding check; the zero
+/// value disables both, so a project that never sets `stop_conditions:` sees no
+/// behavior change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StopConditionsConfig {
+    /// Stop after this many consecutive turns produce neither a tool call nor a
+    /// workspace diff.
+    pub no_progress_turns: Option<u32>,
+    /// Stop after the same turn-failure signature repeats this many times in a row.
+    pub repeated_error: Option<u32>,
+}
+
+/// Extension (AIR-11): `budgets.*` -- token/cost ceilings at four scopes
+/// (platform/application/cycle/stage) enforced after every turn against
+/// `eventlog::usage_summary`-style rollups, per `src/budget.rs`. Every field defaults
+/// to "no limit" (`BudgetLimits::default()`'s `None`/`None`), so a project that never
+/// sets `budgets:` sees no behavior change -- `budget::check_after_turn` short-circuits
+/// to "not exceeded" whenever a scope's limits are both `None`.
+#[derive(Debug, Clone, Default)]
+pub struct BudgetsConfig {
+    pub currency: String,
+    pub platform: Option<BudgetLimits>,
+    pub application: Option<BudgetLimits>,
+    pub window: BudgetWindow,
+    pub cycle: Option<BudgetLimits>,
+    /// Default stage budget, applied to every stage that doesn't set its own
+    /// `pipeline.stages[].budget` override.
+    pub stage: Option<BudgetLimits>,
+    pub on_exceeded: BudgetAction,
+}
+
 /// Extension: the AI Roadmap 2026 delivery pipeline (AIR-1) -- run a ticket through an
 /// ordered sequence of stages within one workspace instead of a single undifferentiated
 /// agent run. Off by default (`enabled: false`, the zero value `Default` produces):
@@ -596,6 +697,9 @@ pub struct StageConfig {
     /// human decision (dashboard or issue-comment `/approve`/`/changes`/`/reject`),
     /// unless `pipeline.approval.auto_approve_when` matches the stage's output first.
     pub requires_approval: bool,
+    /// Overrides `budgets.stage` for this one stage; `None` falls back to the
+    /// project-wide default.
+    pub budget: Option<BudgetLimits>,
 }
 
 /// AIR-2: a project's override of one of the eight built-in roadmap roles
@@ -722,6 +826,13 @@ pub struct EffectiveConfig {
     /// `roles::resolve`.
     pub roles: HashMap<String, RoleConfig>,
     pub observability: ObservabilityConfig,
+    pub budgets: BudgetsConfig,
+    pub stop_conditions: StopConditionsConfig,
+    /// `<backend>/<model>` -> price per million tokens, resolved once at config time
+    /// (default table merged with a project's own `pricing:` overrides) -- see
+    /// `budget::resolve_pricing`. Never consulted deep inside a backend module; cost is
+    /// only ever computed from this at the one place `budget::compute_cost` is called.
+    pub pricing: crate::budget::PricingTable,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -766,6 +877,19 @@ impl EffectiveConfig {
             AgentBackendKind::Codex => self.codex.stall_timeout_ms,
             AgentBackendKind::OpenCode => self.opencode.stall_timeout_ms,
         }
+    }
+
+    /// `<backend>/<model>` pricing-table key for whichever backend/model this run
+    /// actually uses (Section AIR-11) -- `None` model (the CLI's own default) resolves
+    /// to a key nothing in `default_pricing()` matches, which is deliberate: an unpriced
+    /// model must show cost `unknown`, never silently `0`.
+    pub fn effective_model_key(&self) -> String {
+        let (backend, model) = match self.agent_backend {
+            AgentBackendKind::Claude => ("claude", self.claude.model.as_deref()),
+            AgentBackendKind::Codex => ("codex", None),
+            AgentBackendKind::OpenCode => ("opencode", self.opencode.model.as_deref()),
+        };
+        crate::budget::model_key(backend, model)
     }
 
     /// The backend SweBot's own sessions run on: `swebot.backend` when set, else the
@@ -815,6 +939,18 @@ fn get_u64(v: &Value, key: &str, default: u64) -> u64 {
 
 fn get_i64(v: &Value, key: &str, default: i64) -> i64 {
     get(v, key).and_then(|x| x.as_i64()).unwrap_or(default)
+}
+
+/// Unlike `serde_yaml::Value::as_f64` alone, also accepts a bare integer (`cost: 40`)
+/// -- YAML doesn't tag `40` as a float just because the schema expects one, and a
+/// budget/price value written without a decimal point is a completely normal thing for
+/// a human to type.
+fn get_f64(v: &Value, key: &str) -> Option<f64> {
+    get(v, key).and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_i64().map(|i| i as f64))
+            .or_else(|| x.as_u64().map(|u| u as f64))
+    })
 }
 
 fn get_vec_str(v: &Value, key: &str) -> Vec<String> {
@@ -1149,6 +1285,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                         requires_approval: get(s, "requires_approval")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false),
+                        budget: get(s, "budget").and_then(BudgetLimits::parse),
                     })
                 })
                 .collect()
@@ -1362,6 +1499,54 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         },
     };
 
+    let budgets_raw = get(config, "budgets").unwrap_or(&empty);
+    let budgets_cfg = BudgetsConfig {
+        currency: get_str(budgets_raw, "currency").unwrap_or_else(|| "USD".to_string()),
+        platform: get(budgets_raw, "platform").and_then(BudgetLimits::parse),
+        application: get(budgets_raw, "application").and_then(BudgetLimits::parse),
+        window: get_str(budgets_raw, "window")
+            .map(|v| BudgetWindow::parse(&v))
+            .unwrap_or_default(),
+        cycle: get(budgets_raw, "cycle").and_then(BudgetLimits::parse),
+        stage: get(budgets_raw, "stage").and_then(BudgetLimits::parse),
+        on_exceeded: get_str(budgets_raw, "on_exceeded")
+            .map(|v| BudgetAction::parse(&v))
+            .unwrap_or_default(),
+    };
+
+    let stop_conditions_raw = get(config, "stop_conditions").unwrap_or(&empty);
+    let stop_conditions_cfg = StopConditionsConfig {
+        no_progress_turns: get(stop_conditions_raw, "no_progress_turns")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        repeated_error: get(stop_conditions_raw, "repeated_error")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    };
+
+    let pricing_overrides: crate::budget::PricingTable = get(config, "pricing")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.trim().to_lowercase();
+                    let input = get_f64(v, "input")?;
+                    let output = get_f64(v, "output")?;
+                    let cache = get_f64(v, "cache");
+                    Some((
+                        key,
+                        crate::budget::PriceEntry {
+                            input_per_million: input,
+                            output_per_million: output,
+                            cache_per_million: cache,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pricing = crate::budget::resolve_pricing(&pricing_overrides);
+
     let cfg = EffectiveConfig {
         tracker_kind,
         tracker_provider: get_map(tracker, "provider"),
@@ -1382,6 +1567,9 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         pipeline: pipeline_cfg,
         roles: roles_cfg,
         observability: observability_cfg,
+        budgets: budgets_cfg,
+        stop_conditions: stop_conditions_cfg,
+        pricing,
 
         hook_after_create,
         hook_before_run,

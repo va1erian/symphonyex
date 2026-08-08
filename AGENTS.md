@@ -85,11 +85,11 @@ Useful for watching dispatch/concurrency behavior — e.g. bump
 `agent.max_concurrent_agents` and you'll see multiple cards running at once on `/`, or
 look back at exactly what happened on `/events` afterward.
 
-`src/status.rs` exposes this as a plain `Router` (`status::router(status_rx, db_path,
-base_path)`) with no bind/serve attached, so it can be reused unmodified either at the
-root (the single-project CLI path above) or nested under a path prefix (the
-multi-project service below) — `base_path` is what makes every link/asset URL this
-router renders come out correctly prefixed either way.
+`src/status.rs` exposes this as a plain `Router` (`status::router(status_rx,
+workflow_dir, tracker, base_path)`) with no bind/serve attached, so it can be reused
+unmodified either at the root (the single-project CLI path above) or nested under a
+path prefix (the multi-project service below) — `base_path` is what makes every
+link/asset URL this router renders come out correctly prefixed either way.
 
 ## Usage report
 
@@ -123,6 +123,77 @@ first, and `after_run` runs every time a running attempt ends, matching Section 
 ("success, failure, timeout, or cancellation"). Found by running the real
 bsky-archiver pipeline: a ticket showed `done` with fully verified work, but its
 branch never appeared upstream.
+
+## Budgets and stopping conditions (AIR-11)
+
+Symphony *measures* tokens (the usage report and `/usage` above); `budgets:` and
+`stop_conditions:` in `WORKFLOW.md` turn that measurement into an enforced ceiling
+(`src/budget.rs`). Both are entirely optional — a project that never sets either key
+sees zero behavior change.
+
+```yaml
+budgets:
+  currency: EUR
+  platform:    {tokens: 500000000, cost: 20000}   # this process's own share
+  application: {tokens: 20000000,  cost: 800}     # this WORKFLOW.md, rolling window
+  window: monthly                                  # daily | weekly | monthly
+  cycle:       {tokens: 2000000,   cost: 40}
+  stage:       {tokens: 400000}                    # default for every stage
+  on_exceeded: stop                                # warn | escalate | stop
+
+stop_conditions:
+  no_progress_turns: 5   # N consecutive turns with no tool call and no workspace diff
+  repeated_error: 3       # same turn-failure text N times in a row
+```
+
+Any of `platform`/`application`/`cycle`/`stage`/`tokens`/`cost` can be omitted; an
+absent limit never trips. A stage can override the project-wide default with its own
+`pipeline.stages[].budget: {tokens: ..., cost: ...}`.
+
+**Cost** is computed from a `<backend>/<model>` -> price-per-million-tokens table
+(`budget::default_pricing`, overridable per project via a top-level `pricing:` map in
+`WORKFLOW.md`), resolved once at config time — never hardcoded inside a backend module.
+An unpriced model (including the common case of never setting `claude.model`/
+`opencode.model` at all) computes to cost **unknown**, never a silent `0`; a
+budget's `cost` limit simply never trips against an unknown cost.
+
+**Enforcement** happens after every turn: stage/cycle usage is tracked in-memory for
+the running cycle (reset per stage/per dispatch); application/platform usage is a
+window rollup query against `eventlog::usage_summary_since` — the event log stays the
+one source of truth for consumption, this is a filtered replay of it, not a second
+counter. `on_exceeded` (one setting, shared across all four scopes) decides what
+happens:
+- `warn` — records a `budget_warn` event and shows a note on the running card; the
+  cycle keeps going.
+- `escalate`/`stop` — the current turn finishes, `after_run` still runs (the work is
+  never lost), then the issue is parked in `pipeline.blocked_state`, tagged
+  `budget_escalated` or `budget_stop` respectively. An operator resumes an escalated
+  (or a stopped, if judged safe to retry) cycle from the dashboard's "Budget-blocked
+  cycle" form (`POST /budget/extend`, admin-token protected when
+  `SYMPHONY_ADMIN_TOKEN` is set), which moves it back to the project's first
+  `tracker.active_states` entry.
+
+**Stopping conditions** catch the same "agent loops to `agent.max_turns` producing
+nothing" failure mode from the other direction: `no_progress_turns` ends the cycle once
+N consecutive turns make neither a tool call nor a workspace diff; `repeated_error` ends
+it once the same turn-failure text repeats N times in a row (until configured, a single
+turn failure still ends the cycle immediately, unchanged from before this existed).
+Both are cheap unit-testable state (`budget::ProgressTracker`) — no LLM judgement
+involved.
+
+Known accuracy caveat (same root cause as the usage report's above): usage lands only
+on a turn's final `result` event, so a preempted turn (killed by a stall timeout,
+reconciliation) reports zero tokens for that turn even though real work — and possibly
+real cost — happened. Budget checks treat "no usage reported" as "zero consumed this
+turn," which means a ceiling can be crossed and not get caught until the *next* turn
+reports usage; this is a best-effort ceiling against what's actually been observed, not
+a hard real-time guarantee.
+
+Platform-level enforcement is scoped per-process: under `symphony serve`, each
+project's own orchestrator enforces `budgets.platform` against its own event log only
+(correct for a single project, and for the common case of one project per process);
+true cross-project aggregation into one platform-wide number would need a shared
+accounting service and is out of scope here.
 
 ## Plan usage-limit handling (`claude` backend)
 
