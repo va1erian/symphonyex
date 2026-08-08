@@ -17,6 +17,7 @@ mod registry;
 mod repo_host;
 mod review_rubric;
 mod roles;
+mod security;
 mod service;
 mod status;
 mod swebot;

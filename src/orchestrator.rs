@@ -1,4 +1,4 @@
-﻿//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
+//! Orchestrator: the single authority over dispatch, retry, and reconciliation state
 //! (Section 7, 8, 16). One task owns all mutable scheduling state directly; worker
 //! tasks only ever report back over a channel, never mutate shared state themselves.
 
@@ -198,6 +198,30 @@ enum OrchMsg {
         issue_id: String,
         stage_id: String,
     },
+    /// A `security` stage finished evaluating its artifact (model output + scanners),
+    /// whether or not it ended up blocking -- recorded unconditionally so the
+    /// dashboard's `/security` page has something to show for a clean cycle too, not
+    /// just blocked ones. `findings_json` is the fully redacted, scanner-merged
+    /// `security::SecurityFindings` artifact.
+    SecurityEvaluated {
+        issue_id: String,
+        stage_id: String,
+        risk: String,
+        findings_json: String,
+    },
+    /// The security stage's findings breached `pipeline.security.block_on` and no
+    /// pending human override was found -- the cycle is about to be parked.
+    SecurityBlocked {
+        issue_id: String,
+        reason: String,
+    },
+    /// A previously-recorded human override (`status.rs`'s `/security/override`) was
+    /// applied to unblock this evaluation -- one-shot, see
+    /// `eventlog::pending_override`.
+    SecurityOverrideConsumed {
+        issue_id: String,
+        reason: String,
+    },
 }
 
 /// Load workflow + resolve config + build adapters for the current file contents.
@@ -384,6 +408,10 @@ pub struct ProjectHandles {
     /// when `web_enabled` is set (the single-project status server serves it at
     /// `/chat` on the same condition).
     pub chat: Option<crate::swebot::chat::ChatHandles>,
+    /// AIR-8: lets the multi-project service (`src/service.rs`) wire the same
+    /// tracker-backed `/security` override action into this project's nested
+    /// dashboard that the single-project path gets above.
+    pub security: status::SecurityContext,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -486,6 +514,11 @@ async fn run_inner(
             .as_ref()
             .filter(|handles| handles.web_enabled)
             .map(|handles| crate::swebot::chat::web::router(handles.store.clone(), "/chat"));
+        let security_context = status::SecurityContext {
+            tracker: shared.tracker.clone(),
+            blocked_state: shared.config.pipeline.blocked_state.clone(),
+            resume_state: shared.config.active_states.first().cloned(),
+        };
         tokio::spawn(async move {
             if let Err(e) = status::serve_composite(
                 port,
@@ -493,6 +526,7 @@ async fn run_inner(
                 status_rx_for_serve,
                 workflow_dir_for_serve,
                 chat_router,
+                Some(security_context),
             )
             .await
             {
@@ -505,6 +539,11 @@ async fn run_inner(
             status_rx: status_rx.clone(),
             workflow_dir: workflow_dir.clone(),
             chat,
+            security: status::SecurityContext {
+                tracker: shared.tracker.clone(),
+                blocked_state: shared.config.pipeline.blocked_state.clone(),
+                resume_state: shared.config.active_states.first().cloned(),
+            },
         });
     }
 
@@ -1692,6 +1731,63 @@ async fn handle_msg(
                 );
             }
         }
+        OrchMsg::SecurityEvaluated {
+            issue_id,
+            stage_id,
+            risk,
+            findings_json,
+        } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "security_findings".to_string(),
+                        // First line is `stage=<id> risk=<risk>` for a quick glance in
+                        // `/events`; everything after the first newline is the raw
+                        // `security::SecurityFindings` JSON artifact, parsed back out by
+                        // `status.rs`'s `/security` page.
+                        message: Some(format!("stage={stage_id} risk={risk}\n{findings_json}")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::SecurityBlocked { issue_id, reason } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "security_blocked".to_string(),
+                        message: Some(reason),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::SecurityOverrideConsumed { issue_id, reason } => {
+            // Already persisted synchronously by `evaluate_security_stage`, before
+            // this message was even sent -- consuming an override has to be
+            // immediate (never dependent on this deferred handler running first),
+            // or two evaluations racing `pending_override` could both consume the
+            // same one. Only a log line here, not a second `eventlog` row.
+            tracing::info!(issue_id = %issue_id, reason = %reason, "security override consumed, cycle resumed");
+        }
     }
 }
 
@@ -1911,8 +2007,14 @@ async fn run_turn_loop(
     let mut turn_number: u32 = 1;
     let mut last_message: Option<String> = None;
     loop {
-        let mut prompt = match render_turn_prompt(prompt_template, issue, attempt, turn_number, max_turns, cycle)
-        {
+        let mut prompt = match render_turn_prompt(
+            prompt_template,
+            issue,
+            attempt,
+            turn_number,
+            max_turns,
+            cycle,
+        ) {
             Ok(p) => p,
             Err(e) => return (LoopExit::Error(format!("prompt error: {e}")), last_message),
         };
@@ -2164,7 +2266,13 @@ async fn run_pipeline(
             let backend = crate::roles::build_backend(&role, cfg);
             let title = format!("{}: {} [{}]", issue.identifier, issue.title, stage.id);
             match backend
-                .start_session(workspace_path, issue_id, &title, container, &role.tool_policy)
+                .start_session(
+                    workspace_path,
+                    issue_id,
+                    &title,
+                    container,
+                    &role.tool_policy,
+                )
                 .await
             {
                 Ok(s) => fresh_session = Some(s),
@@ -2263,6 +2371,22 @@ async fn run_pipeline(
             }
         }
 
+        // AIR-8: a `security` stage's turns completing successfully is not the same
+        // as the change passing security review -- evaluate the artifact the stage's
+        // rubric (`roles::builtin::prompt_for("security")`) instructs the agent to
+        // write, plus any configured scanners, and turn a threshold breach into the
+        // same `LoopExit::Error` any other stage failure produces, so the existing
+        // `on_failure`/`blocking` handling below (unchanged) is what actually parks
+        // the issue.
+        if stage.role.eq_ignore_ascii_case("security")
+            && matches!(outcome, LoopExit::Completed | LoopExit::EndedByIssueState)
+        {
+            outcome =
+                evaluate_security_stage(issue_id, &stage.id, workspace_path, container, cfg, tx)
+                    .await
+                    .unwrap_or(outcome);
+        }
+
         let outcome_label = match &outcome {
             LoopExit::Completed => "completed".to_string(),
             LoopExit::EndedByIssueState => "ended by issue state".to_string(),
@@ -2284,7 +2408,8 @@ async fn run_pipeline(
         match outcome {
             LoopExit::Completed => {
                 if stage.requires_approval {
-                    let next_stage_id = cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
+                    let next_stage_id =
+                        cfg.pipeline.stages.get(stage_idx + 1).map(|s| s.id.clone());
                     let auto_approved = handle_stage_approval(
                         issue_id,
                         issue,
@@ -2380,7 +2505,13 @@ async fn run_pipeline(
             // failure (AIR-4) -- same `block_issue` park, regardless of `stage.blocking`,
             // since this is the agent explicitly asking a human rather than an error.
             LoopExit::Blocked(question) => {
-                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, Some(&question)).await;
+                block_issue(
+                    snapshot,
+                    issue_id,
+                    &cfg.pipeline.blocked_state,
+                    Some(&question),
+                )
+                .await;
                 return ExitReason::Normal;
             }
             LoopExit::Error(reason) => {
@@ -2525,7 +2656,11 @@ async fn block_issue(
     blocked_state: &str,
     clarification: Option<&str>,
 ) {
-    if let Err(e) = snapshot.tracker.set_issue_state(issue_id, blocked_state).await {
+    if let Err(e) = snapshot
+        .tracker
+        .set_issue_state(issue_id, blocked_state)
+        .await
+    {
         tracing::warn!(
             issue_id = %issue_id,
             blocked_state = %blocked_state,
@@ -2599,7 +2734,13 @@ async fn handle_stage_approval(
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(issue_id = %issue_id, stage_id = %stage.id, error = %e, "failed to record pending approval; falling back to the plain blocking-stage park so the cycle doesn't silently spin");
-            block_issue(snapshot, issue_id, &cfg.pipeline.awaiting_approval_state, None).await;
+            block_issue(
+                snapshot,
+                issue_id,
+                &cfg.pipeline.awaiting_approval_state,
+                None,
+            )
+            .await;
             return false;
         }
     };
@@ -2723,6 +2864,127 @@ fn emit_test_stage_events(
             event: ev,
         });
     }
+}
+
+/// AIR-8: evaluate a `security` stage's output after its turns complete. Reads the
+/// `security_findings` artifact the stage's rubric (the built-in `security` role
+/// prompt, `roles::builtin::prompt_for("security")`) instructs the agent to write to
+/// `.symphony/security_findings.json` inside the workspace, folds in any configured
+/// deterministic scanners, and decides whether the result breaches
+/// `pipeline.security.block_on`.
+///
+/// Returns `None` when the stage should be treated as it already was (no threshold
+/// breach); `Some(LoopExit::Error(reason))` when it should instead be treated as a
+/// stage failure -- letting the existing `on_failure`/`blocking` handling in
+/// `run_pipeline` decide what that means for the cycle, exactly like a turn error
+/// would. A missing/invalid artifact is itself a failure: the stage's whole job is to
+/// produce it.
+async fn evaluate_security_stage(
+    issue_id: &str,
+    stage_id: &str,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
+    cfg: &EffectiveConfig,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) -> Option<LoopExit> {
+    let artifact_path = workspace_path
+        .join(".symphony")
+        .join("security_findings.json");
+    let raw = match std::fs::read_to_string(&artifact_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(LoopExit::Error(format!(
+                "security stage produced no .symphony/security_findings.json artifact: {e}"
+            )));
+        }
+    };
+    let mut findings: crate::security::SecurityFindings = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => {
+            return Some(LoopExit::Error(format!(
+                "security_findings artifact is not valid JSON for the expected schema: {e}"
+            )));
+        }
+    };
+    if let Err(e) = findings.validate() {
+        return Some(LoopExit::Error(format!(
+            "security_findings artifact failed validation: {e}"
+        )));
+    }
+
+    crate::security::run_scanners(
+        &cfg.pipeline.security.scanners,
+        &mut findings,
+        &cfg.workflow_dir,
+        workspace_path,
+        cfg.hook_timeout_ms,
+        container,
+    )
+    .await;
+    findings.recompute_risk();
+
+    let findings_json = serde_json::to_string(&findings).unwrap_or_default();
+    let _ = tx.send(OrchMsg::SecurityEvaluated {
+        issue_id: issue_id.to_string(),
+        stage_id: stage_id.to_string(),
+        risk: findings.risk_classification.as_str().to_string(),
+        findings_json,
+    });
+
+    if !findings.is_blocking(&cfg.pipeline.security.block_on) {
+        return None;
+    }
+
+    let threshold = cfg
+        .pipeline
+        .security
+        .block_on
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let reason = format!(
+        "security findings at or above the blocking threshold ({threshold}); overall risk: {}",
+        findings.risk_classification.as_str()
+    );
+
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let pending = crate::eventlog::pending_override(&db_path, issue_id).unwrap_or(None);
+    if let Some(over) = pending {
+        let reason = over.message.unwrap_or_default();
+        // Written synchronously, not via `tx`/`handle_msg`'s deferred event-log
+        // writer: `pending_override` must never see this same override as pending
+        // again once this function returns, or a second concurrent (or immediately
+        // re-run) evaluation could consume it twice. The `tx.send` below is purely
+        // for `/events` visibility -- the one-shot guarantee lives in this write.
+        if let Err(e) = crate::eventlog::insert_event(
+            &db_path,
+            &crate::eventlog::NewEvent {
+                issue_id: issue_id.to_string(),
+                identifier: issue_id.to_string(),
+                title: String::new(),
+                session_id: None,
+                event_type: "security_override_consumed".to_string(),
+                message: Some(reason.clone()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+        ) {
+            tracing::warn!(issue_id = %issue_id, error = %e, "failed to record security override consumption");
+        }
+        let _ = tx.send(OrchMsg::SecurityOverrideConsumed {
+            issue_id: issue_id.to_string(),
+            reason,
+        });
+        return None;
+    }
+
+    let _ = tx.send(OrchMsg::SecurityBlocked {
+        issue_id: issue_id.to_string(),
+        reason: reason.clone(),
+    });
+    Some(LoopExit::Error(reason))
 }
 
 /// Returns the turn's outcome, plus two things extracted while forwarding its event
@@ -3260,7 +3522,10 @@ mod tests {
             config: cfg,
             prompt_template: String::new(),
             tracker: Arc::from(tracker_adapter),
-            agent_backend: Arc::new(ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new())),
+            agent_backend: Arc::new(ScriptedBackend::new(
+                Arc::new(Mutex::new(0)),
+                HashMap::new(),
+            )),
             workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
         };
 
@@ -3585,6 +3850,307 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
+    // AIR-8: security stage evaluation (`evaluate_security_stage`)
+    // -----------------------------------------------------------------------------
+
+    fn write_security_artifact(workspace: &Path, severity: &str) {
+        let dir = workspace.join(".symphony");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("security_findings.json"),
+            format!(
+                r#"{{"schema_version":1,"risk_classification":"low","owasp_checklist":[
+                    {{"id":"A01:2021","name":"Broken Access Control","applicable":false,
+                     "status":"not_applicable","evidence":"no auth surface touched"}}],
+                "findings":[{{"id":"S1","severity":"{severity}","owasp_id":"A03:2021",
+                    "cwe":"CWE-89","file":"src/x.rs","line":10,"summary":"sql injection",
+                    "exploit_scenario":"...", "remediation":"..."}}],
+                "secrets_scan":{{"status":"clean","matches":[]}},
+                "dependency_scan":{{"tool":"","status":"not_run","advisories":[]}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn security_stage_blocking_finding_parks_the_issue() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-1");
+        write_security_artifact(workspace.path(), "critical");
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "blocked");
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, OrchMsg::SecurityBlocked { .. }))
+        );
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::SecurityEvaluated { risk, .. } if risk == "critical")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn security_stage_pending_override_unblocks_and_is_consumed() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-2");
+        write_security_artifact(workspace.path(), "critical");
+
+        let db_path = workflow_dir.path().join(crate::eventlog::DB_FILENAME);
+        crate::eventlog::insert_event(
+            &db_path,
+            &crate::eventlog::NewEvent {
+                issue_id: "P-SEC-2".to_string(),
+                identifier: "P-SEC-2".to_string(),
+                title: "Test issue".to_string(),
+                session_id: None,
+                event_type: "security_override".to_string(),
+                message: Some("accepted risk: fix scheduled next sprint".to_string()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+        )
+        .unwrap();
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-2".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed[0].normalized_state(),
+            "todo",
+            "an overridden block must not park the issue"
+        );
+
+        let msgs = drain(rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, OrchMsg::SecurityBlocked { .. }))
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::SecurityOverrideConsumed { reason, .. } if reason.contains("fix scheduled"))
+        ));
+
+        // One-shot: a second evaluation with the same pending state must not still be
+        // able to use the already-consumed override.
+        assert!(
+            crate::eventlog::pending_override(&db_path, "P-SEC-2")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn security_stage_clean_findings_do_not_block() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-3");
+        write_security_artifact(workspace.path(), "low");
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-3".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "todo");
+    }
+
+    #[tokio::test]
+    async fn security_stage_missing_artifact_is_treated_as_a_stage_failure() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-4");
+        // Deliberately no `.symphony/security_findings.json` written.
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-4".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-4".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "blocked");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert!(
+            stages
+                .iter()
+                .any(|(kind, id)| *kind == "finished" && *id == "security")
+        );
+    }
+
+    // -----------------------------------------------------------------------------
     // BUG-3: plan usage-limit ("session limit") handling
     // -----------------------------------------------------------------------------
 
@@ -3906,7 +4472,10 @@ mod tests {
         // Stopped right after the first turn of the first stage -- never even
         // finished out that stage's own turn budget (3), let alone started the
         // second stage.
-        assert_eq!(stages, vec![("started", "requirements"), ("finished", "requirements")]);
+        assert_eq!(
+            stages,
+            vec![("started", "requirements"), ("finished", "requirements")]
+        );
         assert!(msgs.iter().any(
             |m| matches!(m, OrchMsg::StageFinished { outcome, .. } if outcome.contains("blocked: clarification"))
         ));
@@ -3967,7 +4536,10 @@ mod tests {
             .fetch_issues_by_ids(&["P-7".to_string()])
             .await
             .unwrap();
-        assert_eq!(refreshed[0].state, "todo", "non-blocking clarification must not park the issue");
+        assert_eq!(
+            refreshed[0].state, "todo",
+            "non-blocking clarification must not park the issue"
+        );
 
         let msgs = drain(rx).await;
         let stages = stage_events(&msgs);
@@ -4891,7 +5463,10 @@ mod tests {
     fn round_exceeds_limit_flips_once_the_next_round_would_pass_the_cap() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("symphony.db");
-        assert!(!round_exceeds_limit(&db, "1", 2), "round 1 of 2 is within the cap");
+        assert!(
+            !round_exceeds_limit(&db, "1", 2),
+            "round 1 of 2 is within the cap"
+        );
         crate::eventlog::record_rework_round(
             &db,
             &crate::eventlog::NewReworkRound {
@@ -4905,7 +5480,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!round_exceeds_limit(&db, "1", 2), "round 2 of 2 is still within the cap");
+        assert!(
+            !round_exceeds_limit(&db, "1", 2),
+            "round 2 of 2 is still within the cap"
+        );
         crate::eventlog::record_rework_round(
             &db,
             &crate::eventlog::NewReworkRound {
@@ -4919,7 +5497,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(round_exceeds_limit(&db, "1", 2), "round 3 of 2 exceeds the cap");
+        assert!(
+            round_exceeds_limit(&db, "1", 2),
+            "round 3 of 2 exceeds the cap"
+        );
     }
 
     /// AIR-7 acceptance criterion: the stage produces a schema-valid `review_findings`

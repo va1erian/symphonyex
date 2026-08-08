@@ -419,6 +419,64 @@ pub fn latest_message_by_type(
     Ok(out)
 }
 
+/// Insert a single event outside the dedicated writer task's channel (`spawn_writer`).
+/// Used by callers that don't have a running orchestrator's `mpsc::UnboundedSender` to
+/// hand a row to -- today, `status.rs`'s security-override POST handler. WAL mode
+/// tolerates this occasional second writer fine at the traffic volume a human clicking
+/// a button produces; the dedicated channel exists to keep the orchestrator's own hot
+/// per-turn event stream off the request path, not because concurrent writers are
+/// unsafe.
+pub fn insert_event(db_path: &Path, ev: &NewEvent) -> rusqlite::Result<()> {
+    let conn = open(db_path)?;
+    insert(&conn, ev)
+}
+
+/// The most recent event of `event_type` per issue -- one row per `issue_id`, newest
+/// first. General enough for any "what's the latest X" dashboard view keyed by issue
+/// (today: `security_findings`; AIR-5's `/approvals` page is the obvious next user).
+pub fn latest_events_by_type(db_path: &Path, event_type: &str) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.issue_id, e.identifier, e.title, e.session_id, e.event_type, \
+            e.importance, e.message, e.input_tokens, e.output_tokens, e.total_tokens, e.created_at \
+         FROM events e \
+         INNER JOIN (SELECT issue_id, MAX(id) AS maxid FROM events WHERE event_type = ?1 GROUP BY issue_id) m \
+         ON e.issue_id = m.issue_id AND e.id = m.maxid \
+         ORDER BY e.id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![event_type], row_from)?;
+    rows.collect()
+}
+
+/// A `security_override` event for `issue_id` that hasn't yet been consumed by a
+/// `security_override_consumed` event -- i.e. an override a human recorded that the
+/// security stage hasn't applied yet. One-shot: `orchestrator::run_pipeline` records
+/// `security_override_consumed` the moment it uses one, so the same override can't
+/// silently keep suppressing blocking on every future re-run.
+pub fn pending_override(db_path: &Path, issue_id: &str) -> rusqlite::Result<Option<EventRow>> {
+    let conn = open(db_path)?;
+    conn.query_row(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, importance, \
+            message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events \
+         WHERE issue_id = ?1 AND event_type = 'security_override' \
+           AND id > COALESCE( \
+               (SELECT MAX(id) FROM events WHERE issue_id = ?1 AND event_type = 'security_override_consumed'), \
+               0) \
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![issue_id],
+        row_from,
+    )
+    .map(Some)
+    .or_else(|e| {
+        if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    })
+}
+
 pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
@@ -756,7 +814,11 @@ mod tests {
         put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
         let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
         assert_eq!(row.content, "[{\"id\":\"R1\"}]");
-        assert!(get_artifact(&db, "1", "acceptance_criteria").unwrap().is_none());
+        assert!(
+            get_artifact(&db, "1", "acceptance_criteria")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -764,7 +826,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("events.db");
         put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"}]").unwrap();
-        put_artifact(&db, "1", "requirements", "[{\"id\":\"R1\"},{\"id\":\"R2\"}]").unwrap();
+        put_artifact(
+            &db,
+            "1",
+            "requirements",
+            "[{\"id\":\"R1\"},{\"id\":\"R2\"}]",
+        )
+        .unwrap();
         let row = get_artifact(&db, "1", "requirements").unwrap().unwrap();
         assert_eq!(row.content, "[{\"id\":\"R1\"},{\"id\":\"R2\"}]");
     }
@@ -778,7 +846,10 @@ mod tests {
         put_artifact(&db, "2", "requirements", "[\"other\"]").unwrap();
 
         assert_eq!(
-            get_artifact(&db, "1", "requirements").unwrap().unwrap().content,
+            get_artifact(&db, "1", "requirements")
+                .unwrap()
+                .unwrap()
+                .content,
             "[\"r\"]"
         );
         assert_eq!(
@@ -789,7 +860,10 @@ mod tests {
             "[\"ac\"]"
         );
         assert_eq!(
-            get_artifact(&db, "2", "requirements").unwrap().unwrap().content,
+            get_artifact(&db, "2", "requirements")
+                .unwrap()
+                .unwrap()
+                .content,
             "[\"other\"]"
         );
     }
@@ -886,5 +960,77 @@ mod tests {
             serde_json::from_str(rows[1].message.as_deref().unwrap()).unwrap();
         assert_eq!(earliest["summary"], "first pass");
         assert_eq!(earliest["escalated"], false);
+    }
+
+    #[tokio::test]
+    async fn insert_event_is_readable_by_recent_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        let rows = recent_events(&db, &EventFilter::default(), 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "security_override");
+    }
+
+    #[tokio::test]
+    async fn latest_events_by_type_returns_one_row_per_issue_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("first".to_string()),
+                ..new_event("1", "security_findings")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("second".to_string()),
+                ..new_event("1", "security_findings")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("other-issue".to_string()),
+                ..new_event("2", "security_findings")
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = latest_events_by_type(&db, "security_findings").unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert_eq!(issue1.message.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn pending_override_is_none_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        assert!(pending_override(&db, "1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_override_finds_an_unconsumed_override_and_ignores_a_consumed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        assert!(pending_override(&db, "1").unwrap().is_some());
+
+        insert_event(&db, &new_event("1", "security_override_consumed")).unwrap();
+        assert!(
+            pending_override(&db, "1").unwrap().is_none(),
+            "a consumed override must not still be reported as pending"
+        );
+
+        // A second override recorded after the consumption is a fresh, unconsumed one.
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        assert!(pending_override(&db, "1").unwrap().is_some());
     }
 }

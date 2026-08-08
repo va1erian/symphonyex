@@ -143,7 +143,12 @@ fn json_array_or_error(value: &Value, field: &str) -> Result<Vec<Value>, ToolRes
 /// its required string/array fields) -- schema conformance for the artifact itself is
 /// enforced here so a malformed entry is rejected before it's ever persisted, rather
 /// than trusting the agent's JSON blindly.
-fn execute_pipeline_tool(ctx: &PipelineToolCtx, name: &str, arguments: Value, issue_id: &str) -> ToolResult {
+fn execute_pipeline_tool(
+    ctx: &PipelineToolCtx,
+    name: &str,
+    arguments: Value,
+    issue_id: &str,
+) -> ToolResult {
     match name {
         "record_requirements" => {
             let items = match json_array_or_error(&arguments, "requirements") {
@@ -185,14 +190,23 @@ fn execute_pipeline_tool(ctx: &PipelineToolCtx, name: &str, arguments: Value, is
                         ));
                     }
                 }
-                if item.get("requirement_ids").and_then(|v| v.as_array()).is_none() {
+                if item
+                    .get("requirement_ids")
+                    .and_then(|v| v.as_array())
+                    .is_none()
+                {
                     return ToolResult::error(format!(
                         "acceptance_criteria[{i}] is missing required array field 'requirement_ids'"
                     ));
                 }
             }
             let content = Value::Array(items).to_string();
-            match crate::eventlog::put_artifact(&ctx.db_path, issue_id, "acceptance_criteria", &content) {
+            match crate::eventlog::put_artifact(
+                &ctx.db_path,
+                issue_id,
+                "acceptance_criteria",
+                &content,
+            ) {
                 Ok(()) => ToolResult::ok("Recorded acceptance criteria.".to_string()),
                 Err(e) => ToolResult::error(format!("failed to record acceptance criteria: {e}")),
             }
