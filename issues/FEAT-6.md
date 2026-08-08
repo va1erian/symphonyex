@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-6
 title: Render artifact content by content_type on /artifacts/{id} instead of a raw dump
-state: todo
+state: done
 priority: 3
 labels: [dashboard, ux]
 dispatchable: true
@@ -52,16 +52,16 @@ using a raw `<pre>` dump:
 
 ## Acceptance criteria
 
-- [ ] A `content_type: application/json` artifact renders pretty-printed, readable JSON
+- [x] A `content_type: application/json` artifact renders pretty-printed, readable JSON
       instead of an unformatted single-line/wrapped dump.
-- [ ] A `content_type: text/markdown` artifact renders as formatted HTML (headings,
+- [x] A `content_type: text/markdown` artifact renders as formatted HTML (headings,
       lists, tables, code blocks), matching `/evidence`'s existing rendering quality.
-- [ ] A non-JSON, non-Markdown artifact (or a JSON artifact with genuinely malformed
+- [x] A non-JSON, non-Markdown artifact (or a JSON artifact with genuinely malformed
       content) still renders exactly as it does today — no regression, no page error.
-- [ ] Unit tests extending `artifact_raw_page`'s existing coverage (or a new test module
+- [x] Unit tests extending `artifact_raw_page`'s existing coverage (or a new test module
       if none exists yet) for both the JSON and Markdown rendering paths, plus the
       malformed-JSON fallback.
-- [ ] `cargo test` and `cargo clippy --all-targets` stay clean.
+- [x] `cargo test` and `cargo clippy --all-targets` stay clean.
 
 ## Out of scope
 

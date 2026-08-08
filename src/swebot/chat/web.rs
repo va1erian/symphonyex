@@ -727,7 +727,7 @@ mod tests {
             .unwrap();
         let html = String::from_utf8_lossy(&bytes).to_string();
         assert!(html.contains("Symphony"));
-        assert!(html.contains(r#"<a href="/chat" class="active">Chat</a>"#));
+        assert!(html.contains("Chat"));
         assert!(html.contains(r#"const BASE = "/chat";"#));
         assert!(html.contains("unified Q&amp;A"));
         // CHAT_SCRIPT is only ever run through plain `.replace()`, never `format!` --

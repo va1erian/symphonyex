@@ -269,10 +269,12 @@ const NAV_LINKS: &[web::NavLink] = &[
     web::NavLink {
         href: "/",
         label: "Dashboard",
+        icon: Some("layout-dashboard"),
     },
     web::NavLink {
         href: "/register",
         label: "Register",
+        icon: Some("circle-plus"),
     },
 ];
 

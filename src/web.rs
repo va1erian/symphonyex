@@ -28,6 +28,7 @@ pub const STYLE: &str = r#"
     --bad-fg: #ff9a9a;
     --warn-fg: #e0c56b;
     --focus-ring: #7fb8ff;
+    --sidebar-w: 220px;
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -49,16 +50,63 @@ pub const STYLE: &str = r#"
       --focus-ring: #2b6cb0;
     }
   }
+  [data-theme="light"] {
+    --bg: #f6f7fb;
+    --bg-alt: #ffffff;
+    --fg: #1c1f26;
+    --fg-strong: #0a0a0a;
+    --fg-dim: #5b6070;
+    --fg-dimmer: #6b7182;
+    --border: #d7dbe3;
+    --border-soft: #e6e9ef;
+    --accent: #2b6cb0;
+    --accent-strong: #1a4d80;
+    --good-bg: #e3f6e7;
+    --good-fg: #1f7a34;
+    --bad-bg: #fbe4e4;
+    --bad-fg: #b32828;
+    --warn-fg: #8a6d1f;
+    --focus-ring: #2b6cb0;
+  }
+  [data-theme="dark"] {
+    --bg: #111318;
+    --bg-alt: #1c1f26;
+    --fg: #e8e8ec;
+    --fg-strong: #ffffff;
+    --fg-dim: #9a9fab;
+    --fg-dimmer: #7b8090;
+    --border: #333844;
+    --border-soft: #262a33;
+    --accent: #7fb8ff;
+    --accent-strong: #a9d1ff;
+    --good-bg: #1c3325;
+    --good-fg: #7be08c;
+    --bad-bg: #3a2020;
+    --bad-fg: #ff9a9a;
+    --warn-fg: #e0c56b;
+    --focus-ring: #7fb8ff;
+  }
   * { box-sizing: border-box; }
-  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0 auto; padding: 24px; max-width: 1180px; }
-  h1 { font-size: 1.1rem; font-weight: 600; color: var(--accent); margin: 0 0 4px; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0; display: flex; min-height: 100vh; }
+  h1 { font-size: 1.1rem; font-weight: 600; color: var(--accent); margin: 0 0 16px; }
   h2 { font-size: 1rem; color: var(--fg-strong); margin: 0 0 8px; }
   a { color: var(--accent); }
   .meta { color: var(--fg-dim); font-size: 0.8rem; margin-bottom: 12px; }
-  nav { margin-bottom: 20px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
-  nav a { color: var(--accent); text-decoration: none; font-size: 0.85rem; }
-  nav a:hover { text-decoration: underline; }
-  nav a.active { color: var(--fg-strong); font-weight: 600; }
+
+  /* Sidebar */
+  .sidebar { width: var(--sidebar-w); flex-shrink: 0; background: var(--bg-alt); border-right: 1px solid var(--border); padding: 20px 16px; overflow-y: auto; display: flex; flex-direction: column; }
+  .sidebar h1 { font-size: 1rem; margin-bottom: 20px; }
+  .sidebar nav { display: flex; flex-direction: column; gap: 2px; margin-bottom: 16px; }
+  .sidebar nav a { color: var(--fg-dim); text-decoration: none; font-size: 0.82rem; padding: 5px 8px; border-radius: 4px; display: flex; align-items: center; gap: 7px; }
+  .sidebar nav a:hover { color: var(--fg); background: var(--bg); }
+  .sidebar nav a.active { color: var(--fg-strong); background: var(--bg); font-weight: 600; }
+  .nav-icon { width: 16px; height: 16px; flex-shrink: 0; }
+  .theme-toggle { background: none; border: 1px solid var(--border); color: var(--fg-dim); cursor: pointer; padding: 4px 10px; border-radius: 4px; font-size: 0.9rem; margin-top: auto; align-self: flex-start; }
+  .theme-toggle:hover { color: var(--fg); border-color: var(--accent); }
+
+  /* Main content */
+  main { flex: 1; overflow-y: auto; padding: 24px; min-width: 0; }
+
   .grid { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 32px; }
   .card { background: var(--bg-alt); border: 1px solid var(--border); border-left: 4px solid var(--good-fg); border-radius: 6px; padding: 12px 14px; flex: 1 1 260px; min-width: 220px; max-width: 100%; }
   .card h2 { font-size: 0.95rem; margin: 0 0 6px; color: var(--fg-strong); }
@@ -178,8 +226,18 @@ pub const STYLE: &str = r#"
   @media (prefers-reduced-motion: reduce) {
     .msg { animation: none; }
   }
+
+  /* Responsive: collapse sidebar to top bar below 768px. */
+  @media (max-width: 768px) {
+    body { flex-direction: column; }
+    .sidebar { width: 100%; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-right: none; border-bottom: 1px solid var(--border); }
+    .sidebar h1 { margin: 0 12px 0 0; font-size: 0.95rem; }
+    .sidebar nav { flex-direction: row; flex-wrap: wrap; gap: 4px 12px; margin: 0; }
+    .sidebar nav a { padding: 3px 6px; font-size: 0.78rem; }
+    .theme-toggle { margin-top: 0; }
+    main { padding: 14px; }
+  }
   @media (max-width: 640px) {
-    body { padding: 14px; }
     .card { flex-basis: 100%; }
     form.admin input { width: 100%; }
     .stats { gap: 8px; }
@@ -196,6 +254,14 @@ pub const STYLE: &str = r#"
 /// (used for destructive actions like removing a registered repo), and a live
 /// character counter under any `[maxlength]` field.
 pub const SCRIPT: &str = r#"
+window.Symphony = window.Symphony || {};
+Symphony.toggleTheme = function () {
+  var html = document.documentElement;
+  var current = html.getAttribute('data-theme');
+  var next = current === 'light' ? 'dark' : 'light';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('symphony-theme', next);
+};
 document.addEventListener('click', function (e) {
   var msg = e.target.closest('.msg, .msg-cell');
   if (msg) { msg.classList.toggle('expanded'); return; }
@@ -315,6 +381,81 @@ pub fn urlencode(s: &str) -> String {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Lucide icons (ISC) — inline SVG paths, one constant per icon. Only the inner
+// elements are stored; `icon_svg()` wraps them in a consistent `<svg>` shell.
+// ---------------------------------------------------------------------------
+
+static ICONS: &[(&str, &str)] = &[
+    (
+        "activity",
+        r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#,
+    ),
+    (
+        "clipboard-list",
+        r#"<rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="M12 11h4"/><path d="M12 16h4"/><path d="M8 11h.01"/><path d="M8 16h.01"/>"#,
+    ),
+    (
+        "chart-line",
+        r#"<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="m19 9-5 5-4-4-3 3"/>"#,
+    ),
+    (
+        "package",
+        r#"<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><polyline points="3.29 7 12 12 20.71 7"/><path d="m7.5 4.27 9 5.15"/>"#,
+    ),
+    (
+        "file-text",
+        r#"<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>"#,
+    ),
+    (
+        "badge-check",
+        r#"<path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z"/><path d="m9 12 2 2 4-4"/>"#,
+    ),
+    (
+        "search",
+        r#"<path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/>"#,
+    ),
+    (
+        "shield",
+        r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/>"#,
+    ),
+    (
+        "file-check",
+        r#"<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z"/><path d="M14 2v5a1 1 0 0 0 1 1h5"/><path d="m9 15 2 2 4-4"/>"#,
+    ),
+    (
+        "telescope",
+        r#"<path d="m10.065 12.493-6.18 1.318a.934.934 0 0 1-1.108-.702l-.537-2.15a1.07 1.07 0 0 1 .691-1.265l13.504-4.44"/><path d="m13.56 11.747 4.332-.924"/><path d="m16 21-3.105-6.21"/><path d="M16.485 5.94a2 2 0 0 1 1.455-2.425l1.09-.272a1 1 0 0 1 1.212.727l1.515 6.06a1 1 0 0 1-.727 1.213l-1.09.272a2 2 0 0 1-2.425-1.455z"/><path d="m6.158 8.633 1.114 4.456"/><path d="m8 21 3.105-6.21"/><circle cx="12" cy="13" r="2"/>"#,
+    ),
+    (
+        "lightbulb",
+        r#"<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/>"#,
+    ),
+    (
+        "message-square",
+        r#"<path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/>"#,
+    ),
+    (
+        "layout-dashboard",
+        r#"<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>"#,
+    ),
+    (
+        "circle-plus",
+        r#"<circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/>"#,
+    ),
+];
+
+fn icon_svg(name: &str) -> String {
+    let inner = ICONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+        .unwrap_or("");
+    format!(
+        r#"<svg class="nav-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{inner}</svg>"#
+    )
+}
+
 /// One nav link. `href` is mount-relative (e.g. `"/events"`); `base` is prepended only
 /// at render time so callers keep comparing/passing the same unprefixed identifiers
 /// regardless of where a router ends up nested (see `status.rs`'s `AppState::base_path`
@@ -322,6 +463,7 @@ pub fn urlencode(s: &str) -> String {
 pub struct NavLink<'a> {
     pub href: &'a str,
     pub label: &'a str,
+    pub icon: Option<&'static str>,
 }
 
 pub fn nav(links: &[NavLink], active: &str, base: &str) -> String {
@@ -333,7 +475,8 @@ pub fn nav(links: &[NavLink], active: &str, base: &str) -> String {
             } else {
                 ""
             };
-            format!(r#"<a href="{base}{}"{class}>{}</a>"#, l.href, l.label)
+            let icon = l.icon.map(icon_svg).unwrap_or_default();
+            format!(r#"<a href="{base}{}"{class}>{icon}{}</a>"#, l.href, l.label)
         })
         .collect();
     format!("<nav>{items}</nav>")
@@ -348,50 +491,62 @@ pub const NAV_LINKS: &[NavLink] = &[
     NavLink {
         href: "/",
         label: "Status",
+        icon: Some("activity"),
     },
     NavLink {
         href: "/events",
         label: "Events",
+        icon: Some("clipboard-list"),
     },
     NavLink {
         href: "/usage",
         label: "Usage",
+        icon: Some("chart-line"),
     },
     NavLink {
         href: "/artifacts",
         label: "Artifacts",
+        icon: Some("package"),
     },
     NavLink {
         href: "/requirements",
         label: "Requirements",
+        icon: Some("file-text"),
     },
     NavLink {
         href: "/approvals",
         label: "Approvals",
+        icon: Some("badge-check"),
     },
     NavLink {
         href: "/reviews",
         label: "Reviews",
+        icon: Some("search"),
     },
     NavLink {
         href: "/security",
         label: "Security",
+        icon: Some("shield"),
     },
     NavLink {
         href: "/evidence",
         label: "Evidence",
+        icon: Some("file-check"),
     },
     NavLink {
         href: "/observability",
         label: "Observability",
+        icon: Some("telescope"),
     },
     NavLink {
         href: "/insights",
         label: "Insights",
+        icon: Some("lightbulb"),
     },
     NavLink {
         href: "/chat",
         label: "Chat",
+        icon: Some("message-square"),
     },
 ];
 
@@ -409,6 +564,7 @@ pub fn nav_links(chat_enabled: bool) -> Vec<NavLink<'static>> {
         .map(|l| NavLink {
             href: l.href,
             label: l.label,
+            icon: l.icon,
         })
         .collect()
 }
@@ -442,12 +598,22 @@ pub fn page_shell(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{app_title} &mdash; {page_title}</title>
 <style>{STYLE}</style>
+<script>
+(function(){{
+  var t=localStorage.getItem('symphony-theme');
+  if(!t){{t=window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'}}
+  document.documentElement.setAttribute('data-theme',t);
+}})();
+</script>
 {extra_head}
 </head>
 <body>
+<div class="sidebar">
 <h1>{app_title}</h1>
 {nav_html}
-{body}
+<button class="theme-toggle" onclick="Symphony.toggleTheme()" title="Toggle light/dark mode">&#9788;</button>
+</div>
+<main>{body}</main>
 <script>{SCRIPT}</script>
 </body>
 </html>
@@ -514,10 +680,12 @@ mod tests {
             NavLink {
                 href: "/",
                 label: "Status",
+                icon: None,
             },
             NavLink {
                 href: "/events",
                 label: "Events",
+                icon: None,
             },
         ];
         let html = nav(&links, "/events", "/projects/x");

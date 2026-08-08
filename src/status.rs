@@ -1798,16 +1798,49 @@ fn artifact_row(r: &artifacts::ArtifactRow, base: &str) -> String {
     )
 }
 
+#[derive(Deserialize, Default)]
+struct ArtifactRawQuery {
+    raw: Option<String>,
+}
+
 async fn artifact_raw_page(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(q): Query<ArtifactRawQuery>,
 ) -> Result<Html<String>, StatusCode> {
     let db_path = state.eventlog_db_path();
     let row = artifacts::find_by_id(&db_path, &id).ok_or(StatusCode::NOT_FOUND)?;
     let base = state.base_path.as_str();
-    let content = artifacts::read_content(&state.workflow_dir, &row)
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_else(|e| format!("(could not read artifact content: {e})"));
+    let raw_bytes =
+        artifacts::read_content(&state.workflow_dir, &row).map_err(|_| StatusCode::NOT_FOUND)?;
+    let content = String::from_utf8_lossy(&raw_bytes).into_owned();
+    let raw = q.raw.as_deref() == Some("1") || q.raw.as_deref() == Some("true");
+
+    let id_link = urlencode(&row.id);
+    let toggle_link = if raw {
+        format!("<a href=\"{base}/artifacts/{id_link}\">View rendered</a>")
+    } else {
+        format!("<a href=\"{base}/artifacts/{id_link}?raw=1\">View raw</a>")
+    };
+
+    let rendered = if raw {
+        format!("<pre class=\"table-wrap\">{}</pre>", escape(&content))
+    } else if row.content_type.contains("json") {
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => {
+                let pretty = serde_json::to_string_pretty(&v).unwrap_or_else(|_| content.clone());
+                format!("<pre class=\"table-wrap\">{}</pre>", escape(&pretty))
+            }
+            Err(_) => {
+                format!("<pre class=\"table-wrap\">{}</pre>", escape(&content))
+            }
+        }
+    } else if row.content_type.contains("markdown") {
+        let html = render_markdown_html(&content);
+        format!("<div class=\"post-body\">{html}</div>")
+    } else {
+        format!("<pre class=\"table-wrap\">{}</pre>", escape(&content))
+    };
 
     let body = format!(
         r#"<div class="meta">
@@ -1815,12 +1848,12 @@ async fn artifact_raw_page(
   <div class="row"><b>issue</b> <a href="{base}/artifacts?cycle={cycle_link}">{issue}</a></div>
   <div class="row"><b>stage</b> {stage}</div>
   <div class="row"><b>kind</b> {kind}</div>
-  <div class="row"><b>content type</b> {content_type}</div>
+  <div class="row"><b>content type</b> {content_type} &middot; {toggle_link}</div>
   <div class="row"><b>sha256</b> {sha}</div>
   <div class="row"><b>recorded</b> {created}</div>
   <div class="row"><b>summary</b> {summary}</div>
 </div>
-<pre class="table-wrap">{content}</pre>"#,
+{rendered}"#,
         id = escape(&row.id),
         base = base,
         cycle_link = urlencode(&row.cycle_id),
@@ -1828,10 +1861,11 @@ async fn artifact_raw_page(
         stage = escape(row.stage_id.as_deref().unwrap_or("-")),
         kind = escape(&row.kind),
         content_type = escape(&row.content_type),
+        toggle_link = toggle_link,
         sha = escape(&row.sha256),
         created = escape(&row.created_at),
         summary = escape(&row.summary),
-        content = escape(&content),
+        rendered = rendered,
     );
     Ok(Html(page_shell(
         &format!("artifact {}", row.id),
@@ -3077,16 +3111,21 @@ fn verdict_badge(v: Verdict) -> String {
 /// `release::render_markdown`'s own Markdown -- already redacted -- and converts it
 /// with `pulldown-cmark` rather than hand-rolling a second HTML renderer (see
 /// `release.rs`'s own doc comment: "reuse pulldown-cmark only for HTML views").
+fn render_markdown_html(markdown: &str) -> String {
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    let parser = pulldown_cmark::Parser::new_ext(markdown, options);
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, parser);
+    html
+}
+
 fn render_evidence_content(bundle: &EvidenceBundle) -> String {
     let verdict = release::compute_verdict(bundle);
     let matrix = release::build_traceability_matrix(bundle);
     let markdown =
         release::render_markdown(bundle, verdict, &matrix, &std::collections::BTreeMap::new());
-    let mut options = pulldown_cmark::Options::empty();
-    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
-    let parser = pulldown_cmark::Parser::new_ext(&markdown, options);
-    let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, parser);
+    let html = render_markdown_html(&markdown);
     format!(
         r#"<div class="row">{badge}</div>
 <div class="post-body">{html}</div>"#,
@@ -4771,5 +4810,199 @@ mod tests {
             .unwrap();
         let body = resp.text().await.unwrap();
         assert!(body.contains("Rescan open PRs now"));
+    }
+
+    // ── FEAT-6: artifact_raw_page content-type rendering ──
+
+    fn insert_test_artifact(workflow_dir: &Path, id: &str, content_type: &str, content: &[u8]) {
+        let db = workflow_dir.join(eventlog::DB_FILENAME);
+        let conn = eventlog::open(&db).unwrap();
+        let relative = format!(".symphony/cycles/test-cycle/{id}");
+        let full = workflow_dir.join(&relative);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, content).unwrap();
+        conn.execute(
+            "INSERT INTO artifacts (id, cycle_id, issue_identifier, stage_id, kind, \
+             content_type, path, sha256, created_at, summary) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                id,
+                "test-cycle",
+                "test",
+                Some("plan"),
+                "plan",
+                content_type,
+                relative,
+                "abc123",
+                "2026-01-01T00:00:00Z",
+                "test summary",
+            ],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn artifact_raw_page_renders_json_pretty_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        insert_test_artifact(
+            dir.path(),
+            "plan-abc",
+            "application/json",
+            br#"{"name":"test","nested":{"key":"val"}}"#,
+        );
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) = artifact_raw_page(
+            State(state),
+            AxumPath("plan-abc".to_string()),
+            Query(ArtifactRawQuery { raw: None }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            body.contains("&quot;name&quot;: &quot;test&quot;"),
+            "pretty-printed: {body}"
+        );
+        assert!(
+            body.contains("&quot;nested&quot;"),
+            "nested present: {body}"
+        );
+        assert!(body.contains("View raw"), "raw toggle link: {body}");
+    }
+
+    #[tokio::test]
+    async fn artifact_raw_page_renders_markdown_as_html() {
+        let dir = tempfile::tempdir().unwrap();
+        insert_test_artifact(
+            dir.path(),
+            "plan-md",
+            "text/markdown",
+            b"# Hello\n\nA **bold** paragraph.",
+        );
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) = artifact_raw_page(
+            State(state),
+            AxumPath("plan-md".to_string()),
+            Query(ArtifactRawQuery { raw: None }),
+        )
+        .await
+        .unwrap();
+        assert!(body.contains("<h1>Hello</h1>"), "md heading: {body}");
+        assert!(body.contains("<strong>bold</strong>"), "md bold: {body}");
+        assert!(body.contains("post-body"), "post-body class: {body}");
+    }
+
+    #[tokio::test]
+    async fn artifact_raw_page_falls_back_to_raw_for_unknown_content_type() {
+        let dir = tempfile::tempdir().unwrap();
+        insert_test_artifact(dir.path(), "plan-txt", "text/plain", b"just plain text");
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) = artifact_raw_page(
+            State(state),
+            AxumPath("plan-txt".to_string()),
+            Query(ArtifactRawQuery { raw: None }),
+        )
+        .await
+        .unwrap();
+        assert!(body.contains("<pre class=\"table-wrap\">"), "{body}");
+        assert!(body.contains("just plain text"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn artifact_raw_page_falls_back_to_raw_when_json_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        insert_test_artifact(
+            dir.path(),
+            "plan-bad",
+            "application/json",
+            b"not valid json {{{",
+        );
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) = artifact_raw_page(
+            State(state),
+            AxumPath("plan-bad".to_string()),
+            Query(ArtifactRawQuery { raw: None }),
+        )
+        .await
+        .unwrap();
+        // Should still render without error, just as raw dump
+        assert!(
+            body.contains("not valid json"),
+            "raw content present: {body}"
+        );
+        assert!(
+            !body.contains("  \""),
+            "should not be pretty-printed: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_raw_page_raw_param_shows_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        insert_test_artifact(
+            dir.path(),
+            "plan-raw",
+            "application/json",
+            br#"{"a":1,"b":2}"#,
+        );
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) = artifact_raw_page(
+            State(state),
+            AxumPath("plan-raw".to_string()),
+            Query(ArtifactRawQuery {
+                raw: Some("1".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            body.contains("{&quot;a&quot;:1,&quot;b&quot;:2}"),
+            "raw unformatted JSON: {body}"
+        );
+        assert!(body.contains("View rendered"), "toggle back: {body}");
     }
 }
