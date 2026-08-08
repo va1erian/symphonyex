@@ -10,6 +10,7 @@ mod envsub;
 mod eventlog;
 mod frontmatter;
 mod hooks;
+mod insights;
 mod mcp;
 mod metrics;
 mod observability;
@@ -128,6 +129,21 @@ enum Command {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+
+    /// Print the roadmap §11 success-measure metrics (`src/insights`) computed from
+    /// `symphony.db` for offline reporting -- the same computation and numbers backing
+    /// `/metrics` and `/insights` on the live dashboard.
+    Metrics {
+        /// Path to WORKFLOW.md. Defaults to ./WORKFLOW.md.
+        workflow_path: Option<PathBuf>,
+        /// Only `json` is supported today; kept as a flag (rather than hardcoded) so a
+        /// future Prometheus-text `--format prom` output can reuse this same subcommand.
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// RFC 3339 timestamp (e.g. `2026-01-01T00:00:00Z`); omit for all of history.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +206,11 @@ async fn main() -> std::process::ExitCode {
             .await;
         }
         Some(Command::Daemon { action }) => return run_daemon_command(action).await,
+        Some(Command::Metrics {
+            workflow_path,
+            format,
+            since,
+        }) => return run_metrics_command(workflow_path, &format, since.as_deref()).await,
         Some(Command::Serve { port, data_dir }) => {
             let data_dir = data_dir.unwrap_or_else(|| PathBuf::from("symphony-data"));
             return match service::run(port, data_dir).await {
@@ -255,6 +276,52 @@ async fn run_daemon_command(action: DaemonAction) -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "symphony daemon command failed");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_metrics_command(
+    workflow_path: Option<PathBuf>,
+    format: &str,
+    since: Option<&str>,
+) -> std::process::ExitCode {
+    if format != "json" {
+        tracing::error!(
+            format,
+            "unsupported --format; only \"json\" is supported today"
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    let since = match since.map(|s| s.parse::<chrono::DateTime<chrono::Utc>>()) {
+        Some(Ok(dt)) => Some(dt),
+        Some(Err(e)) => {
+            tracing::error!(since, error = %e, "--since must be an RFC 3339 timestamp");
+            return std::process::ExitCode::FAILURE;
+        }
+        None => None,
+    };
+
+    let path = workflow::resolve_workflow_path(workflow_path.as_deref());
+    let workflow_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let db_path = workflow_dir.join(eventlog::DB_FILENAME);
+
+    match insights::compute(&db_path, since) {
+        Ok(report) => match serde_json::to_string_pretty(&report) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize insights report");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, path = %db_path.display(), "failed to compute insights");
             std::process::ExitCode::FAILURE
         }
     }

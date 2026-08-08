@@ -16,6 +16,7 @@
 //! mode handles concurrent readers fine at this traffic volume) -- no connection pool,
 //! no `Arc<Mutex<Connection>>`, matching "keep it basic."
 
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -553,6 +554,36 @@ pub fn pending_override(db_path: &Path, issue_id: &str) -> rusqlite::Result<Opti
     })
 }
 
+/// All events at or after `since` (or all of history when `None`), oldest first --
+/// feeds `insights::compute` (`src/insights/mod.rs`), which needs the raw ordered
+/// stream (not a pre-aggregated summary like `usage_summary`/`usage_by_issue` above)
+/// to reconstruct per-issue cycles and overlaps. Unlike `recent_events`, this ignores
+/// `importance`: a metric computation needs every row, not just what a human browsing
+/// `/events` would want to see by default.
+pub fn events_in_period(
+    db_path: &Path,
+    since: Option<&DateTime<Utc>>,
+) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut sql = "SELECT id, issue_id, identifier, title, session_id, event_type, \
+        importance, message, input_tokens, output_tokens, total_tokens, created_at \
+        FROM events"
+        .to_string();
+    if since.is_some() {
+        sql.push_str(" WHERE created_at >= ?1");
+    }
+    sql.push_str(" ORDER BY id ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    if let Some(since) = since {
+        stmt.query_map([since.to_rfc3339()], row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    } else {
+        stmt.query_map([], row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    }
+}
+
 pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
     let conn = open(db_path)?;
     let mut stmt = conn.prepare(
@@ -921,6 +952,39 @@ mod tests {
 
         let rows = recent_events_of_types(&db, &[], 50).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_in_period_returns_all_rows_oldest_first_when_since_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "turn_started")).unwrap();
+        insert(&conn, &new_event("2", "worker_exit")).unwrap();
+        drop(conn);
+
+        let rows = events_in_period(&db, None).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].event_type, "dispatched");
+        assert_eq!(rows[2].event_type, "worker_exit");
+    }
+
+    #[tokio::test]
+    async fn events_in_period_filters_by_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        drop(conn);
+
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let rows = events_in_period(&db, Some(&future)).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let rows = events_in_period(&db, Some(&past)).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     #[tokio::test]

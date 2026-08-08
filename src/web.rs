@@ -386,6 +386,10 @@ pub const NAV_LINKS: &[NavLink] = &[
         label: "Observability",
     },
     NavLink {
+        href: "/insights",
+        label: "Insights",
+    },
+    NavLink {
         href: "/chat",
         label: "Chat",
     },

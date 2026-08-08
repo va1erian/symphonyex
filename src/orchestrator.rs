@@ -513,6 +513,10 @@ async fn run_inner(
     let report_path = report_path_override
         .unwrap_or_else(|| shared.config.workflow_dir.join("symphony-report.html"));
     tracing::info!(path = %report_path.display(), "usage report will be written here");
+    let db_path = shared
+        .config
+        .workflow_dir
+        .join(crate::eventlog::DB_FILENAME);
 
     startup_terminal_cleanup(&shared).await;
 
@@ -628,12 +632,12 @@ async fn run_inner(
                 maybe_reload(&workflow_path, &mut shared, &mut last_attempted_mtime, &mut interval);
                 on_tick(&shared, &mut state, &tx).await;
                 status_tx.send_replace(build_status_snapshot(&state));
-                write_report(&report_path, &workflow_path, &state);
+                write_report(&report_path, &workflow_path, &db_path, &state);
             }
             Some(msg) = rx.recv() => {
                 handle_msg(&shared, &mut state, &tx, msg).await;
                 status_tx.send_replace(build_status_snapshot(&state));
-                write_report(&report_path, &workflow_path, &state);
+                write_report(&report_path, &workflow_path, &db_path, &state);
             }
             _ = &mut shutdown => {
                 tracing::info!(path = %workflow_path.display(), "project stopped (removed from service)");
@@ -643,8 +647,15 @@ async fn run_inner(
     }
 }
 
-fn write_report(report_path: &Path, workflow_path: &Path, state: &OrchestratorState) {
-    if let Err(e) = crate::metrics::write_report(report_path, workflow_path, &state.metrics) {
+fn write_report(
+    report_path: &Path,
+    workflow_path: &Path,
+    db_path: &Path,
+    state: &OrchestratorState,
+) {
+    if let Err(e) =
+        crate::metrics::write_report(report_path, workflow_path, db_path, &state.metrics)
+    {
         tracing::warn!(error = %e, path = %report_path.display(), "failed to write usage report (ignored)");
     }
 }
