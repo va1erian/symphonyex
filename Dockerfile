@@ -23,16 +23,23 @@ RUN cargo build --release
 # container itself runs too.
 FROM debian:bookworm-slim
 ARG DOCKER_CLI_VERSION=27.3.1
+# Pinned, not `@latest`: floating tags mean a plain `docker build` (e.g. CI's
+# docker-build job, or a project rebuilding its own derived image) can silently pull a
+# newer, unaudited agent CLI build with no corresponding change in this repo's history
+# to review. Bump deliberately -- `npm view @anthropic-ai/claude-code version` /
+# `npm view opencode-ai version` -- and note the bump in the commit that changes these.
+ARG CLAUDE_CODE_VERSION=2.1.221
+ARG OPENCODE_VERSION=1.18.13
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash git ca-certificates curl gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     # The Claude Code CLI's published package name/install method; verify against
     # https://docs.claude.com/en/docs/claude-code if this has since changed.
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
     # opencode CLI (agent.backend: opencode) -- package name per
     # https://opencode.ai/docs/ ; verify if this has since changed.
-    && npm install -g opencode-ai \
+    && npm install -g opencode-ai@${OPENCODE_VERSION} \
     # docker CLI (client only, no engine/daemon) -- lets a daemonized Symphony spawn
     # per-ticket sibling containers through a mounted host Docker socket
     # (Docker-outside-of-Docker). Static official binary, not an apt package: avoids

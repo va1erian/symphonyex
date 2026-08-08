@@ -1,0 +1,47 @@
+# cargo-deny config (`cargo deny check`, wired into CI's `supply-chain` job).
+# See https://embarkstudios.github.io/cargo-deny/ for the full config reference.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Deny on any known vulnerability; warn (don't fail CI) on unmaintained/yanked so a
+# transitive dependency going stale doesn't block unrelated PRs -- revisit to `deny`
+# once there's a process for reacting to those promptly.
+ignore = []
+
+[licenses]
+# Every license actually present in `cargo tree`'s full (incl. dev-deps) graph as of
+# the last `cargo deny check licenses` run -- add to this list deliberately when a new
+# dependency needs it, not by copying an upstream template.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# `symphony` itself is `publish = false` (no LICENSE file / SPDX id chosen yet) --
+# skip it in the license check rather than fabricate a license here.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
