@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-2
 title: Collapse same-second events onto one line in the /events conversation view
-state: todo
+state: done
 priority: 3
 labels: [dashboard, ux]
 dispatchable: true
@@ -46,14 +46,14 @@ to one row.
 
 ## Acceptance criteria
 
-- [ ] A transcript with several `tool_call`/bookkeeping events sharing one second renders
+- [x] A transcript with several `tool_call`/bookkeeping events sharing one second renders
       as one compact line, not one bubble per event.
-- [ ] An assistant narrative bubble is never merged into a same-second group with
+- [x] An assistant narrative bubble is never merged into a same-second group with
       surrounding tool/system events, even when timestamps coincide.
-- [ ] Events in different seconds are never merged, even if adjacent.
-- [ ] Unit test(s) in `src/status.rs` extending the existing `render_transcript`/
+- [x] Events in different seconds are never merged, even if adjacent.
+- [x] Unit test(s) in `src/status.rs` extending the existing `render_transcript`/
       `transcript_role` test coverage, built from a realistic same-second event burst.
-- [ ] `cargo test` and `cargo clippy --all-targets` stay clean.
+- [x] `cargo test` and `cargo clippy --all-targets` stay clean.
 
 ## Out of scope
 

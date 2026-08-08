@@ -816,14 +816,170 @@ fn event_row(r: &eventlog::EventRow, base: &str) -> String {
 /// conversation instead of a table row per event. `rows` comes in newest-first
 /// (`eventlog::recent_events`'s own order, matching the table view); a transcript
 /// reads top-to-bottom oldest-first, so this reverses it for display.
+///
+/// Two rendering features compose here:
+///   - FEAT-3: events are bucketed by pipeline stage (walking `stage_started`/
+///     `stage_finished` markers). When no stage boundaries exist, rendering falls
+///     back to the same flat list as before -- purely additive for pipeline-enabled
+///     projects.
+///   - FEAT-2: within each stage's bucket, consecutive non-assistant events that
+///     share the same whole-second timestamp are collapsed into one compact line
+///     (e.g. `tool_call: Grep, Read · turn_started, session_started`) instead of
+///     one full bubble each. Assistant narrative bubbles are never collapsed.
 fn render_transcript(rows: &[eventlog::EventRow], base: &str) -> String {
     if rows.is_empty() {
         return r#"<p class="empty">No events recorded yet.</p>"#.to_string();
     }
-    rows.iter()
-        .rev()
-        .map(|r| transcript_bubble(r, base))
-        .collect()
+    let stages = bucket_stages(rows);
+
+    if stages.len() == 1 && stages[0].stage_id.is_none() {
+        let mut events = stages[0].events.clone();
+        events.reverse();
+        return collapse_same_second(&events, base);
+    }
+
+    let mut html = String::new();
+    for stage in stages.iter().rev() {
+        let mut events = stage.events.clone();
+        events.reverse();
+        if let Some(id) = &stage.stage_id {
+            let heading = match &stage.outcome {
+                Some(outcome) => {
+                    format!("{} &mdash; {}", escape(id), escape(outcome))
+                }
+                None => escape(id).to_string(),
+            };
+            html.push_str(&format!(
+                r#"<section><h3>{heading}</h3>{body}</section>"#,
+                body = collapse_same_second(&events, base),
+            ));
+        } else {
+            html.push_str(&collapse_same_second(&events, base));
+        }
+    }
+    html
+}
+
+struct StageBucket<'a> {
+    stage_id: Option<String>,
+    outcome: Option<String>,
+    events: Vec<&'a eventlog::EventRow>,
+}
+
+fn bucket_stages(rows: &[eventlog::EventRow]) -> Vec<StageBucket<'_>> {
+    let mut buckets: Vec<StageBucket<'_>> = Vec::new();
+    let mut current_stage_id: Option<String> = None;
+    let mut current_outcome: Option<String> = None;
+    let mut current_events: Vec<&eventlog::EventRow> = Vec::new();
+
+    for row in rows.iter().rev() {
+        if row.event_type == "stage_started" {
+            let prev_events = std::mem::take(&mut current_events);
+            if !prev_events.is_empty() || current_stage_id.is_some() {
+                buckets.push(StageBucket {
+                    stage_id: current_stage_id.take(),
+                    outcome: current_outcome.take(),
+                    events: prev_events,
+                });
+            }
+            current_stage_id = row.message.clone();
+            current_outcome = None;
+            continue;
+        }
+        if row.event_type == "stage_finished" {
+            if let Some(msg) = &row.message
+                && let Some((_id, outcome)) = msg.split_once(": ")
+            {
+                current_outcome = Some(outcome.to_string());
+            }
+            continue;
+        }
+        current_events.push(row);
+    }
+    let final_events = std::mem::take(&mut current_events);
+    buckets.push(StageBucket {
+        stage_id: current_stage_id.take(),
+        outcome: current_outcome.take(),
+        events: final_events,
+    });
+    buckets
+}
+
+fn timestamp_second(ts: &str) -> &str {
+    if ts.len() >= 19 {
+        &ts[..19]
+    } else {
+        ts
+    }
+}
+
+fn collapse_same_second(events: &[&eventlog::EventRow], base: &str) -> String {
+    if events.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut i = 0;
+    while i < events.len() {
+        let role = transcript_role(&events[i].event_type);
+        if role == "assistant" {
+            output.push_str(&transcript_bubble(events[i], base));
+            i += 1;
+        } else {
+            let second = timestamp_second(&events[i].created_at);
+            let mut group = vec![events[i]];
+            i += 1;
+            while i < events.len() {
+                let next_role = transcript_role(&events[i].event_type);
+                if next_role == "assistant" {
+                    break;
+                }
+                if timestamp_second(&events[i].created_at) == second {
+                    group.push(events[i]);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if group.len() == 1 {
+                output.push_str(&transcript_bubble(group[0], base));
+            } else {
+                output.push_str(&collapsed_bubble(&group, base));
+            }
+        }
+    }
+    output
+}
+
+fn collapsed_bubble(events: &[&eventlog::EventRow], base: &str) -> String {
+    let time = escape(timestamp_second(&events[0].created_at));
+    let parts: Vec<String> = events
+        .iter()
+        .map(|r| {
+            let issue_link = urlencode(&r.issue_id);
+            let type_link = urlencode(&r.event_type);
+            if transcript_role(&r.event_type) == "tool" {
+                let tool_name = r.message.as_deref().unwrap_or(&r.event_type);
+                format!(
+                    r#"<a href="{base}/events?issue={issue_link}&amp;type={type_link}">{type}: {name}</a>"#,
+                    type = escape(&r.event_type),
+                    name = escape(tool_name),
+                )
+            } else {
+                format!(
+                    r#"<a href="{base}/events?issue={issue_link}&amp;type={type_link}">{name}</a>"#,
+                    name = escape(&r.event_type),
+                )
+            }
+        })
+        .collect();
+    format!(
+        r#"<div class="msg compact">
+  <div class="bubble">{}</div>
+  <div class="status"><span class="time">{}</span></div>
+</div>"#,
+        parts.join(" &middot; "),
+        time,
+    )
 }
 
 /// Which bubble variant an event type reads as: `other_message` (and anything else
@@ -3516,6 +3672,14 @@ mod tests {
     }
 
     fn event_row_fixture(event_type: &str, message: Option<&str>) -> eventlog::EventRow {
+        event_row_at(event_type, message, "2026-01-01T00:00:00Z")
+    }
+
+    fn event_row_at(
+        event_type: &str,
+        message: Option<&str>,
+        created_at: &str,
+    ) -> eventlog::EventRow {
         eventlog::EventRow {
             id: 1,
             issue_id: "42".to_string(),
@@ -3528,12 +3692,194 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             total_tokens: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: created_at.to_string(),
         }
     }
 
+    // ── FEAT-2: same-second collapsing ──
+
     #[test]
-    fn render_transcript_renders_oldest_first_and_escapes_message_bodies() {
+    fn feats_different_seconds_never_merged() {
+        let rows = vec![
+            event_row_at("tool_call", Some("Grep"), "2026-01-01T00:00:02Z"),
+            event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("00:00:02"), "newer second: {html}");
+        assert!(html.contains("00:00:01"), "older second: {html}");
+        assert_eq!(html.matches("class=\"msg").count(), 2, "two separate bubbles: {html}");
+    }
+
+    #[test]
+    fn feats_same_second_tool_and_system_events_collapsed_into_one_line() {
+        let rows = vec![
+            event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
+            event_row_at("session_started", None, "2026-01-01T00:00:01.021Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("turn_started"), "{html}");
+        assert!(html.contains("session_started"), "{html}");
+        assert!(html.contains("&middot;"), "collapsed separator: {html}");
+        let bubble_count = html.matches("class=\"msg").count();
+        assert_eq!(bubble_count, 1, "two same-second events → one collapsed bubble, got {bubble_count}: {html}");
+        assert!(html.contains("00:00:01"), "{html}");
+    }
+
+    #[test]
+    fn feats_assistant_never_collapsed_even_when_same_second() {
+        let rows = vec![
+            event_row_at("other_message", Some("Here's the fix"), "2026-01-01T00:00:01.100Z"),
+            event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        let assistant_pos = html.find("Here&#39;s the fix").unwrap();
+        let system_pos = html.find("turn_started").unwrap();
+        assert!(
+            assistant_pos < system_pos,
+            "assistant (newest) before system (older): assistant at {assistant_pos}, system at {system_pos}"
+        );
+        assert!(
+            html.contains(r#"class="msg assistant""#),
+            "assistant bubble preserved: {html}"
+        );
+        assert_eq!(
+            html.matches("class=\"msg").count(),
+            2,
+            "assistant never merged: {html}"
+        );
+    }
+
+    #[test]
+    fn feats_same_second_tool_calls_show_tool_names() {
+        let rows = vec![
+            event_row_at("tool_call", Some("Grep"), "2026-01-01T00:00:01Z"),
+            event_row_at("tool_call", Some("Read"), "2026-01-01T00:00:01.050Z"),
+            event_row_at("tool_call", Some("Edit"), "2026-01-01T00:00:01.100Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("tool_call: Grep"), "{html}");
+        assert!(html.contains("tool_call: Read"), "{html}");
+        assert!(html.contains("tool_call: Edit"), "{html}");
+        assert_eq!(
+            html.matches("class=\"msg").count(),
+            1,
+            "three same-second tools → one collapsed bubble: {html}"
+        );
+    }
+
+    #[test]
+    fn feats_mixed_tool_and_system_in_same_second_collapses() {
+        let rows = vec![
+            event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
+            event_row_at("tool_call", Some("Grep"), "2026-01-01T00:00:01.010Z"),
+            event_row_at("session_started", None, "2026-01-01T00:00:01.020Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("turn_started"), "{html}");
+        assert!(html.contains("tool_call: Grep"), "{html}");
+        assert!(html.contains("session_started"), "{html}");
+        assert_eq!(
+            html.matches("class=\"msg").count(),
+            1,
+            "three same-second events → one collapsed bubble: {html}"
+        );
+    }
+
+    // ── FEAT-3: stage grouping ──
+
+    #[test]
+    fn feats_no_stage_events_falls_back_to_flat_rendering() {
+        let rows = vec![
+            event_row_at("dispatched", None, "2026-01-01T00:00:02Z"),
+            event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(!html.contains("<section>"), "no stage sections: {html}");
+        assert!(html.contains("turn_started"), "{html}");
+        assert!(html.contains("dispatched"), "{html}");
+    }
+
+    #[test]
+    fn feats_multi_stage_events_grouped_into_sections_with_heading_and_outcome() {
+        let rows = vec![
+            // Stage "review" finished
+            event_row_at("stage_finished", Some("review: blocked: 1 critical"), "2026-01-01T00:00:06Z"),
+            event_row_at("other_message", Some("here's why"), "2026-01-01T00:00:05Z"),
+            event_row_at("tool_call", Some("Read"), "2026-01-01T00:00:04Z"),
+            // Stage "implement" started
+            event_row_at("stage_started", Some("review"), "2026-01-01T00:00:03Z"),
+            event_row_at("tool_call", Some("Edit"), "2026-01-01T00:00:02Z"),
+            event_row_at("tool_call", Some("Write"), "2026-01-01T00:00:02Z"),
+            // Stage "implement" finished
+            event_row_at("stage_finished", Some("implement: completed"), "2026-01-01T00:00:01Z"),
+            // Stage "implement" started
+            event_row_at("stage_started", Some("implement"), "2026-01-01T00:00:00Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("<section>"), "stage sections: {html}");
+        assert!(html.contains("<h3>review"), "{html}");
+        assert!(html.contains("blocked: 1 critical"), "{html}");
+        assert!(html.contains("<h3>implement"), "{html}");
+        assert!(html.contains("completed"), "{html}");
+        // stage_started/stage_finished are not rendered as individual bubbles
+        assert!(!html.contains("stage_started"), "boundary markers excluded: {html}");
+        assert!(!html.contains("stage_finished"), "boundary markers excluded: {html}");
+        // Tool events inside stages are still present
+        assert!(html.contains("tool_call"), "{html}");
+        assert!(html.contains("Read"), "{html}");
+        assert!(html.contains("Edit"), "{html}");
+        assert!(html.contains("Write"), "{html}");
+        // Assistant content is present
+        assert!(html.contains("here&#39;s why"), "{html}");
+        // implement's two same-second tools are collapsed
+        let implement_start = html.find("<h3>implement").unwrap();
+        let implement_section = &html[implement_start..];
+        let bubbles_in_implement = implement_section.matches("class=\"msg").count();
+        assert_eq!(
+            bubbles_in_implement,
+            1,
+            "implement's two same-second tools collapsed into one: {implement_section}"
+        );
+    }
+
+    #[test]
+    fn feats_pre_first_stage_events_flat_no_section_header() {
+        let rows = vec![
+            event_row_at("turn_started", None, "2026-01-01T00:00:04Z"),
+            event_row_at("stage_started", Some("plan"), "2026-01-01T00:00:03Z"),
+            event_row_at("dispatched", None, "2026-01-01T00:00:02Z"),
+            event_row_at("other_message", Some("hello"), "2026-01-01T00:00:01Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        assert!(html.contains("<h3>plan"), "stage section: {html}");
+        assert!(html.contains("turn_started"), "pre-stage event inside plan: {html}");
+        assert!(html.contains("dispatched"), "{html}");
+        assert!(html.contains("hello"), "{html}");
+        // stage_started boundary not rendered as a bubble
+        assert!(!html.contains(">stage_started<"), "{html}");
+    }
+
+    #[test]
+    fn feats_same_second_collapsing_does_not_cross_stage_boundaries() {
+        let rows = vec![
+            event_row_at("turn_started", None, "2026-01-01T00:00:05Z"),
+            event_row_at("tool_call", Some("Read"), "2026-01-01T00:00:05.010Z"),
+            event_row_at("stage_started", Some("plan"), "2026-01-01T00:00:04Z"),
+            event_row_at("tool_call", Some("Write"), "2026-01-01T00:00:04Z"),
+            event_row_at("stage_started", Some("requirements"), "2026-01-01T00:00:03Z"),
+            event_row_at("tool_call", Some("Grep"), "2026-01-01T00:00:04Z"),
+        ];
+        let html = render_transcript(&rows, "");
+        let bubbles = html.matches("class=\"msg").count();
+        assert_eq!(
+            bubbles,
+            3,
+            "bucketed by stage: requirements→1 Grep, plan→1 Write, plan_stage→1 turn_started+Read collapsed: {html}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_renders_newest_first_and_escapes_message_bodies() {
         let rows = vec![
             event_row_fixture("other_message", Some("newest reply")),
             event_row_fixture("dispatched", Some("<script>alert(1)</script>")),
@@ -3542,8 +3888,8 @@ mod tests {
         let dispatched_pos = html.find("dispatched").unwrap();
         let reply_pos = html.find("newest reply").unwrap();
         assert!(
-            dispatched_pos < reply_pos,
-            "oldest (dispatched) event should render before the newer reply"
+            reply_pos < dispatched_pos,
+            "newest (reply) event should render before the older dispatched event"
         );
         assert!(!html.contains("<script>alert"));
         assert!(html.contains("&lt;script&gt;"));

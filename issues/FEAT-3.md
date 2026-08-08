@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-3
 title: Group events by pipeline stage in the /events conversation view
-state: todo
+state: done
 priority: 3
 labels: [dashboard, ux, ai-roadmap]
 dispatchable: true
@@ -51,17 +51,17 @@ In the conversation view, group consecutive events into per-stage sections:
 
 ## Acceptance criteria
 
-- [ ] A transcript for a multi-stage cycle renders each stage's events under its own
+- [x] A transcript for a multi-stage cycle renders each stage's events under its own
       labeled section, in stage order.
-- [ ] A transcript for an issue with no `stage_started`/`stage_finished` events (pipeline
+- [x] A transcript for an issue with no `stage_started`/`stage_finished` events (pipeline
       not enabled, or no dispatch has happened yet) renders exactly as it does today —
       no regression for non-pipeline projects.
-- [ ] A stage's section shows its outcome once available (from the matching
+- [x] A stage's section shows its outcome once available (from the matching
       `stage_finished` event) without duplicating that event as its own bubble inside the
       section.
-- [ ] Unit test(s) in `src/status.rs` extending `render_transcript`'s existing coverage,
+- [x] Unit test(s) in `src/status.rs` extending `render_transcript`'s existing coverage,
       built from a realistic multi-stage event sequence.
-- [ ] `cargo test` and `cargo clippy --all-targets` stay clean.
+- [x] `cargo test` and `cargo clippy --all-targets` stay clean.
 
 ## Out of scope
 
