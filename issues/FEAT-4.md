@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-4
 title: Give /requirements and /reviews a real issue-picker instead of a "pass ?issue= in the URL" hint
-state: todo
+state: done
 priority: 3
 labels: [dashboard, ux]
 dispatchable: true
@@ -51,20 +51,20 @@ etc. for the established pattern).
 
 ## Acceptance criteria
 
-- [ ] Visiting `/requirements` or `/reviews` with no `?issue=` shows a submittable form
+- [x] Visiting `/requirements` or `/reviews` with no `?issue=` shows a submittable form
       (not just a code-snippet hint) and a list of up to 10 recently-active issues to
       click through to.
-- [ ] The list reflects real data — an issue with recorded events appears; an
+- [x] The list reflects real data — an issue with recorded events appears; an
       issue/database with no history yet shows the empty state gracefully (no crash, no
       broken query).
-- [ ] Submitting the form or clicking a listed issue navigates to that page's own
+- [x] Submitting the form or clicking a listed issue navigates to that page's own
       `?issue=<id>` exactly as manually typing the URL does today — no change to the
       already-working "issue specified" rendering path on either page.
-- [ ] Unit tests extending `requirements_page`'s/`reviews_page`'s existing "prompts for
+- [x] Unit tests extending `requirements_page`'s/`reviews_page`'s existing "prompts for
       one" test coverage (`reviews_page_without_an_issue_prompts_for_one` and its
       requirements-page counterpart) to assert the form and list are present instead of
       just the old hint text.
-- [ ] `cargo test` and `cargo clippy --all-targets` stay clean.
+- [x] `cargo test` and `cargo clippy --all-targets` stay clean.
 
 ## Out of scope
 

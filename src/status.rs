@@ -1109,6 +1109,37 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
     ))
 }
 
+fn issue_picker(base: &str, active_path: &str, recent: &[eventlog::IssueUsageRow]) -> String {
+    let mut body = r#"<form class="filters" method="get">
+  <label for="f-issue">Issue</label>
+  <input type="text" id="f-issue" name="issue" placeholder="issue id">
+  <button type="submit">Load</button>
+</form>
+
+<h3>Recent issues</h3>
+"#
+    .to_string();
+    if recent.is_empty() {
+        body.push_str(r#"<p class="empty">No issues with recorded events yet.</p>"#);
+    } else {
+        body.push_str(
+            r#"<div class="table-wrap"><table>
+<thead><tr><th>Identifier</th><th>Title</th></tr></thead>
+<tbody>"#,
+        );
+        for r in recent.iter().take(10) {
+            body.push_str(&format!(
+                "<tr><td><a href=\"{base}{active_path}?issue={issue_link}\">{identifier}</a></td><td>{title}</td></tr>",
+                issue_link = urlencode(&r.issue_id),
+                identifier = escape(&r.identifier),
+                title = escape(&r.title),
+            ));
+        }
+        body.push_str("</tbody></table></div>");
+    }
+    body
+}
+
 fn issue_usage_row(
     r: &eventlog::IssueUsageRow,
     base: &str,
@@ -1833,10 +1864,9 @@ async fn requirements_page(
 ) -> Html<String> {
     let base = state.base_path.as_str();
     let Some(issue_id) = q.issue.filter(|s| !s.is_empty()) else {
-        let body = format!(
-            r#"<p>Pass an issue id, e.g. <code>{base}/requirements?issue=1</code>. \
-               Find one on the <a href="{base}/events">Events</a> page.</p>"#
-        );
+        let db = state.eventlog_db_path();
+        let recent = eventlog::usage_by_issue(&db).unwrap_or_default();
+        let body = issue_picker(base, "/requirements", &recent);
         return Html(page_shell(
             "requirements",
             "/requirements",
@@ -2068,10 +2098,9 @@ async fn reviews_page(
 ) -> Html<String> {
     let base = state.base_path.as_str();
     let Some(issue_id) = q.issue.filter(|s| !s.is_empty()) else {
-        let body = format!(
-            r#"<p>Pass an issue id, e.g. <code>{base}/reviews?issue=1</code>. \
-               Find one on the <a href="{base}/events">Events</a> page.</p>"#
-        );
+        let db = state.eventlog_db_path();
+        let recent = eventlog::usage_by_issue(&db).unwrap_or_default();
+        let body = issue_picker(base, "/reviews", &recent);
         return Html(page_shell(
             "reviews",
             "/reviews",
@@ -4163,7 +4192,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviews_page_without_an_issue_prompts_for_one() {
+    async fn reviews_page_without_an_issue_shows_picker_and_form() {
         let dir = tempfile::tempdir().unwrap();
         let (_tx, rx) = watch::channel(StatusSnapshot::default());
         let state = AppState {
@@ -4176,7 +4205,29 @@ mod tests {
             tracker: test_tracker(dir.path()),
         };
         let Html(body) = reviews_page(State(state), Query(ReviewsQuery { issue: None })).await;
-        assert!(body.contains("Pass an issue id"));
+        assert!(body.contains(r#"<form class="filters" method="get">"#));
+        assert!(body.contains("<h3>Recent issues</h3>"));
+        assert!(body.contains("No issues with recorded events yet."));
+    }
+
+    #[tokio::test]
+    async fn requirements_page_without_an_issue_shows_picker_and_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let state = AppState {
+            status_rx: rx,
+            workflow_dir: dir.path().to_path_buf(),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
+        };
+        let Html(body) =
+            requirements_page(State(state), Query(RequirementsQuery { issue: None })).await;
+        assert!(body.contains(r#"<form class="filters" method="get">"#));
+        assert!(body.contains("<h3>Recent issues</h3>"));
+        assert!(body.contains("No issues with recorded events yet."));
     }
 
     #[tokio::test]
