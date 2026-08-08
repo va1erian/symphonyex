@@ -158,7 +158,7 @@ async fn index(State(state): State<WebState>) -> Html<String> {
     Html(crate::web::page_shell(
         "Symphony",
         "chat",
-        &crate::web::nav(crate::web::NAV_LINKS, "/chat", &state.nav_path),
+        &crate::web::nav(&crate::web::nav_links(true), "/chat", &state.nav_path),
         body,
         &extra_head,
     ))

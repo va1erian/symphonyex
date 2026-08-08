@@ -103,13 +103,24 @@ Claude backend only, Codex backend doesn't detect these yet), and input/output/t
 tokens. Since it's rewritten continuously rather than only at shutdown, the report is
 current even if the process is killed rather than stopped cleanly.
 
-Known accuracy caveat: token counts are only recorded when a turn's final `result`
-event arrives from the `claude` subprocess. If reconciliation reclaims a worker right
-after it marks its issue done (Section 8.5 — this can preempt mid-turn) but before
-that event arrives, turns/tool-calls for that dispatch are still counted correctly but
-its tokens show as 0. Narrow race, mostly visible on short poll intervals against
-trivial/fast tasks; not expected to matter much at realistic poll intervals against
-real work.
+Known accuracy caveat (BUG-1): token counts are only recorded when a turn's final
+`result` event arrives from the `claude` subprocess, and a live dogfood run once
+observed 6/6 real, multi-tool-call turns show 0 tokens with zero `turn_completed`/
+`turn_failed` events at all — not just a narrow reconciliation race. Extensive
+reproduction attempts (single turns, `--resume`ed turns, 12–30-tool-call turns, two
+concurrent sessions, and two full end-to-end `symphony` dispatches, all against the
+real `claude` CLI 2.1.223) never reproduced it; every one of those correctly captured
+non-zero usage. The exact original trigger is still unconfirmed — candidates remain
+the reconciliation-preempts-mid-turn race (Section 8.5) and an unrecognized `result`
+shape for some turn type. What's fixed either way: this used to be silent — a 0-token
+turn was indistinguishable from a genuinely free one. It no longer is. Both gap shapes
+now emit a visible `turn_completed` event carrying an explanatory `message` (shown on
+`/events` and in `symphony-report.html`'s per-issue table) instead of a clean-looking
+but wrong number: a `result` event with no readable `usage` field logs the raw JSON
+via `tracing::warn` and flags the event; stdout hitting EOF with no `result` event at
+all surfaces the last few stderr lines captured from the subprocess, if any. See
+`src/agent/claude.rs`'s `extracts_real_usage_from_a_captured_result_transcript` test
+(built from an actual captured transcript) for the known-good parse path this guards.
 
 That same reconciliation-preempts-mid-turn race used to be worse than a metrics gap:
 `after_run` (and therefore an agent's `git commit`/`push`, if that's what the hook

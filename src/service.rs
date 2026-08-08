@@ -544,7 +544,8 @@ async fn project_proxy(
         *req.uri_mut() = new_uri;
     }
 
-    let sub_router = status::router(status_rx, workflow_dir, &prefix);
+    let chat_enabled = chat.as_ref().is_some_and(|handles| handles.web_enabled);
+    let sub_router = status::router(status_rx, workflow_dir, &prefix, chat_enabled);
     let sub_router = match &chat {
         Some(handles) if handles.web_enabled => sub_router.nest(
             "/chat",

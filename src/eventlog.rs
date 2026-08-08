@@ -119,6 +119,17 @@ pub struct IssueUsageRow {
     pub total_tokens: i64,
     pub last_event_type: String,
     pub last_event_at: String,
+    /// Sum of every closed `"dispatched"` -> `"worker_exit"` span for this issue, plus
+    /// (if the most recent `"dispatched"` has no matching `"worker_exit"` yet) that
+    /// span's duration up to "now" -- see `duration_open` for whether that trailing
+    /// piece is still live.
+    pub duration_secs: f64,
+    /// True when the last `"dispatched"` for this issue has no `"worker_exit"` yet --
+    /// either it's genuinely running right now, or the process was killed mid-attempt
+    /// and never got to record one. `status.rs` disambiguates using the live
+    /// `StatusSnapshot` (FEAT-1): render plain while actually running, mark distinctly
+    /// (stale/uncertain) otherwise.
+    pub duration_open: bool,
 }
 
 const SCHEMA: &str = "
@@ -437,9 +448,13 @@ pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
          GROUP BY issue_id \
          ORDER BY MAX(id) DESC",
     )?;
+    let durations = issue_durations(&conn)?;
     let rows = stmt.query_map([], |row| {
+        let issue_id: String = row.get(0)?;
+        let (duration_secs, duration_open) =
+            durations.get(&issue_id).copied().unwrap_or((0.0, false));
         Ok(IssueUsageRow {
-            issue_id: row.get(0)?,
+            issue_id,
             identifier: row.get(1)?,
             title: row.get(2)?,
             dispatch_count: row.get(3)?,
@@ -450,9 +465,62 @@ pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
             total_tokens: row.get(8)?,
             last_event_type: row.get(9)?,
             last_event_at: row.get(10)?,
+            duration_secs,
+            duration_open,
         })
     })?;
     rows.collect()
+}
+
+/// Fold each issue's `"dispatched"`/`"worker_exit"` events (ordered by insertion) into
+/// closed spans, summed, plus one still-open trailing span if the last `"dispatched"`
+/// has no matching `"worker_exit"` yet (FEAT-1). Computed here in Rust rather than in
+/// SQL -- pairing up rows across an ordered sequence in one pass is far more direct
+/// this way than a self-join or window-function query would be, and this table is
+/// small enough that reading it once per `/usage` request is not a concern (matches
+/// this module's existing "keep it basic" read-path stance).
+fn issue_durations(conn: &Connection) -> rusqlite::Result<HashMap<String, (f64, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT issue_id, event_type, created_at FROM events \
+         WHERE event_type = 'dispatched' OR event_type = 'worker_exit' \
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut spans: HashMap<String, (f64, bool)> = HashMap::new();
+    let mut open_since: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    for row in rows {
+        let (issue_id, event_type, created_at) = row?;
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&created_at) else {
+            continue;
+        };
+        let ts = ts.with_timezone(&chrono::Utc);
+        match event_type.as_str() {
+            "dispatched" => {
+                open_since.insert(issue_id, ts);
+            }
+            "worker_exit" => {
+                if let Some(start) = open_since.remove(&issue_id) {
+                    let entry = spans.entry(issue_id).or_insert((0.0, false));
+                    entry.0 += (ts - start).num_milliseconds().max(0) as f64 / 1000.0;
+                }
+            }
+            _ => {}
+        }
+    }
+    let now = chrono::Utc::now();
+    for (issue_id, start) in open_since {
+        let entry = spans.entry(issue_id).or_insert((0.0, false));
+        entry.0 += (now - start).num_milliseconds().max(0) as f64 / 1000.0;
+        entry.1 = true;
+    }
+    Ok(spans)
 }
 
 /// A pipeline stage's durable output (AIR-4's `requirements`/`acceptance_criteria`,
@@ -747,6 +815,105 @@ mod tests {
         let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
         assert_eq!(issue1.dispatch_count, 1);
         assert_eq!(issue1.turn_count, 1);
+    }
+
+    /// Inserts with an explicit `created_at` (unlike `insert`, which always stamps
+    /// `Utc::now()`) so duration-folding tests can control span lengths precisely.
+    fn insert_at(conn: &Connection, ev: &NewEvent, created_at: &str) {
+        let importance = classify_importance(ev);
+        conn.execute(
+            "INSERT INTO events (issue_id, identifier, title, session_id, event_type, \
+             importance, message, input_tokens, output_tokens, total_tokens, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                ev.issue_id,
+                ev.identifier,
+                ev.title,
+                ev.session_id,
+                ev.event_type,
+                importance.as_str(),
+                ev.message,
+                ev.input_tokens.map(|v| v as i64),
+                ev.output_tokens.map(|v| v as i64),
+                ev.total_tokens.map(|v| v as i64),
+                created_at,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// FEAT-1: multiple closed dispatch/worker_exit spans for the same issue are
+    /// summed, not just the most recent one.
+    #[test]
+    fn usage_by_issue_sums_multiple_closed_dispatch_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert_at(&conn, &new_event("1", "dispatched"), "2026-01-01T00:00:00Z");
+        insert_at(
+            &conn,
+            &new_event("1", "worker_exit"),
+            "2026-01-01T00:01:00Z",
+        ); // +60s
+        insert_at(&conn, &new_event("1", "dispatched"), "2026-01-01T00:05:00Z");
+        insert_at(
+            &conn,
+            &new_event("1", "worker_exit"),
+            "2026-01-01T00:05:30Z",
+        ); // +30s
+        drop(conn);
+
+        let rows = usage_by_issue(&db).unwrap();
+        let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert_eq!(issue1.duration_secs, 90.0);
+        assert!(!issue1.duration_open);
+    }
+
+    /// FEAT-1: a `dispatched` with no `worker_exit` yet is an open span, reported up to
+    /// "now" and flagged as open regardless of whether the issue happens to still be
+    /// running -- `status.rs` is the layer that cross-references live state to decide
+    /// how to render it, not `eventlog`.
+    #[test]
+    fn usage_by_issue_reports_an_open_span_for_an_unmatched_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        let start = chrono::Utc::now() - chrono::Duration::seconds(10);
+        insert_at(&conn, &new_event("1", "dispatched"), &start.to_rfc3339());
+        drop(conn);
+
+        let rows = usage_by_issue(&db).unwrap();
+        let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert!(issue1.duration_open);
+        assert!(
+            issue1.duration_secs >= 9.0 && issue1.duration_secs < 60.0,
+            "{}",
+            issue1.duration_secs
+        );
+    }
+
+    /// FEAT-1: a closed span followed by a later unmatched `dispatched` (retry that
+    /// never got a `worker_exit`, e.g. the process was killed) sums the closed portion
+    /// plus the still-open trailing one, and stays flagged open.
+    #[test]
+    fn usage_by_issue_sums_closed_spans_plus_a_trailing_open_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert_at(&conn, &new_event("1", "dispatched"), "2026-01-01T00:00:00Z");
+        insert_at(
+            &conn,
+            &new_event("1", "worker_exit"),
+            "2026-01-01T00:01:00Z",
+        ); // +60s closed
+        let start = chrono::Utc::now() - chrono::Duration::seconds(5);
+        insert_at(&conn, &new_event("1", "dispatched"), &start.to_rfc3339()); // open
+        drop(conn);
+
+        let rows = usage_by_issue(&db).unwrap();
+        let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert!(issue1.duration_open);
+        assert!(issue1.duration_secs >= 65.0, "{}", issue1.duration_secs);
     }
 
     #[test]

@@ -331,6 +331,24 @@ pub const NAV_LINKS: &[NavLink] = &[
     },
 ];
 
+/// `NAV_LINKS` filtered down to what's actually mounted for this page. The `/chat`
+/// route only ever exists when `swebot.chat.enabled` and the `web` connector are both
+/// on (`ChatHandles::web_enabled`) -- both `status.rs`'s single-project dashboard and
+/// `service.rs`'s nested multi-project one gate `.nest("/chat", ...)` on that exact
+/// condition, so a page rendered without it must not advertise a "Chat" tab that leads
+/// to a 404 (BUG-2). One helper shared by both call sites rather than the same `if`
+/// duplicated in each.
+pub fn nav_links(chat_enabled: bool) -> Vec<NavLink<'static>> {
+    NAV_LINKS
+        .iter()
+        .filter(|l| chat_enabled || l.href != "/chat")
+        .map(|l| NavLink {
+            href: l.href,
+            label: l.label,
+        })
+        .collect()
+}
+
 /// The one page shell every hand-rolled page in this crate renders through. `nav_html`
 /// is pre-rendered (via `nav()`, or `""` for pages that don't want one) rather than
 /// built here, since callers' nav shapes differ enough that forcing one nav-building
@@ -407,6 +425,23 @@ mod tests {
         assert!(!encoded.contains('"'));
         assert!(!encoded.contains('<'));
         assert!(!encoded.contains('>'));
+    }
+
+    /// Regression test for BUG-2: `NAV_LINKS`' `/chat` entry must not appear when chat
+    /// isn't actually mounted.
+    #[test]
+    fn nav_links_omits_chat_when_disabled() {
+        let links = nav_links(false);
+        assert!(!links.iter().any(|l| l.href == "/chat"));
+        // Nothing else about the link set should change.
+        assert_eq!(links.len(), NAV_LINKS.len() - 1);
+    }
+
+    #[test]
+    fn nav_links_includes_chat_when_enabled() {
+        let links = nav_links(true);
+        assert!(links.iter().any(|l| l.href == "/chat"));
+        assert_eq!(links.len(), NAV_LINKS.len());
     }
 
     #[test]

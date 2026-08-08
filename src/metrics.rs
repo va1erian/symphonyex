@@ -189,7 +189,9 @@ fn render(workflow_path: &Path, m: &Metrics) -> String {
     web::page_shell("Symphony", "usage report", "", &body, "")
 }
 
-fn format_duration(total_secs: u64) -> String {
+/// Shared with `status.rs`'s `/usage` per-issue Duration column (FEAT-1) -- one
+/// human-readable-duration formatter, not two copies drifting apart.
+pub fn format_duration(total_secs: u64) -> String {
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;

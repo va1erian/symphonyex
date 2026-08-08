@@ -1,11 +1,36 @@
 ---
 identifier: BUG-2
 title: Dashboard nav always shows "Chat" even when swebot.chat is disabled, linking to a 404
-state: todo
+state: done
 priority: 2
 labels: [bug, dashboard, swebot-chat]
 dispatchable: true
 ---
+
+## Resolution
+
+Added `web::nav_links(chat_enabled: bool) -> Vec<NavLink>`, a filtered view over
+`NAV_LINKS` that drops the `/chat` entry when `chat_enabled` is false -- one helper
+shared by every caller instead of the same `if` duplicated per file.
+
+- `status::AppState` gained a `chat_enabled: bool` field, threaded through
+  `router(status_rx, workflow_dir, base_path, chat_enabled)` and every `page_shell()`
+  call site in `status.rs` (dashboard, events, usage, artifacts, requirements, reviews,
+  approvals).
+- `serve_composite` (single-project mode) derives it from `chat.is_some()` -- the same
+  `Option<Router>` it already nests under `/chat`.
+- `service.rs::project_proxy` (multi-project mode) derives it from the same
+  `handles.web_enabled` check already sitting next to its own `.nest("/chat", ...)`.
+- `swebot::chat::web`'s own page now calls `nav_links(true)` explicitly, since it only
+  ever renders when chat is on -- its own "Chat" tab still shows itself as active.
+
+Tests: `web::nav_links_omits_chat_when_disabled`/`nav_links_includes_chat_when_enabled`
+(the filtering itself), and `status::dashboard_nav_omits_chat_link_when_chat_is_disabled`/
+`dashboard_nav_includes_chat_link_when_chat_is_enabled` (the actual rendered `/events`
+page HTML, via a real router with the flag flipped both ways).
+
+Verified: `cargo build`, `cargo test` (442 passed), `cargo clippy --all-targets`, `cargo fmt` clean.
+
 ## Context
 
 `src/web.rs`'s `NAV_LINKS` (shared by every status-dashboard page: `/`, `/events`,
