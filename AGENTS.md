@@ -835,12 +835,17 @@ environment *before* you register that repo; there's no way to hand Symphony a
 brand-new secret purely through the browser, by design.
 
 **Auth**: a single shared admin token (`SYMPHONY_ADMIN_TOKEN`) gates `/register` and
-`/projects/<id>/remove` only — logging in sets an `HttpOnly` cookie; a non-browser
-client can instead send `Authorization: Bearer <token>`. The read-only dashboard
-(`/` and every nested per-project page) stays open, same posture the single-project
-dashboard (`status.rs`) already has. This is one operator-held bearer token, not a
-user-account system — appropriate for the same "single trusted operator" scope as the
-rest of this project (see "Trust and safety posture" below), not multi-tenant access
+`/projects/<id>/remove` only — logging in sets an `HttpOnly; Secure` cookie (so it's
+only ever sent over TLS; run `symphony serve` behind a TLS-terminating reverse proxy,
+same as any other bearer-token web service), and `/login` is rate-limited per
+source IP. A non-browser client can instead send `Authorization: Bearer <token>`.
+Token comparisons are constant-time (`service.rs`'s `token_matches`, comparing SHA-256
+digests rather than raw bytes) to avoid a timing side-channel on the token value. The
+read-only dashboard (`/` and every nested per-project page) stays open, same posture
+the single-project dashboard (`status.rs`) already has. This is one operator-held
+bearer token, not a user-account system — appropriate for the same "single trusted
+operator" scope as the rest of this project (see "Trust and safety posture" below),
+not multi-tenant access
 control.
 
 **Running it unattended**: no changes were needed to `Dockerfile` for this — it
