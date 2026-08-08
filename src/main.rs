@@ -14,6 +14,7 @@ mod metrics;
 mod orchestrator;
 mod quality;
 mod registry;
+mod release;
 mod repo_host;
 mod review_rubric;
 mod roles;
