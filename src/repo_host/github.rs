@@ -241,7 +241,36 @@ impl GithubRepoHost {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("evidence.png");
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        match self
+            .put_content_hashed(
+                issue_id,
+                file_name,
+                &bytes,
+                &format!("Attach evidence: {caption}"),
+            )
+            .await
+        {
+            Ok(raw_url) => ToolResult::ok(format!(
+                "Evidence uploaded. Paste this into the pull request body to embed it:\n\n![{caption}]({raw_url})"
+            )),
+            Err(e) => ToolResult::error(e),
+        }
+    }
+
+    /// Shared upload plumbing behind both `attach_evidence` (an image, agent-driven)
+    /// and `RepoHost::upload_artifact` (arbitrary bytes, orchestrator-driven, AIR-9):
+    /// content-hash `bytes` into a `.symphony/evidence/<workspace-key>/`-scoped path
+    /// (see `attach_evidence`'s own doc comment for why: a plain create always
+    /// succeeds, no existing-blob `sha` juggling) and PUT it via the Contents API,
+    /// returning the resulting `raw.githubusercontent.com` URL.
+    async fn put_content_hashed(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
         let short_hash = digest
             .iter()
             .take(8)
@@ -256,30 +285,25 @@ impl GithubRepoHost {
             "{}/repos/{}/{}/contents/{repo_path}",
             self.base_url, self.owner, self.repo
         );
-        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let req = self.client.put(&url).json(&json!({
-            "message": format!("Attach evidence: {caption}"),
+            "message": commit_message,
             "content": content_b64,
             "branch": branch,
         }));
         match self.auth_headers(req).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let raw_url = format!(
-                    "https://raw.githubusercontent.com/{}/{}/{branch}/{repo_path}",
-                    self.owner, self.repo
-                );
-                ToolResult::ok(format!(
-                    "Evidence uploaded. Paste this into the pull request body to embed it:\n\n![{caption}]({raw_url})"
-                ))
-            }
+            Ok(resp) if resp.status().is_success() => Ok(format!(
+                "https://raw.githubusercontent.com/{}/{}/{branch}/{repo_path}",
+                self.owner, self.repo
+            )),
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                ToolResult::error(format!(
+                Err(format!(
                     "PUT {url} -> {status}: {text} (has this branch been pushed yet?)"
                 ))
             }
-            Err(e) => ToolResult::error(e.to_string()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -457,6 +481,34 @@ impl RepoHost for GithubRepoHost {
         }
     }
 
+    async fn update_pr_body(&self, pr_number: u64, body: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{pr_number}",
+            self.base_url, self.owner, self.repo
+        );
+        let req = self.client.patch(&url).json(&json!({"body": body}));
+        match self.auth_headers(req).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("PATCH {url} -> {status}: {text}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn upload_artifact(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        self.put_content_hashed(issue_id, file_name, bytes, commit_message)
+            .await
+    }
+
     async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String> {
         let url = format!("{}/repos/{}/{}/pulls", self.base_url, self.owner, self.repo);
         let req = self
@@ -557,6 +609,66 @@ impl RepoHost for GithubRepoHost {
             Err(e) => Err(e),
         }
     }
+
+    /// GitHub's Deployments API: the most recent deployment against `default_branch`,
+    /// then that deployment's most recent status -- a deployment with no `success`
+    /// status yet (still in progress, or failed) is not reported as a deploy.
+    async fn latest_successful_deploy(&self) -> Result<Option<super::DeployRecord>, String> {
+        let url = format!(
+            "{}/repos/{}/{}/deployments",
+            self.base_url, self.owner, self.repo
+        );
+        let req = self
+            .client
+            .get(&url)
+            .query(&[("ref", self.default_branch.as_str()), ("per_page", "1")]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let deployments: Vec<GhDeployment> = resp.json().await.map_err(|e| e.to_string())?;
+        let Some(deployment) = deployments.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let statuses_url = format!("{url}/{}/statuses", deployment.id);
+        let req = self.client.get(&statuses_url).query(&[("per_page", "1")]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {statuses_url} -> {status}: {text}"));
+        }
+        let statuses: Vec<GhDeploymentStatus> = resp.json().await.map_err(|e| e.to_string())?;
+        match statuses.first() {
+            Some(s) if s.state == "success" => Ok(Some(super::DeployRecord {
+                sha: deployment.sha,
+                identifier: deployment.id.to_string(),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhDeployment {
+    id: u64,
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhDeploymentStatus {
+    state: String,
 }
 
 #[async_trait]
@@ -1029,6 +1141,69 @@ mod tests {
         assert!(result.content.contains("does-not-exist.png"));
     }
 
+    #[tokio::test]
+    async fn update_pr_body_patches_just_the_body() {
+        let server = MockServer::start().await;
+        set_token("SYMPHONY_TEST_REPO_HOST_UPDATE_BODY", "t");
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/name/pulls/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": 9,
+                "html_url": "https://github.com/owner/name/pull/9"
+            })))
+            .mount(&server)
+            .await;
+
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_UPDATE_BODY".to_string()),
+            pull_request: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri());
+
+        let result = host.update_pr_body(9, "new body").await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn upload_artifact_returns_the_raw_content_url() {
+        let server = MockServer::start().await;
+        set_token("SYMPHONY_TEST_REPO_HOST_UPLOAD_ARTIFACT", "t");
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/repos/owner/name/contents/\.symphony/evidence/.*$",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"content": {}})))
+            .mount(&server)
+            .await;
+
+        let host = GithubRepoHost::new(&RepoConfig {
+            url: "https://github.com/owner/name.git".to_string(),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_REPO_HOST_UPLOAD_ARTIFACT".to_string()),
+            pull_request: true,
+            release_evidence: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_base_url_for_test(&server.uri());
+
+        let url = host
+            .upload_artifact(
+                "42",
+                "bundle.json",
+                b"{}",
+                "Persist release evidence bundle",
+            )
+            .await
+            .unwrap();
+        assert!(url.starts_with("https://raw.githubusercontent.com/owner/name/issue-42/"));
+        assert!(url.ends_with("bundle.json"));
+    }
+
     #[test]
     fn new_requires_a_github_url() {
         set_token("SYMPHONY_TEST_REPO_HOST_TOKEN_4", "t");
@@ -1300,6 +1475,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "C_99");
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_reports_the_sha_when_status_is_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 42, "sha": "abc123"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments/42/statuses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"state": "success"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_1")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(
+            record,
+            Some(super::super::DeployRecord {
+                sha: "abc123".to_string(),
+                identifier: "42".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_the_latest_status_is_not_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 7, "sha": "def456"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments/7/statuses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"state": "in_progress"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_2")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_nothing_has_ever_deployed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_3")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
     }
 
     use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};

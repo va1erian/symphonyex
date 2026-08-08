@@ -16,6 +16,7 @@
 //! mode handles concurrent readers fine at this traffic volume) -- no connection pool,
 //! no `Arc<Mutex<Connection>>`, matching "keep it basic."
 
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -219,6 +220,17 @@ fn insert(conn: &Connection, ev: &NewEvent) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// One-off write via a short-lived connection, for a caller that isn't the
+/// orchestrator's dedicated writer task and doesn't want to hold a channel to it
+/// (`status.rs`'s `/budget/extend` -- a rare admin action, not the hot dispatch path
+/// `spawn_writer` exists to protect). Same "each request opens its own connection, WAL
+/// mode handles concurrent writers fine at this traffic volume" posture the read-side
+/// functions in this module already use.
+pub fn record_now(db_path: &Path, ev: &NewEvent) -> rusqlite::Result<()> {
+    let conn = open(db_path)?;
+    insert(&conn, ev)
+}
+
 /// Spawn the dedicated writer task and return the channel to feed it. Best-effort: a
 /// write failure is logged and dropped, never propagated back to the orchestrator's
 /// hot dispatch path -- losing one history row is not worth destabilizing dispatch
@@ -298,6 +310,41 @@ pub fn recent_events(
     let mut stmt = conn.prepare(&sql)?;
     let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt.query_map(param_refs.as_slice(), row_from)?;
+    rows.collect()
+}
+
+/// Rows carrying one of `event_types` (an `IN (...)` filter, unlike `EventFilter`'s
+/// single-type match), most-recent-first. Used by `status.rs`'s `/observability`
+/// page (AIR-10) to pull `telemetry_evidence`/`production_validation` rows together
+/// -- generic over the type list rather than a one-off "observability" query, so the
+/// next feature needing "recent rows of a few specific types" reuses this instead of
+/// writing its own `IN (...)` clause.
+pub fn recent_events_of_types(
+    db_path: &Path,
+    event_types: &[&str],
+    limit: i64,
+) -> rusqlite::Result<Vec<EventRow>> {
+    if event_types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open(db_path)?;
+    let placeholders: Vec<String> = (0..event_types.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, \
+         importance, message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events WHERE event_type IN ({}) ORDER BY id DESC LIMIT ?{}",
+        placeholders.join(", "),
+        event_types.len() + 1
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = event_types
+        .iter()
+        .map(|t| t as &dyn rusqlite::ToSql)
+        .collect();
+    params.push(&limit);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), row_from)?;
     rows.collect()
 }
 
@@ -402,6 +449,36 @@ pub fn usage_summary(db_path: &Path) -> rusqlite::Result<UsageSummary> {
     )
 }
 
+/// Same aggregation as [`usage_summary`], restricted to events at or after `since`
+/// (an RFC 3339 timestamp -- lexical comparison works because `created_at` is always
+/// written via `chrono::Utc::now().to_rfc3339()`, which sorts identically to time order).
+/// Backs `budget.rs`'s window rollup (Section AIR-11): the event log is the one source
+/// of truth for consumption, so a budget window is just a filtered replay of it rather
+/// than a second counter that could drift.
+pub fn usage_summary_since(db_path: &Path, since: &str) -> rusqlite::Result<UsageSummary> {
+    let conn = open(db_path)?;
+    conn.query_row(
+        "SELECT \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'dispatched' AND created_at >= ?1), \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'turn_started' AND created_at >= ?1), \
+            (SELECT COUNT(*) FROM events WHERE event_type = 'tool_call' AND created_at >= ?1), \
+            (SELECT COALESCE(SUM(input_tokens), 0) FROM events WHERE created_at >= ?1), \
+            (SELECT COALESCE(SUM(output_tokens), 0) FROM events WHERE created_at >= ?1), \
+            (SELECT COALESCE(SUM(total_tokens), 0) FROM events WHERE created_at >= ?1)",
+        [since],
+        |row| {
+            Ok(UsageSummary {
+                dispatch_count: row.get(0)?,
+                turn_count: row.get(1)?,
+                tool_call_count: row.get(2)?,
+                input_tokens: row.get(3)?,
+                output_tokens: row.get(4)?,
+                total_tokens: row.get(5)?,
+            })
+        },
+    )
+}
+
 /// Latest `message` for each `issue_id` having at least one event of `event_type` --
 /// used by `/usage` (AIR-6) to show the most recent test/coverage summary per issue
 /// without the per-issue usage query (which tracks *last event overall*, not last event
@@ -428,6 +505,94 @@ pub fn latest_message_by_type(
         }
     }
     Ok(out)
+}
+
+/// Insert a single event outside the dedicated writer task's channel (`spawn_writer`).
+/// Used by callers that don't have a running orchestrator's `mpsc::UnboundedSender` to
+/// hand a row to -- today, `status.rs`'s security-override POST handler. WAL mode
+/// tolerates this occasional second writer fine at the traffic volume a human clicking
+/// a button produces; the dedicated channel exists to keep the orchestrator's own hot
+/// per-turn event stream off the request path, not because concurrent writers are
+/// unsafe.
+pub fn insert_event(db_path: &Path, ev: &NewEvent) -> rusqlite::Result<()> {
+    let conn = open(db_path)?;
+    insert(&conn, ev)
+}
+
+/// The most recent event of `event_type` per issue -- one row per `issue_id`, newest
+/// first. General enough for any "what's the latest X" dashboard view keyed by issue
+/// (today: `security_findings`; AIR-5's `/approvals` page is the obvious next user).
+pub fn latest_events_by_type(db_path: &Path, event_type: &str) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.issue_id, e.identifier, e.title, e.session_id, e.event_type, \
+            e.importance, e.message, e.input_tokens, e.output_tokens, e.total_tokens, e.created_at \
+         FROM events e \
+         INNER JOIN (SELECT issue_id, MAX(id) AS maxid FROM events WHERE event_type = ?1 GROUP BY issue_id) m \
+         ON e.issue_id = m.issue_id AND e.id = m.maxid \
+         ORDER BY e.id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![event_type], row_from)?;
+    rows.collect()
+}
+
+/// A `security_override` event for `issue_id` that hasn't yet been consumed by a
+/// `security_override_consumed` event -- i.e. an override a human recorded that the
+/// security stage hasn't applied yet. One-shot: `orchestrator::run_pipeline` records
+/// `security_override_consumed` the moment it uses one, so the same override can't
+/// silently keep suppressing blocking on every future re-run.
+pub fn pending_override(db_path: &Path, issue_id: &str) -> rusqlite::Result<Option<EventRow>> {
+    let conn = open(db_path)?;
+    conn.query_row(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, importance, \
+            message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events \
+         WHERE issue_id = ?1 AND event_type = 'security_override' \
+           AND id > COALESCE( \
+               (SELECT MAX(id) FROM events WHERE issue_id = ?1 AND event_type = 'security_override_consumed'), \
+               0) \
+         ORDER BY id DESC LIMIT 1",
+        rusqlite::params![issue_id],
+        row_from,
+    )
+    .map(Some)
+    .or_else(|e| {
+        if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    })
+}
+
+/// All events at or after `since` (or all of history when `None`), oldest first --
+/// feeds `insights::compute` (`src/insights/mod.rs`), which needs the raw ordered
+/// stream (not a pre-aggregated summary like `usage_summary`/`usage_by_issue` above)
+/// to reconstruct per-issue cycles and overlaps. Unlike `recent_events`, this ignores
+/// `importance`: a metric computation needs every row, not just what a human browsing
+/// `/events` would want to see by default.
+pub fn events_in_period(
+    db_path: &Path,
+    since: Option<&DateTime<Utc>>,
+) -> rusqlite::Result<Vec<EventRow>> {
+    let conn = open(db_path)?;
+    let mut sql = "SELECT id, issue_id, identifier, title, session_id, event_type, \
+        importance, message, input_tokens, output_tokens, total_tokens, created_at \
+        FROM events"
+        .to_string();
+    if since.is_some() {
+        sql.push_str(" WHERE created_at >= ?1");
+    }
+    sql.push_str(" ORDER BY id ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    if let Some(since) = since {
+        stmt.query_map([since.to_rfc3339()], row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    } else {
+        stmt.query_map([], row_from)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    }
 }
 
 pub fn usage_by_issue(db_path: &Path) -> rusqlite::Result<Vec<IssueUsageRow>> {
@@ -801,6 +966,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_summary_since_only_counts_events_at_or_after_the_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                total_tokens: Some(100),
+                ..new_event("1", "tool_call")
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        // A cutoff in the future excludes everything already written.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let none_yet = usage_summary_since(&db, &future).unwrap();
+        assert_eq!(none_yet.total_tokens, 0);
+
+        // A cutoff in the past includes it.
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let all = usage_summary_since(&db, &past).unwrap();
+        assert_eq!(all.total_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn recent_events_of_types_filters_to_the_requested_types_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "telemetry_evidence")).unwrap();
+        insert(&conn, &new_event("2", "production_validation")).unwrap();
+        drop(conn);
+
+        let rows =
+            recent_events_of_types(&db, &["telemetry_evidence", "production_validation"], 50)
+                .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(
+            |r| r.event_type == "telemetry_evidence" || r.event_type == "production_validation"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_events_of_types_with_no_types_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        drop(conn);
+
+        let rows = recent_events_of_types(&db, &[], 50).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_in_period_returns_all_rows_oldest_first_when_since_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "turn_started")).unwrap();
+        insert(&conn, &new_event("2", "worker_exit")).unwrap();
+        drop(conn);
+
+        let rows = events_in_period(&db, None).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0].event_type, "dispatched");
+        assert_eq!(rows[2].event_type, "worker_exit");
+    }
+
+    #[tokio::test]
+    async fn events_in_period_filters_by_since() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        drop(conn);
+
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let rows = events_in_period(&db, Some(&future)).unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let rows = events_in_period(&db, Some(&past)).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[tokio::test]
     async fn usage_by_issue_groups_correctly() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("events.db");
@@ -1069,5 +1324,77 @@ mod tests {
             serde_json::from_str(rows[1].message.as_deref().unwrap()).unwrap();
         assert_eq!(earliest["summary"], "first pass");
         assert_eq!(earliest["escalated"], false);
+    }
+
+    #[tokio::test]
+    async fn insert_event_is_readable_by_recent_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        let rows = recent_events(&db, &EventFilter::default(), 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_type, "security_override");
+    }
+
+    #[tokio::test]
+    async fn latest_events_by_type_returns_one_row_per_issue_the_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("first".to_string()),
+                ..new_event("1", "security_findings")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("second".to_string()),
+                ..new_event("1", "security_findings")
+            },
+        )
+        .unwrap();
+        insert(
+            &conn,
+            &NewEvent {
+                message: Some("other-issue".to_string()),
+                ..new_event("2", "security_findings")
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let rows = latest_events_by_type(&db, "security_findings").unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let issue1 = rows.iter().find(|r| r.issue_id == "1").unwrap();
+        assert_eq!(issue1.message.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn pending_override_is_none_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        assert!(pending_override(&db, "1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_override_finds_an_unconsumed_override_and_ignores_a_consumed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        assert!(pending_override(&db, "1").unwrap().is_some());
+
+        insert_event(&db, &new_event("1", "security_override_consumed")).unwrap();
+        assert!(
+            pending_override(&db, "1").unwrap().is_none(),
+            "a consumed override must not still be reported as pending"
+        );
+
+        // A second override recorded after the consumption is a fresh, unconsumed one.
+        insert_event(&db, &new_event("1", "security_override")).unwrap();
+        assert!(pending_override(&db, "1").unwrap().is_some());
     }
 }

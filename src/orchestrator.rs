@@ -96,6 +96,10 @@ struct RunningEntry {
     /// already is, so a human watching a multi-stage cycle can see which stage is
     /// running without opening `/events`.
     current_stage: Option<String>,
+    /// Most recent budget/stop-condition note (AIR-11), e.g. "cycle budget exceeded:
+    /// 2.1M tokens used, budget is 2M" -- mirrors `last_message`'s "keep the latest,
+    /// surface it on the dashboard card" shape. `None` until the first such event fires.
+    budget_note: Option<String>,
 }
 
 struct RetryEntry {
@@ -137,11 +141,13 @@ impl OrchestratorState {
     }
 }
 
+#[derive(Debug)]
 enum ExitReason {
     Normal,
     Error(String),
 }
 
+#[derive(Debug)]
 enum OrchMsg {
     SessionStarted {
         issue_id: String,
@@ -197,6 +203,47 @@ enum OrchMsg {
     ApprovalAutoApproved {
         issue_id: String,
         stage_id: String,
+    },
+    /// A `security` stage finished evaluating its artifact (model output + scanners),
+    /// whether or not it ended up blocking -- recorded unconditionally so the
+    /// dashboard's `/security` page has something to show for a clean cycle too, not
+    /// just blocked ones. `findings_json` is the fully redacted, scanner-merged
+    /// `security::SecurityFindings` artifact.
+    SecurityEvaluated {
+        issue_id: String,
+        stage_id: String,
+        risk: String,
+        findings_json: String,
+    },
+    /// The security stage's findings breached `pipeline.security.block_on` and no
+    /// pending human override was found -- the cycle is about to be parked.
+    SecurityBlocked {
+        issue_id: String,
+        reason: String,
+    },
+    /// A previously-recorded human override (`status.rs`'s `/security/override`) was
+    /// applied to unblock this evaluation -- one-shot, see
+    /// `eventlog::pending_override`.
+    SecurityOverrideConsumed {
+        issue_id: String,
+        reason: String,
+    },
+    /// A release evidence bundle was assembled and (if a Symphony-opened PR/MR was
+    /// open) consolidated into its body (`repo.release_evidence`, AIR-9). `summary`
+    /// is the verdict plus the rule(s) that produced it (`release::explain_verdict`),
+    /// so `/events` shows *why*, not just the verdict word.
+    ReleaseEvidenceReady {
+        issue_id: String,
+        summary: String,
+    },
+    /// A budget rule fired, or a `stop_conditions.*` check tripped (AIR-11) --
+    /// `event_type` is one of `budget_warn`/`budget_escalated`/`budget_stop`/
+    /// `stop_condition`, `message` is the human-readable reason `/events` and the
+    /// dashboard show verbatim as "why".
+    BudgetEvent {
+        issue_id: String,
+        event_type: String,
+        message: String,
     },
 }
 
@@ -379,11 +426,22 @@ pub struct ProjectHandles {
     /// `EffectiveConfig::workflow_dir` -- `status::router` derives the eventlog db
     /// path from this itself.
     pub workflow_dir: PathBuf,
+    /// Lets the dashboard's `/budget/extend` control (AIR-11) move an escalated/stopped
+    /// issue back to an active tracker state -- the same `TrackerAdapter` abstraction
+    /// `block_issue` already writes through, just handed to the read side too.
+    pub tracker: Arc<dyn TrackerAdapter>,
     /// Present when `swebot.chat.enabled` -- chat mode's store+worker. The
     /// multi-project service nests the web chat UI under `/projects/<id>/chat` only
     /// when `web_enabled` is set (the single-project status server serves it at
     /// `/chat` on the same condition).
     pub chat: Option<crate::swebot::chat::ChatHandles>,
+    /// AIR-8: lets the multi-project service (`src/service.rs`) wire the same
+    /// tracker-backed `/security` override action into this project's nested
+    /// dashboard that the single-project path gets above.
+    pub security: status::SecurityContext,
+    /// Backs the nested `/observability` page's "rescan now" action -- see
+    /// `status::ObservabilityHandle`.
+    pub observability: status::ObservabilityHandle,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -455,6 +513,10 @@ async fn run_inner(
     let report_path = report_path_override
         .unwrap_or_else(|| shared.config.workflow_dir.join("symphony-report.html"));
     tracing::info!(path = %report_path.display(), "usage report will be written here");
+    let db_path = shared
+        .config
+        .workflow_dir
+        .join(crate::eventlog::DB_FILENAME);
 
     startup_terminal_cleanup(&shared).await;
 
@@ -472,6 +534,12 @@ async fn run_inner(
     // HTTP surface is gated on a port).
     let chat = crate::swebot::chat::start(shared.config.clone(), shared.tracker.clone());
 
+    // Backs `/observability`'s "rescan now" action -- see `status::ObservabilityHandle`.
+    let observability_handle = status::ObservabilityHandle {
+        repo: shared.config.repo.clone(),
+        event_tx: shared.event_tx.clone(),
+    };
+
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
@@ -480,19 +548,29 @@ async fn run_inner(
             std::env::var("SYMPHONY_DAEMON_VOLUME").is_ok_and(|v| !v.trim().is_empty());
         let status_rx_for_serve = status_rx.clone();
         let workflow_dir_for_serve = workflow_dir.clone();
+        let tracker_for_serve = shared.tracker.clone();
         // Composite dashboard: the status router at the root, chat's UI nested under
         // /chat -- only when the web connector is enabled.
         let chat_router = chat
             .as_ref()
             .filter(|handles| handles.web_enabled)
             .map(|handles| crate::swebot::chat::web::router(handles.store.clone(), "/chat"));
+        let security_context = status::SecurityContext {
+            tracker: shared.tracker.clone(),
+            blocked_state: shared.config.pipeline.blocked_state.clone(),
+            resume_state: shared.config.active_states.first().cloned(),
+        };
+        let observability_for_serve = observability_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = status::serve_composite(
                 port,
                 bind_all_interfaces,
                 status_rx_for_serve,
                 workflow_dir_for_serve,
+                tracker_for_serve,
                 chat_router,
+                Some(security_context),
+                Some(observability_for_serve),
             )
             .await
             {
@@ -504,7 +582,14 @@ async fn run_inner(
         let _ = handles_tx.send(ProjectHandles {
             status_rx: status_rx.clone(),
             workflow_dir: workflow_dir.clone(),
+            tracker: shared.tracker.clone(),
             chat,
+            security: status::SecurityContext {
+                tracker: shared.tracker.clone(),
+                blocked_state: shared.config.pipeline.blocked_state.clone(),
+                resume_state: shared.config.active_states.first().cloned(),
+            },
+            observability: observability_handle,
         });
     }
 
@@ -519,6 +604,25 @@ async fn run_inner(
         });
     }
 
+    // AIR-10 Observability Agent: both halves are gated on `observability.backend`
+    // not being `none` (the default) -- see `observability::pre_merge::run`'s doc
+    // comment for why the pre-merge scan (which needs no backend of its own) is
+    // gated the same way as post-deploy validation (which does).
+    if shared.config.observability.backend != crate::config::ObservabilityBackendKind::None {
+        let pre_merge_cfg = shared.config.clone();
+        let pre_merge_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::pre_merge::run(pre_merge_cfg, pre_merge_events).await;
+        });
+
+        let validation_cfg = shared.config.clone();
+        let validation_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::production_validation::run(validation_cfg, validation_events)
+                .await;
+        });
+    }
+
     let mut interval = tokio::time::interval(Duration::from_millis(shared.config.poll_interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -528,12 +632,12 @@ async fn run_inner(
                 maybe_reload(&workflow_path, &mut shared, &mut last_attempted_mtime, &mut interval);
                 on_tick(&shared, &mut state, &tx).await;
                 status_tx.send_replace(build_status_snapshot(&state));
-                write_report(&report_path, &workflow_path, &state);
+                write_report(&report_path, &workflow_path, &db_path, &state);
             }
             Some(msg) = rx.recv() => {
                 handle_msg(&shared, &mut state, &tx, msg).await;
                 status_tx.send_replace(build_status_snapshot(&state));
-                write_report(&report_path, &workflow_path, &state);
+                write_report(&report_path, &workflow_path, &db_path, &state);
             }
             _ = &mut shutdown => {
                 tracing::info!(path = %workflow_path.display(), "project stopped (removed from service)");
@@ -543,8 +647,15 @@ async fn run_inner(
     }
 }
 
-fn write_report(report_path: &Path, workflow_path: &Path, state: &OrchestratorState) {
-    if let Err(e) = crate::metrics::write_report(report_path, workflow_path, &state.metrics) {
+fn write_report(
+    report_path: &Path,
+    workflow_path: &Path,
+    db_path: &Path,
+    state: &OrchestratorState,
+) {
+    if let Err(e) =
+        crate::metrics::write_report(report_path, workflow_path, db_path, &state.metrics)
+    {
         tracing::warn!(error = %e, path = %report_path.display(), "failed to write usage report (ignored)");
     }
 }
@@ -565,6 +676,7 @@ fn build_status_snapshot(state: &OrchestratorState) -> status::StatusSnapshot {
             last_event: e.last_event.clone(),
             last_message: e.last_message.clone(),
             stage: e.current_stage.clone(),
+            budget_note: e.budget_note.clone(),
         })
         .collect();
 
@@ -798,6 +910,7 @@ async fn dispatch_issue(
             handle,
             retry_attempt: attempt,
             current_stage: None,
+            budget_note: None,
         },
     );
     state.claimed.insert(issue_id.clone());
@@ -1670,6 +1783,51 @@ async fn handle_msg(
                 );
             }
         }
+        OrchMsg::BudgetEvent {
+            issue_id,
+            event_type,
+            message,
+        } => {
+            if let Some(e) = state.running.get_mut(&issue_id) {
+                e.budget_note = Some(message.clone());
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type,
+                        message: Some(message),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::ReleaseEvidenceReady { issue_id, summary } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "release_evidence_ready".to_string(),
+                        message: Some(summary),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
         OrchMsg::ApprovalAutoApproved { issue_id, stage_id } => {
             if let Some(e) = state.running.get(&issue_id) {
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
@@ -1691,6 +1849,63 @@ async fn handle_msg(
                     },
                 );
             }
+        }
+        OrchMsg::SecurityEvaluated {
+            issue_id,
+            stage_id,
+            risk,
+            findings_json,
+        } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "security_findings".to_string(),
+                        // First line is `stage=<id> risk=<risk>` for a quick glance in
+                        // `/events`; everything after the first newline is the raw
+                        // `security::SecurityFindings` JSON artifact, parsed back out by
+                        // `status.rs`'s `/security` page.
+                        message: Some(format!("stage={stage_id} risk={risk}\n{findings_json}")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::SecurityBlocked { issue_id, reason } => {
+            if let Some(e) = state.running.get(&issue_id) {
+                let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
+                let session_id = e.session_id.clone();
+                record_event(
+                    shared,
+                    crate::eventlog::NewEvent {
+                        issue_id,
+                        identifier,
+                        title,
+                        session_id: Some(session_id),
+                        event_type: "security_blocked".to_string(),
+                        message: Some(reason),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            }
+        }
+        OrchMsg::SecurityOverrideConsumed { issue_id, reason } => {
+            // Already persisted synchronously by `evaluate_security_stage`, before
+            // this message was even sent -- consuming an override has to be
+            // immediate (never dependent on this deferred handler running first),
+            // or two evaluations racing `pending_override` could both consume the
+            // same one. Only a log line here, not a second `eventlog` row.
+            tracing::info!(issue_id = %issue_id, reason = %reason, "security override consumed, cycle resumed");
         }
     }
 }
@@ -1820,6 +2035,19 @@ async fn run_attempt_body(
         )
         .await
     } else {
+        let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let model_key = cfg.effective_model_key();
+        let budget = TurnLoopBudget {
+            db_path,
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: None,
+        };
+        let mut cycle_usage = TokenUsage::default();
+        let mut progress = crate::budget::ProgressTracker::default();
         let (outcome, _last_message) = run_turn_loop(
             session.as_mut(),
             &snapshot.tracker,
@@ -1833,6 +2061,9 @@ async fn run_attempt_body(
             None,
             tx,
             None,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
         )
         .await;
         match outcome {
@@ -1846,11 +2077,139 @@ async fn run_attempt_body(
                 tracing::warn!(issue_id = %issue_id, question = %question, "raise_clarification called outside the delivery pipeline; ignoring");
                 ExitReason::Normal
             }
+            LoopExit::BudgetExceeded { .. } | LoopExit::StoppedByCondition(_) => {
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
+                ExitReason::Normal
+            }
         }
     };
 
+    if matches!(exit, ExitReason::Normal) {
+        finalize_release_evidence(issue_id, &issue, cfg, tx).await;
+    }
+
     session.stop().await;
     exit
+}
+
+/// AIR-9: after a cycle ends normally, with `repo.release_evidence` on, assemble an
+/// evidence bundle from what's actually recorded for this issue (its own description
+/// for requirements/AC, `eventlog` for the timeline and token totals -- see
+/// `release.rs`'s own doc comment on why most other sections are still gaps today),
+/// persist it (locally for `/evidence/<key>`, and durably via `upload_artifact` so it
+/// survives the PR/MR being closed later), and -- if this cycle opened or already had
+/// a Symphony-authored PR/MR open -- rewrite its body to lead with the agent's own
+/// narrative followed by the evidence sections.
+///
+/// Best-effort throughout (mirrors `after_run`'s own "log and ignore" stance just
+/// above this function's call site): a release-evidence failure must never fail the
+/// cycle itself, since `repo.pull_request`'s own success already happened inside the
+/// turn loop this runs after.
+async fn finalize_release_evidence(
+    issue_id: &str,
+    issue: &Issue,
+    cfg: &EffectiveConfig,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) {
+    let Some(repo_cfg) = cfg.repo.as_ref().filter(|r| r.release_evidence) else {
+        return;
+    };
+    let repo_host = match crate::repo_host::build(repo_cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to build repo host (ignored)");
+            return;
+        }
+    };
+
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let filter = crate::eventlog::EventFilter {
+        issue_id: Some(issue_id.to_string()),
+        ..Default::default()
+    };
+    let events = crate::eventlog::recent_events(&db_path, &filter, 5_000, 0).unwrap_or_default();
+    let usage = crate::eventlog::usage_by_issue(&db_path)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| r.issue_id == issue_id);
+
+    let bundle = crate::release::assemble(issue, &events, usage.as_ref());
+    let verdict = crate::release::compute_verdict(&bundle);
+    let matrix = crate::release::build_traceability_matrix(&bundle);
+    let reasons = crate::release::explain_verdict(&bundle);
+
+    let key = crate::workspace::derive_workspace_key(issue_id);
+    let dir = cfg.workflow_dir.join(".symphony").join("release");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to create local artifact dir (ignored)");
+    } else if let Ok(json) = serde_json::to_vec_pretty(&bundle)
+        && let Err(e) = std::fs::write(dir.join(format!("{key}.json")), &json)
+    {
+        tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to persist bundle locally (ignored)");
+    }
+
+    let mut artifact_links = std::collections::BTreeMap::new();
+    if let Ok(json) = serde_json::to_vec_pretty(&bundle) {
+        match repo_host
+            .upload_artifact(
+                issue_id,
+                "evidence-bundle.json",
+                &json,
+                "Persist release evidence bundle",
+            )
+            .await
+        {
+            Ok(url) => {
+                artifact_links.insert("evidence-bundle.json".to_string(), url);
+            }
+            Err(e) => {
+                tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to upload bundle artifact (ignored)")
+            }
+        }
+    }
+    for artifact in &bundle.large_artifacts {
+        if artifact.content.len() > crate::release::INLINE_ARTIFACT_LIMIT {
+            match repo_host
+                .upload_artifact(
+                    issue_id,
+                    &artifact.name,
+                    artifact.content.as_bytes(),
+                    &format!("Attach release artifact: {}", artifact.name),
+                )
+                .await
+            {
+                Ok(url) => {
+                    artifact_links.insert(artifact.name.clone(), url);
+                }
+                Err(e) => {
+                    tracing::warn!(issue_id = %issue_id, artifact = %artifact.name, error = %e, "release evidence: failed to upload oversized artifact (ignored)")
+                }
+            }
+        }
+    }
+
+    let rendered = crate::release::render_markdown(&bundle, verdict, &matrix, &artifact_links);
+
+    match repo_host.list_open_symphony_prs().await {
+        Ok(prs) => {
+            let head = format!("issue-{key}");
+            if let Some(pr) = prs.iter().find(|p| p.head_ref == head) {
+                let composed = crate::release::compose_pr_body(&pr.body, &rendered);
+                if let Err(e) = repo_host.update_pr_body(pr.number, &composed).await {
+                    tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to update PR/MR body (ignored)");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(issue_id = %issue_id, error = %e, "release evidence: failed to list open PRs/MRs (ignored)");
+        }
+    }
+
+    let summary = format!("{}: {}", verdict.as_str(), reasons.join("; "));
+    let _ = tx.send(OrchMsg::ReleaseEvidenceReady {
+        issue_id: issue_id.to_string(),
+        summary,
+    });
 }
 
 /// How a fixed-turn-budget run of `run_turn_loop` ended. `Completed` and
@@ -1861,6 +2220,7 @@ async fn run_attempt_body(
 /// `update_issue_state` to a terminal state) means the whole cycle is done, whereas
 /// `Completed` (the stage simply ran out its own turn budget) means "move on to the
 /// next stage."
+#[derive(Debug)]
 enum LoopExit {
     Completed,
     EndedByIssueState,
@@ -1871,6 +2231,31 @@ enum LoopExit {
     /// `pipeline.blocked_state` via the same `block_issue` path. Carries the question
     /// only for the `stage_finished` event message.
     Blocked(String),
+    /// A budget (`config::BudgetsConfig`) was exceeded at some scope, with
+    /// `on_exceeded: escalate` or `stop` -- both end the cycle cleanly the same way a
+    /// blocking stage's failure does (`block_issue`); which one it was has already been
+    /// recorded distinctly via `OrchMsg::BudgetEvent` (its `event_type`) by the time
+    /// this is returned, so there's nothing left for a caller to branch on here.
+    BudgetExceeded {
+        reason: String,
+    },
+    /// `stop_conditions.no_progress_turns`/`repeated_error` fired (AIR-11) -- same
+    /// clean-stop handling as `BudgetExceeded`.
+    StoppedByCondition(String),
+}
+
+/// Everything a `run_turn_loop` call needs for budget enforcement and the
+/// no-progress/repeated-error stopping conditions (AIR-11), bundled so the loop's own
+/// signature doesn't grow another five positional arguments. Built once per
+/// `run_turn_loop` invocation (i.e. once per stage) by its caller.
+struct TurnLoopBudget<'a> {
+    db_path: PathBuf,
+    workspace_path: &'a Path,
+    budgets: &'a config::BudgetsConfig,
+    stop_conditions: &'a config::StopConditionsConfig,
+    pricing: &'a crate::budget::PricingTable,
+    model_key: &'a str,
+    stage_override: Option<&'a config::BudgetLimits>,
 }
 
 /// Runs 1..=`max_turns` turns of `session` against `issue`, refreshing tracker state
@@ -1886,6 +2271,12 @@ enum LoopExit {
 /// `resume_note`, when set, is appended to *only* the first turn's prompt -- a human
 /// reviewer's "request changes" comment, injected back into the same stage's next
 /// attempt (`run_pipeline`'s resume handling).
+///
+/// `cycle_usage` accumulates across every call within one cycle (a pipeline has one
+/// call per stage, sharing the same accumulator; the non-pipeline path has exactly one
+/// call, so it's equivalent to "whole cycle" trivially); `progress` similarly persists
+/// per cycle. Both are owned by the caller so they survive across the several
+/// `run_turn_loop` calls a multi-stage pipeline makes.
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_loop(
     session: &mut dyn AgentSession,
@@ -1907,7 +2298,11 @@ async fn run_turn_loop(
     cycle: Option<&serde_json::Value>,
     tx: &mpsc::UnboundedSender<OrchMsg>,
     resume_note: Option<&str>,
+    budget: &TurnLoopBudget<'_>,
+    cycle_usage: &mut TokenUsage,
+    progress: &mut crate::budget::ProgressTracker,
 ) -> (LoopExit, Option<String>) {
+    let mut stage_usage = TokenUsage::default();
     let mut turn_number: u32 = 1;
     let mut last_message: Option<String> = None;
     loop {
@@ -1935,26 +2330,113 @@ async fn run_turn_loop(
             issue_id: issue_id.to_string(),
         });
 
-        let (outcome, question, msg) = run_one_turn(session, &prompt, issue_id, tx).await;
+        let (turn_result, question, msg, had_tool_call) =
+            run_one_turn(session, &prompt, issue_id, tx).await;
         if msg.is_some() {
             last_message = msg;
         }
         if let Some(question) = question {
             return (LoopExit::Blocked(question), last_message);
         }
-        match outcome {
-            Ok(TurnOutcome::Completed { .. }) => {}
+
+        let error_text = match &turn_result {
+            Ok(TurnOutcome::Failed { reason }) => Some(reason.clone()),
+            Err(e) => Some(e.to_string()),
+            Ok(TurnOutcome::Completed { .. }) => None,
+        };
+        // `None` (git unavailable/not a repo) falls back to the tool-call signal alone
+        // rather than assuming "touched" -- see `budget::workspace_touched`'s doc.
+        let touched = crate::budget::workspace_touched(budget.workspace_path)
+            .await
+            .unwrap_or(false);
+        let made_progress = had_tool_call || touched;
+
+        match progress.observe_turn(made_progress, error_text.as_deref(), budget.stop_conditions) {
+            crate::budget::StopSignal::None => {}
+            crate::budget::StopSignal::NoProgress(n) => {
+                let reason = format!("no progress for {n} consecutive turns");
+                let _ = tx.send(OrchMsg::BudgetEvent {
+                    issue_id: issue_id.to_string(),
+                    event_type: "stop_condition".to_string(),
+                    message: reason.clone(),
+                });
+                return (LoopExit::StoppedByCondition(reason), last_message);
+            }
+            crate::budget::StopSignal::RepeatedError(n) => {
+                let reason = format!("same error repeated {n} times in a row");
+                let _ = tx.send(OrchMsg::BudgetEvent {
+                    issue_id: issue_id.to_string(),
+                    event_type: "stop_condition".to_string(),
+                    message: reason.clone(),
+                });
+                return (LoopExit::StoppedByCondition(reason), last_message);
+            }
+        }
+
+        match turn_result {
+            Ok(TurnOutcome::Completed { usage }) => {
+                if let Some(u) = usage {
+                    stage_usage.input_tokens += u.input_tokens;
+                    stage_usage.output_tokens += u.output_tokens;
+                    stage_usage.total_tokens += u.total_tokens;
+                    cycle_usage.input_tokens += u.input_tokens;
+                    cycle_usage.output_tokens += u.output_tokens;
+                    cycle_usage.total_tokens += u.total_tokens;
+                }
+            }
             Ok(TurnOutcome::Failed { reason }) => {
-                return (
-                    LoopExit::Error(format!("agent turn error: {reason}")),
-                    last_message,
-                );
+                // Fail fast exactly as before unless `stop_conditions.repeated_error`
+                // is configured to tolerate repeats -- in that case `observe_turn`
+                // above already handles ending the loop once the streak hits its
+                // threshold, so a failure short of that just continues to the next
+                // turn like a completed (if unproductive) one.
+                if budget.stop_conditions.repeated_error.is_none() {
+                    return (
+                        LoopExit::Error(format!("agent turn error: {reason}")),
+                        last_message,
+                    );
+                }
             }
             Err(e) => {
-                return (
-                    LoopExit::Error(format!("agent turn error: {e}")),
-                    last_message,
-                );
+                if budget.stop_conditions.repeated_error.is_none() {
+                    return (
+                        LoopExit::Error(format!("agent turn error: {e}")),
+                        last_message,
+                    );
+                }
+            }
+        }
+
+        let budget_ctx = crate::budget::BudgetContext {
+            db_path: &budget.db_path,
+            budgets: budget.budgets,
+            pricing: budget.pricing,
+            model_key: budget.model_key,
+            stage_override: budget.stage_override,
+        };
+        if let Some(verdict) =
+            crate::budget::check_after_turn(&budget_ctx, &stage_usage, cycle_usage)
+        {
+            let event_type = match verdict.action {
+                config::BudgetAction::Warn => "budget_warn",
+                config::BudgetAction::Escalate => "budget_escalated",
+                config::BudgetAction::Stop => "budget_stop",
+            };
+            let message = format!(
+                "{} budget exceeded: {}",
+                verdict.scope.label(),
+                verdict.reason
+            );
+            let _ = tx.send(OrchMsg::BudgetEvent {
+                issue_id: issue_id.to_string(),
+                event_type: event_type.to_string(),
+                message: message.clone(),
+            });
+            match verdict.action {
+                config::BudgetAction::Warn => {}
+                config::BudgetAction::Escalate | config::BudgetAction::Stop => {
+                    return (LoopExit::BudgetExceeded { reason: message }, last_message);
+                }
             }
         }
 
@@ -2023,6 +2505,12 @@ async fn run_pipeline(
     let cycle_id = format!("{issue_id}-{}", attempt.unwrap_or(1));
     let mut previous_stage_summary = String::new();
     let artifacts_db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let model_key = cfg.effective_model_key();
+    // Shared across every stage in this cycle -- a pipeline calls `run_turn_loop` once
+    // per stage, but `budgets.cycle` and `stop_conditions.*` are whole-cycle concepts.
+    let mut cycle_usage = TokenUsage::default();
+    let mut progress = crate::budget::ProgressTracker::default();
 
     // AIR-5: a prior cycle may have parked at a `requires_approval` stage and just
     // been resumed (approved -> the stage after it; "request changes" -> the same
@@ -2193,6 +2681,15 @@ async fn run_pipeline(
             None => &mut *session,
         };
 
+        let budget = TurnLoopBudget {
+            db_path: db_path.clone(),
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: stage.budget.as_ref(),
+        };
         let (mut outcome, mut last_message) = run_turn_loop(
             active_session,
             &snapshot.tracker,
@@ -2206,6 +2703,9 @@ async fn run_pipeline(
             Some(&cycle_ctx),
             tx,
             resume_note,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
         )
         .await;
 
@@ -2226,6 +2726,9 @@ async fn run_pipeline(
                 Some(&cycle_ctx),
                 tx,
                 resume_note,
+                &budget,
+                &mut cycle_usage,
+                &mut progress,
             )
             .await;
         }
@@ -2275,6 +2778,22 @@ async fn run_pipeline(
             }
         }
 
+        // AIR-8: a `security` stage's turns completing successfully is not the same
+        // as the change passing security review -- evaluate the artifact the stage's
+        // rubric (`roles::builtin::prompt_for("security")`) instructs the agent to
+        // write, plus any configured scanners, and turn a threshold breach into the
+        // same `LoopExit::Error` any other stage failure produces, so the existing
+        // `on_failure`/`blocking` handling below (unchanged) is what actually parks
+        // the issue.
+        if stage.role.eq_ignore_ascii_case("security")
+            && matches!(outcome, LoopExit::Completed | LoopExit::EndedByIssueState)
+        {
+            outcome =
+                evaluate_security_stage(issue_id, &stage.id, workspace_path, container, cfg, tx)
+                    .await
+                    .unwrap_or(outcome);
+        }
+
         let outcome_label = match &outcome {
             LoopExit::Completed => "completed".to_string(),
             LoopExit::EndedByIssueState => "ended by issue state".to_string(),
@@ -2285,6 +2804,8 @@ async fn run_pipeline(
             LoopExit::Blocked(question) => {
                 format!("blocked: clarification needed: {question}")
             }
+            LoopExit::BudgetExceeded { reason, .. } => format!("stopped: {reason}"),
+            LoopExit::StoppedByCondition(reason) => format!("stopped: {reason}"),
         };
         previous_stage_summary = format!("{}: {outcome_label}", stage.id);
         let _ = tx.send(OrchMsg::StageFinished {
@@ -2400,6 +2921,12 @@ async fn run_pipeline(
                     Some(&question),
                 )
                 .await;
+                return ExitReason::Normal;
+            }
+            LoopExit::BudgetExceeded { .. } | LoopExit::StoppedByCondition(_) => {
+                // Orchestrator-level cuts, independent of the stage's own
+                // `on_failure`/`blocking` config -- always parked, never retried.
+                block_issue(snapshot, issue_id, &cfg.pipeline.blocked_state, None).await;
                 return ExitReason::Normal;
             }
             LoopExit::Error(reason) => {
@@ -2754,12 +3281,138 @@ fn emit_test_stage_events(
     }
 }
 
+/// AIR-8: evaluate a `security` stage's output after its turns complete. Reads the
+/// `security_findings` artifact the stage's rubric (the built-in `security` role
+/// prompt, `roles::builtin::prompt_for("security")`) instructs the agent to write to
+/// `.symphony/security_findings.json` inside the workspace, folds in any configured
+/// deterministic scanners, and decides whether the result breaches
+/// `pipeline.security.block_on`.
+///
+/// Returns `None` when the stage should be treated as it already was (no threshold
+/// breach); `Some(LoopExit::Error(reason))` when it should instead be treated as a
+/// stage failure -- letting the existing `on_failure`/`blocking` handling in
+/// `run_pipeline` decide what that means for the cycle, exactly like a turn error
+/// would. A missing/invalid artifact is itself a failure: the stage's whole job is to
+/// produce it.
+async fn evaluate_security_stage(
+    issue_id: &str,
+    stage_id: &str,
+    workspace_path: &Path,
+    container: Option<&ContainerHandle>,
+    cfg: &EffectiveConfig,
+    tx: &mpsc::UnboundedSender<OrchMsg>,
+) -> Option<LoopExit> {
+    let artifact_path = workspace_path
+        .join(".symphony")
+        .join("security_findings.json");
+    let raw = match std::fs::read_to_string(&artifact_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Some(LoopExit::Error(format!(
+                "security stage produced no .symphony/security_findings.json artifact: {e}"
+            )));
+        }
+    };
+    let mut findings: crate::security::SecurityFindings = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => {
+            return Some(LoopExit::Error(format!(
+                "security_findings artifact is not valid JSON for the expected schema: {e}"
+            )));
+        }
+    };
+    if let Err(e) = findings.validate() {
+        return Some(LoopExit::Error(format!(
+            "security_findings artifact failed validation: {e}"
+        )));
+    }
+
+    crate::security::run_scanners(
+        &cfg.pipeline.security.scanners,
+        &mut findings,
+        &cfg.workflow_dir,
+        workspace_path,
+        cfg.hook_timeout_ms,
+        container,
+    )
+    .await;
+    findings.recompute_risk();
+
+    let findings_json = serde_json::to_string(&findings).unwrap_or_default();
+    let _ = tx.send(OrchMsg::SecurityEvaluated {
+        issue_id: issue_id.to_string(),
+        stage_id: stage_id.to_string(),
+        risk: findings.risk_classification.as_str().to_string(),
+        findings_json,
+    });
+
+    if !findings.is_blocking(&cfg.pipeline.security.block_on) {
+        return None;
+    }
+
+    let threshold = cfg
+        .pipeline
+        .security
+        .block_on
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let reason = format!(
+        "security findings at or above the blocking threshold ({threshold}); overall risk: {}",
+        findings.risk_classification.as_str()
+    );
+
+    let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+    let pending = crate::eventlog::pending_override(&db_path, issue_id).unwrap_or(None);
+    if let Some(over) = pending {
+        let reason = over.message.unwrap_or_default();
+        // Written synchronously, not via `tx`/`handle_msg`'s deferred event-log
+        // writer: `pending_override` must never see this same override as pending
+        // again once this function returns, or a second concurrent (or immediately
+        // re-run) evaluation could consume it twice. The `tx.send` below is purely
+        // for `/events` visibility -- the one-shot guarantee lives in this write.
+        if let Err(e) = crate::eventlog::insert_event(
+            &db_path,
+            &crate::eventlog::NewEvent {
+                issue_id: issue_id.to_string(),
+                identifier: issue_id.to_string(),
+                title: String::new(),
+                session_id: None,
+                event_type: "security_override_consumed".to_string(),
+                message: Some(reason.clone()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+        ) {
+            tracing::warn!(issue_id = %issue_id, error = %e, "failed to record security override consumption");
+        }
+        let _ = tx.send(OrchMsg::SecurityOverrideConsumed {
+            issue_id: issue_id.to_string(),
+            reason,
+        });
+        return None;
+    }
+
+    let _ = tx.send(OrchMsg::SecurityBlocked {
+        issue_id: issue_id.to_string(),
+        reason: reason.clone(),
+    });
+    Some(LoopExit::Error(reason))
+}
+
 /// Returns the turn's outcome, plus two things extracted while forwarding its event
 /// stream (so nothing needs a second pass over it): `Some(question)` if this turn
 /// called `raise_clarification` with `blocking: true` (AIR-4, lets `run_turn_loop`
 /// stop the cycle), and the turn's final text message, if any (AIR-5's approval gate
 /// uses a `requires_approval` stage's last words as the plan content shown to a
 /// human, `handle_stage_approval`).
+///
+/// Also reports whether at least one `tool_call` event was observed during the turn --
+/// the "did this turn do anything" half of `stop_conditions.no_progress_turns`'s signal
+/// (the other half, a workspace diff, is checked separately since it needs the
+/// workspace path, not anything in the event stream).
 async fn run_one_turn(
     session: &mut dyn AgentSession,
     prompt: &str,
@@ -2769,10 +3422,13 @@ async fn run_one_turn(
     Result<TurnOutcome, crate::agent::AgentError>,
     Option<String>,
     Option<String>,
+    bool,
 ) {
     let (etx, mut erx) = mpsc::unbounded_channel::<AgentEvent>();
     let fwd_issue_id = issue_id.to_string();
     let fwd_tx = tx.clone();
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let had_tool_call_writer = had_tool_call.clone();
     let forward = tokio::spawn(async move {
         let mut blocked_on: Option<String> = None;
         let mut last_message: Option<String> = None;
@@ -2790,6 +3446,9 @@ async fn run_one_turn(
                         .to_string(),
                 );
             }
+            if ev.event == "tool_call" {
+                had_tool_call_writer.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(m) = &ev.message {
                 last_message = Some(m.clone());
             }
@@ -2802,7 +3461,12 @@ async fn run_one_turn(
     });
     let result = session.run_turn(prompt, etx).await;
     let (blocked_on, last_message) = forward.await.unwrap_or((None, None));
-    (result, blocked_on, last_message)
+    (
+        result,
+        blocked_on,
+        last_message,
+        had_tool_call.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 fn render_turn_prompt(
@@ -3115,6 +3779,283 @@ mod tests {
             agent_backend: Arc::new(backend),
             workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
         }
+    }
+
+    /// Same shape as `pipeline_snapshot` but with the whole config YAML supplied
+    /// directly, for tests (budgets, `stop_conditions`) that need top-level keys
+    /// outside `pipeline.stages`.
+    fn snapshot_with_config(
+        tracker_dir: &Path,
+        cfg_yaml: &str,
+        backend: Arc<dyn AgentBackend>,
+    ) -> DispatchSnapshot {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(cfg_yaml).unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+
+        let provider: serde_yaml::Value =
+            serde_yaml::from_str(&format!("dir: {:?}", tracker_dir)).unwrap();
+        let tracker_adapter = tracker::build("local", &provider, Path::new(".")).unwrap();
+
+        DispatchSnapshot {
+            config: cfg,
+            prompt_template: String::new(),
+            tracker: Arc::from(tracker_adapter),
+            agent_backend: backend,
+            workspace_mgr: Arc::new(WorkspaceManager::new(PathBuf::from("unused"))),
+        }
+    }
+
+    /// Runs `run_turn_loop` directly (the non-pipeline path's shape) against
+    /// `snapshot`, returning its `LoopExit` -- shared setup for the `stop_conditions`
+    /// tests below, which don't need `pipeline.enabled` at all.
+    async fn run_turn_loop_for_test(
+        snapshot: &DispatchSnapshot,
+        issue_id: &str,
+        workspace_path: &Path,
+        tx: &mpsc::UnboundedSender<OrchMsg>,
+    ) -> LoopExit {
+        let cfg = &snapshot.config;
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(std::slice::from_ref(&issue_id.to_string()))
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                workspace_path,
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let db_path = cfg.workflow_dir.join(crate::eventlog::DB_FILENAME);
+        let model_key = cfg.effective_model_key();
+        let budget = TurnLoopBudget {
+            db_path,
+            workspace_path,
+            budgets: &cfg.budgets,
+            stop_conditions: &cfg.stop_conditions,
+            pricing: &cfg.pricing,
+            model_key: &model_key,
+            stage_override: None,
+        };
+        let mut cycle_usage = TokenUsage::default();
+        let mut progress = crate::budget::ProgressTracker::default();
+        let (outcome, _last_message) = run_turn_loop(
+            session.as_mut(),
+            &snapshot.tracker,
+            &cfg.active_states,
+            &cfg.required_labels,
+            &snapshot.prompt_template,
+            &mut issue,
+            None,
+            cfg.max_turns,
+            issue_id,
+            None,
+            tx,
+            None,
+            &budget,
+            &mut cycle_usage,
+            &mut progress,
+        )
+        .await;
+        session.stop().await;
+        outcome
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-11: stop_conditions (no_progress_turns/repeated_error) stop a looping agent
+    // -----------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_progress_turns_stops_a_looping_agent_before_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "NP-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nstop_conditions:\n  no_progress_turns: 3\n",
+            Arc::new(ScriptedBackend::new(calls.clone(), HashMap::new())),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Not a git repo: `budget::workspace_touched` returns `None` here, so the only
+        // progress signal left is the tool-call one -- `ScriptedSession` never sends a
+        // `tool_call` event, so every turn counts as "no progress."
+        let workspace = tempdir().unwrap();
+
+        let outcome = run_turn_loop_for_test(&snapshot, "NP-1", workspace.path(), &tx).await;
+
+        assert!(
+            matches!(outcome, LoopExit::StoppedByCondition(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            3,
+            "should stop after exactly 3 no-progress turns, not run to max_turns (10)"
+        );
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::BudgetEvent { event_type, .. } if event_type == "stop_condition")
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_error_stops_a_looping_agent_before_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "RE-1");
+        let calls = Arc::new(Mutex::new(0));
+        let failures: HashMap<u32, String> = (1..=10)
+            .map(|n| (n, "boom: same error".to_string()))
+            .collect();
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nstop_conditions:\n  repeated_error: 3\n",
+            Arc::new(ScriptedBackend::new(calls.clone(), failures)),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome = run_turn_loop_for_test(&snapshot, "RE-1", workspace.path(), &tx).await;
+
+        assert!(
+            matches!(outcome, LoopExit::StoppedByCondition(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            3,
+            "should stop after exactly 3 identical failures in a row, not run to max_turns (10)"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn without_stop_conditions_a_single_failure_still_ends_the_loop_immediately() {
+        // Same failing session as the repeated-error test, but with no `stop_conditions`
+        // configured at all -- behavior must be unchanged from before this ticket:
+        // the very first failure ends the loop.
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "RE-2");
+        let calls = Arc::new(Mutex::new(0));
+        let failures: HashMap<u32, String> = (1..=10).map(|n| (n, "boom".to_string())).collect();
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\n",
+            Arc::new(ScriptedBackend::new(calls.clone(), failures)),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome = run_turn_loop_for_test(&snapshot, "RE-2", workspace.path(), &tx).await;
+
+        assert!(matches!(outcome, LoopExit::Error(_)), "{outcome:?}");
+        assert_eq!(*calls.lock().unwrap(), 1);
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn cycle_token_budget_stop_parks_the_issue_without_reaching_max_turns() {
+        let tracker_dir = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "BUD-1");
+        let calls = Arc::new(Mutex::new(0));
+        let snapshot = snapshot_with_config(
+            tracker_dir.path(),
+            "tracker:\n  kind: local\n  active_states: [todo]\n  terminal_states: [done]\n\
+             agent:\n  max_turns: 10\nbudgets:\n  cycle:\n    tokens: 250\n  on_exceeded: stop\n",
+            Arc::new(ScriptedTokenBackend {
+                calls: calls.clone(),
+                tokens_per_turn: 100,
+            }),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = tempdir().unwrap();
+
+        let outcome = run_turn_loop_for_test(&snapshot, "BUD-1", workspace.path(), &tx).await;
+
+        assert!(
+            matches!(outcome, LoopExit::BudgetExceeded { .. }),
+            "{outcome:?}"
+        );
+        // 100 tokens/turn: still under 250 after turn 2 (200), over after turn 3 (300).
+        assert_eq!(*calls.lock().unwrap(), 3);
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::BudgetEvent { event_type, .. } if event_type == "budget_stop")
+            ),
+            "{msgs:?}"
+        );
+    }
+
+    /// A canned-outcome session that reports real `TokenUsage` every turn (unlike
+    /// `ScriptedSession`, which always reports `None`) -- lets a budget test drive the
+    /// cycle-level token accumulator deterministically.
+    struct ScriptedTokenBackend {
+        calls: Arc<Mutex<u32>>,
+        tokens_per_turn: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for ScriptedTokenBackend {
+        async fn start_session(
+            &self,
+            _workspace: &Path,
+            _issue_id: &str,
+            _title: &str,
+            _container: Option<&ContainerHandle>,
+            _tool_policy: &crate::agent::ToolPolicy,
+        ) -> Result<Box<dyn AgentSession>, crate::agent::AgentError> {
+            Ok(Box::new(ScriptedTokenSession {
+                calls: self.calls.clone(),
+                tokens_per_turn: self.tokens_per_turn,
+            }))
+        }
+    }
+
+    struct ScriptedTokenSession {
+        calls: Arc<Mutex<u32>>,
+        tokens_per_turn: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSession for ScriptedTokenSession {
+        fn session_id(&self) -> &str {
+            "scripted-token-session"
+        }
+
+        async fn run_turn(
+            &mut self,
+            _prompt: &str,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<TurnOutcome, crate::agent::AgentError> {
+            {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+            }
+            let _ = events.send(AgentEvent::new("tool_call").with_message("edit"));
+            Ok(TurnOutcome::Completed {
+                usage: Some(TokenUsage {
+                    input_tokens: self.tokens_per_turn,
+                    output_tokens: 0,
+                    total_tokens: self.tokens_per_turn,
+                }),
+            })
+        }
+
+        async fn stop(self: Box<Self>) {}
     }
 
     async fn drain(mut rx: mpsc::UnboundedReceiver<OrchMsg>) -> Vec<OrchMsg> {
@@ -3617,6 +4558,307 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------
+    // AIR-8: security stage evaluation (`evaluate_security_stage`)
+    // -----------------------------------------------------------------------------
+
+    fn write_security_artifact(workspace: &Path, severity: &str) {
+        let dir = workspace.join(".symphony");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("security_findings.json"),
+            format!(
+                r#"{{"schema_version":1,"risk_classification":"low","owasp_checklist":[
+                    {{"id":"A01:2021","name":"Broken Access Control","applicable":false,
+                     "status":"not_applicable","evidence":"no auth surface touched"}}],
+                "findings":[{{"id":"S1","severity":"{severity}","owasp_id":"A03:2021",
+                    "cwe":"CWE-89","file":"src/x.rs","line":10,"summary":"sql injection",
+                    "exploit_scenario":"...", "remediation":"..."}}],
+                "secrets_scan":{{"status":"clean","matches":[]}},
+                "dependency_scan":{{"tool":"","status":"not_run","advisories":[]}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn security_stage_blocking_finding_parks_the_issue() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-1");
+        write_security_artifact(workspace.path(), "critical");
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-1".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "blocked");
+
+        let msgs = drain(rx).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, OrchMsg::SecurityBlocked { .. }))
+        );
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, OrchMsg::SecurityEvaluated { risk, .. } if risk == "critical")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn security_stage_pending_override_unblocks_and_is_consumed() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-2");
+        write_security_artifact(workspace.path(), "critical");
+
+        let db_path = workflow_dir.path().join(crate::eventlog::DB_FILENAME);
+        crate::eventlog::insert_event(
+            &db_path,
+            &crate::eventlog::NewEvent {
+                issue_id: "P-SEC-2".to_string(),
+                identifier: "P-SEC-2".to_string(),
+                title: "Test issue".to_string(),
+                session_id: None,
+                event_type: "security_override".to_string(),
+                message: Some("accepted risk: fix scheduled next sprint".to_string()),
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: None,
+            },
+        )
+        .unwrap();
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-2".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed[0].normalized_state(),
+            "todo",
+            "an overridden block must not park the issue"
+        );
+
+        let msgs = drain(rx).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, OrchMsg::SecurityBlocked { .. }))
+        );
+        assert!(msgs.iter().any(
+            |m| matches!(m, OrchMsg::SecurityOverrideConsumed { reason, .. } if reason.contains("fix scheduled"))
+        ));
+
+        // One-shot: a second evaluation with the same pending state must not still be
+        // able to use the already-consumed override.
+        assert!(
+            crate::eventlog::pending_override(&db_path, "P-SEC-2")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn security_stage_clean_findings_do_not_block() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-3");
+        write_security_artifact(workspace.path(), "low");
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-3".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-3".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "todo");
+    }
+
+    #[tokio::test]
+    async fn security_stage_missing_artifact_is_treated_as_a_stage_failure() {
+        let tracker_dir = tempdir().unwrap();
+        let workflow_dir = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        write_pipeline_issue(tracker_dir.path(), "P-SEC-4");
+        // Deliberately no `.symphony/security_findings.json` written.
+
+        let mut snapshot = pipeline_snapshot(
+            tracker_dir.path(),
+            "  - id: security\n    role: security\n    max_turns: 1\n    blocking: true\n",
+            ScriptedBackend::new(Arc::new(Mutex::new(0)), HashMap::new()),
+        );
+        snapshot.config.workflow_dir = workflow_dir.path().to_path_buf();
+
+        let mut issue = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-4".to_string()])
+            .await
+            .unwrap()
+            .remove(0);
+        let mut session = snapshot
+            .agent_backend
+            .start_session(
+                Path::new("."),
+                &issue.id,
+                "t",
+                None,
+                &crate::agent::ToolPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let exit = run_pipeline(
+            &issue.id.clone(),
+            &mut issue,
+            None,
+            session.as_mut(),
+            &snapshot,
+            workspace.path(),
+            None,
+            &tx,
+        )
+        .await;
+        assert!(matches!(exit, ExitReason::Normal));
+
+        let refreshed = snapshot
+            .tracker
+            .fetch_issues_by_ids(&["P-SEC-4".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed[0].normalized_state(), "blocked");
+
+        let msgs = drain(rx).await;
+        let stages = stage_events(&msgs);
+        assert!(
+            stages
+                .iter()
+                .any(|(kind, id)| *kind == "finished" && *id == "security")
+        );
+    }
+
+    // -----------------------------------------------------------------------------
     // BUG-3: plan usage-limit ("session limit") handling
     // -----------------------------------------------------------------------------
 
@@ -3683,6 +4925,7 @@ mod tests {
                 handle,
                 retry_attempt: None,
                 current_stage: None,
+                budget_note: None,
             },
         );
 
@@ -4902,6 +6145,7 @@ mod tests {
             blocking: false,
             optional: false,
             requires_approval: false,
+            budget: None,
         }
     }
 
@@ -5008,5 +6252,66 @@ mod tests {
             latest_review_recommendation(&workflow_dir, &db, "issue-1", "review").unwrap();
         assert_eq!(recommendation, "request_changes");
         assert_eq!(summary, "requests changes: AC3 unmet");
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-9: release evidence (`finalize_release_evidence`)
+    // -----------------------------------------------------------------------------
+
+    fn test_issue(id: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            native_ref: None,
+            identifier: id.to_string(),
+            title: "test issue".to_string(),
+            description: Some("- [x] done thing".to_string()),
+            priority: None,
+            state: "in_progress".to_string(),
+            branch_name: None,
+            url: None,
+            assignee_id: None,
+            labels: vec![],
+            blocked_by: vec![],
+            dispatchable: true,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// `repo.release_evidence` off (the default) must not touch anything -- no PR
+    /// lookup, no artifact upload, no event -- keeping `open_pull_request`'s own
+    /// pipeline-off behavior byte-identical to before this feature existed.
+    #[tokio::test]
+    async fn finalize_release_evidence_is_a_noop_when_the_flag_is_off() {
+        let cfg_yaml: serde_yaml::Value =
+            serde_yaml::from_str("tracker:\n  kind: local\n").unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(cfg.repo.is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        finalize_release_evidence("issue-1", &test_issue("AIR-TEST-1"), &cfg, &tx).await;
+        drop(tx);
+        assert!(
+            rx.recv().await.is_none(),
+            "no message should be sent when release_evidence is off"
+        );
+    }
+
+    /// Same no-op guarantee when `repo:` is configured but `release_evidence` itself
+    /// wasn't turned on -- the common case of a project only using `pull_request`.
+    #[tokio::test]
+    async fn finalize_release_evidence_is_a_noop_without_release_evidence_flag() {
+        let cfg_yaml: serde_yaml::Value = serde_yaml::from_str(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_ORCH_RELEASE_EVIDENCE_OFF\n  pull_request: true\n",
+        )
+        .unwrap();
+        let cfg = config::resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.repo.as_ref().unwrap().release_evidence);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        finalize_release_evidence("issue-1", &test_issue("AIR-TEST-2"), &cfg, &tx).await;
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -38,9 +38,17 @@ struct RunningProject {
     shutdown_tx: Option<oneshot::Sender<()>>,
     status_rx: watch::Receiver<status::StatusSnapshot>,
     workflow_dir: PathBuf,
+    /// Handed to the nested `status::router` so its `/budget/extend` control (AIR-11)
+    /// can resume a budget-blocked cycle.
+    tracker: Arc<dyn crate::tracker::TrackerAdapter>,
     /// Present when `swebot.chat.enabled` -- backs the project's nested `/chat` UI
     /// when `web_enabled`.
     chat: Option<crate::swebot::chat::ChatHandles>,
+    /// AIR-8: backs the project's nested `/security` override action with a real
+    /// tracker, same as the single-project `--port` path.
+    security: status::SecurityContext,
+    /// Backs the project's nested `/observability` page's "rescan now" action.
+    observability: status::ObservabilityHandle,
 }
 
 #[derive(Clone)]
@@ -187,7 +195,10 @@ async fn spawn_project(
             shutdown_tx: Some(shutdown_tx),
             status_rx: handles.status_rx,
             workflow_dir: handles.workflow_dir,
+            tracker: handles.tracker,
             chat: handles.chat,
+            security: handles.security,
+            observability: handles.observability,
         },
     );
     Ok(())
@@ -524,10 +535,17 @@ async fn project_proxy(
         Some(id) => id.clone(),
         None => return (StatusCode::NOT_FOUND, "missing project id").into_response(),
     };
-    let (status_rx, workflow_dir, chat) = {
+    let (status_rx, workflow_dir, tracker, chat, security, observability) = {
         let running = state.running.lock().await;
         match running.get(&id) {
-            Some(p) => (p.status_rx.clone(), p.workflow_dir.clone(), p.chat.clone()),
+            Some(p) => (
+                p.status_rx.clone(),
+                p.workflow_dir.clone(),
+                p.tracker.clone(),
+                p.chat.clone(),
+                p.security.clone(),
+                p.observability.clone(),
+            ),
             None => return (StatusCode::NOT_FOUND, "unknown or removed project").into_response(),
         }
     };
@@ -545,7 +563,15 @@ async fn project_proxy(
     }
 
     let chat_enabled = chat.as_ref().is_some_and(|handles| handles.web_enabled);
-    let sub_router = status::router(status_rx, workflow_dir, &prefix, chat_enabled);
+    let sub_router = status::router(
+        status_rx,
+        workflow_dir,
+        tracker,
+        &prefix,
+        chat_enabled,
+        Some(security),
+        Some(observability),
+    );
     let sub_router = match &chat {
         Some(handles) if handles.web_enabled => sub_router.nest(
             "/chat",

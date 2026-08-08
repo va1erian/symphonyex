@@ -21,8 +21,13 @@
 
 use crate::approvals;
 use crate::artifacts;
+use crate::config;
 use crate::eventlog;
-use crate::web::{escape, urlencode};
+use crate::release::{self, EvidenceBundle, Verdict};
+use crate::security::SecurityFindings;
+use crate::tracker::TrackerAdapter;
+use crate::web;
+use crate::web::{error_banner, escape, urlencode};
 use axum::Router;
 use axum::extract::{Form, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -32,6 +37,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
 use tokio_stream::{Stream, StreamExt};
@@ -63,6 +69,9 @@ pub struct RunningRow {
     /// pipeline (`pipeline.enabled`) is on for this project. `None` for the legacy
     /// single-stage path, or before the first stage has started.
     pub stage: Option<String>,
+    /// Most recent budget/stop-condition note (AIR-11: `budget::check_after_turn`,
+    /// `stop_conditions.*`), e.g. "cycle budget exceeded: ...". `None` until one fires.
+    pub budget_note: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -94,12 +103,77 @@ struct AppState {
     /// so without this the nav would advertise a "Chat" tab pointing at a route that
     /// doesn't exist whenever chat is off (the common case).
     chat_enabled: bool,
+    /// Present iff `pipeline.security` has somewhere to send a human override
+    /// (`AppState`'s owner resolved a tracker for this project) -- `None` renders
+    /// `/security` read-only with an explanatory banner instead of a broken form.
+    security: Option<SecurityContext>,
+    /// Present only when the caller has a `repo:`/event-log writer to hand over --
+    /// backs the `/observability` page's "rescan now" action (AIR-10). `None` (e.g.
+    /// SweBot chat's own test router, or a project with no `repo:` configured) simply
+    /// hides that control rather than erroring.
+    observability: Option<ObservabilityHandle>,
+    /// Backs `/budget/extend` (AIR-11): moves an issue an `escalate`/`stop` budget
+    /// decision parked in `pipeline.blocked_state` back to an active tracker state, the
+    /// same `TrackerAdapter` write `orchestrator::block_issue` used to park it.
+    tracker: Arc<dyn TrackerAdapter>,
+}
+
+/// What `/observability`'s "rescan now" button needs to run one pre-merge scan
+/// on-demand (`observability::pre_merge::poll_once`), outside that scan's own
+/// background poll loop.
+#[derive(Clone)]
+pub struct ObservabilityHandle {
+    pub repo: Option<crate::config::RepoConfig>,
+    pub event_tx: tokio::sync::mpsc::UnboundedSender<eventlog::NewEvent>,
 }
 
 impl AppState {
     fn eventlog_db_path(&self) -> PathBuf {
         self.workflow_dir.join(eventlog::DB_FILENAME)
     }
+}
+
+/// What `/security`'s override action (AIR-8) needs beyond read-only eventlog access:
+/// somewhere to write the resumed tracker state. General enough that AIR-5's
+/// `/approvals` page (the next dashboard action that mutates tracker state from a
+/// human click) can reuse the same shape rather than inventing its own.
+#[derive(Clone)]
+pub struct SecurityContext {
+    pub tracker: Arc<dyn TrackerAdapter>,
+    /// `pipeline.blocked_state` -- shown on the page so a human can see what state a
+    /// blocked issue is actually parked in.
+    pub blocked_state: String,
+    /// Tracker state an override moves the issue back to so the dispatcher picks it
+    /// up again -- `cfg.active_states.first()`, when the project has any configured.
+    /// `None` disables the override action (nothing to resume into) but still shows
+    /// findings.
+    pub resume_state: Option<String>,
+}
+
+/// Re-reads `WORKFLOW.md` and resolves it the same way `orchestrator::build_shared`
+/// does, just for the handful of read-only fields the dashboard needs
+/// (`budgets`/`pricing`/`active_states`) -- deliberately not threaded through
+/// `Shared`/`AppState` at startup, since that would mean plumbing a config-reload path
+/// into the dashboard just to read a few numbers it can cheaply re-derive itself on
+/// each render.
+struct BudgetView {
+    budgets: crate::config::BudgetsConfig,
+    pricing: crate::budget::PricingTable,
+    model_key: String,
+    active_states: Vec<String>,
+}
+
+/// `None` on any error (missing file, bad YAML): the budgets panel simply doesn't
+/// render rather than breaking the rest of the dashboard.
+fn load_budget_view(workflow_dir: &Path) -> Option<BudgetView> {
+    let wf = crate::workflow::load(&workflow_dir.join("WORKFLOW.md")).ok()?;
+    let cfg = crate::config::resolve(&wf.config, workflow_dir).ok()?;
+    Some(BudgetView {
+        budgets: cfg.budgets.clone(),
+        pricing: cfg.pricing.clone(),
+        model_key: cfg.effective_model_key(),
+        active_states: cfg.active_states.clone(),
+    })
 }
 
 /// Bind and serve the dashboard until the process exits. Loopback-only
@@ -126,17 +200,28 @@ impl AppState {
 /// attached -- lets a caller that already owns an axum server (`src/service.rs`'s
 /// multi-project web UI) `.nest()` one of these per registered project instead of
 /// duplicating any of this module's HTML/handler code.
+/// `security`: `Some` wires `/security`'s override action to a real tracker
+/// (`SecurityContext`); `None` renders `/security` read-only (no `pipeline.security`
+/// configured for this project, or the caller has no tracker handle to give it).
+/// `observability: None` still mounts `/observability` (read-only history, no
+/// "rescan now" button) rather than omitting the route.
 pub fn router(
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
+    tracker: Arc<dyn TrackerAdapter>,
     base_path: &str,
     chat_enabled: bool,
+    security: Option<SecurityContext>,
+    observability: Option<ObservabilityHandle>,
 ) -> Router {
     let state = AppState {
         status_rx,
         workflow_dir,
         base_path: base_path.to_string(),
         chat_enabled,
+        security,
+        observability,
+        tracker,
     };
     Router::new()
         .route("/", get(dashboard))
@@ -155,17 +240,42 @@ pub fn router(
         .route("/approvals/{id}/decide", post(approvals_decide))
         .route("/reviews", get(reviews_page))
         .route("/reviews/{issue_id}/unblock", post(unblock_review))
+        .route("/security", get(security_page))
+        .route("/security/override", post(security_override))
+        .route("/evidence", get(evidence_index))
+        .route("/evidence/{key}", get(evidence_page))
+        .route("/evidence/{key}/fragment", get(evidence_fragment))
+        .route("/evidence/{key}/override", post(evidence_override))
+        .route("/observability", get(observability_page))
+        .route("/observability/rescan", post(observability_rescan))
+        .route("/budget/extend", post(extend_budget))
+        .route("/insights", get(insights_page))
+        .route("/metrics", get(metrics_endpoint))
         .with_state(state)
 }
 
+/// `security`/`observability`: see `router`'s doc comment.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_composite(
     port: u16,
     bind_all_interfaces: bool,
     status_rx: watch::Receiver<StatusSnapshot>,
     workflow_dir: PathBuf,
+    tracker: Arc<dyn TrackerAdapter>,
     chat: Option<Router>,
+    security: Option<SecurityContext>,
+    observability: Option<ObservabilityHandle>,
 ) -> anyhow::Result<()> {
-    let mut app = router(status_rx, workflow_dir, "", chat.is_some());
+    let chat_enabled = chat.is_some();
+    let mut app = router(
+        status_rx,
+        workflow_dir,
+        tracker,
+        "",
+        chat_enabled,
+        security,
+        observability,
+    );
     if let Some(chat) = chat {
         app = app.nest("/chat", chat);
     }
@@ -352,8 +462,19 @@ fn render_fragment(s: &StatusSnapshot, base: &str, eventlog_db_path: &Path) -> S
 {retry_rows}
 </tbody>
 </table>
+</section>
+
+<section>
+<h3>Budget-blocked cycle</h3>
+<p class="empty">A cycle an <code>escalate</code>/<code>stop</code> budget decision parked in <code>pipeline.blocked_state</code> (see its issue id on the card above, or on <a href="{base}/events">/events</a>) can be resumed here.</p>
+<form class="admin" method="post" action="{base}/budget/extend">
+  <label for="extend-issue-id">Issue id</label>
+  <input type="text" id="extend-issue-id" name="issue_id" required>
+  <br><button type="submit" class="btn">Extend &amp; resume</button>
+</form>
 </section>"#,
         approvals_banner = approvals_banner,
+        base = base,
         running = s.running.len(),
         retrying = s.retrying.len(),
         running_cards = running_cards,
@@ -376,6 +497,18 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         .as_deref()
         .map(|s| format!(r#"<div class="row"><b>stage</b> {}</div>"#, escape(s)))
         .unwrap_or_default();
+    // AIR-11: the "why" for whatever budget/stop-condition decision most recently fired
+    // against this cycle -- an explanation surface, not just a pass/fail badge.
+    let budget_row = r
+        .budget_note
+        .as_deref()
+        .map(|note| {
+            format!(
+                r#"<div class="row budget-note"><b>budget</b> {}</div>"#,
+                escape(note)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<div class="card" id="run-{id_attr}">
   <h2><a href="{base}/events?issue={issue_link}">{identifier}</a></h2>
@@ -383,6 +516,7 @@ fn running_card(r: &RunningRow, base: &str) -> String {
   <div class="row"><b>session</b> {session}</div>
   <div class="row"><b>running for</b> {elapsed:.1}s &middot; <b>turn</b> {turn} &middot; <b>tool calls</b> {tools}</div>
   {stage_row}
+  {budget_row}
   <div class="row"><b>last event</b> {event}</div>
   <div class="msg"{expandable_attr}>{message}</div>
 </div>"#,
@@ -396,6 +530,7 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         turn = r.turn_count,
         tools = r.tool_call_count,
         stage_row = stage_row,
+        budget_row = budget_row,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
         message = escape(message),
     )
@@ -782,8 +917,10 @@ async fn usage_page(State(state): State<AppState>) -> Html<String> {
             .collect()
     };
 
+    let budget_panel = render_budget_panel(&state.workflow_dir, &state.eventlog_db_path());
+
     let body = format!(
-        r#"<div class="stats">
+        r#"{budget_panel}<div class="stats">
   <div class="stat"><div class="n">{dispatches}</div><div class="l">Dispatches</div></div>
   <div class="stat"><div class="n">{turns}</div><div class="l">Turns</div></div>
   <div class="stat"><div class="n">{tools}</div><div class="l">Tool calls</div></div>
@@ -882,6 +1019,514 @@ fn format_issue_duration(
             escape(&text)
         )
     }
+}
+
+// --------------------------------------------------------------------------------
+// /insights -- roadmap SS11 success-measure dashboard (src/insights.rs), grouped by
+// dimension with a period selector. /metrics -- the same computation, rendered as
+// Prometheus text exposition format for the Open Observability Platform to scrape.
+//
+// Both are plain per-request renders (like /events and /usage above), not pushed
+// through /fragment-stream: that mechanism carries live *in-process* orchestrator
+// state (`StatusSnapshot`), while insights are a point-in-time read of `symphony.db`
+// -- there is nothing to push between requests that a fresh read wouldn't already
+// pick up, exactly the same reasoning that already keeps /events and /usage on plain
+// per-request renders instead of SSE.
+// --------------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct InsightsQuery {
+    /// `"7d"`, `"30d"`, `"90d"`, or `"all"` (default).
+    since: Option<String>,
+}
+
+fn since_from_period(period: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let days = match period {
+        "7d" => 7,
+        "30d" => 30,
+        "90d" => 90,
+        _ => return None,
+    };
+    Some(chrono::Utc::now() - chrono::Duration::days(days))
+}
+
+async fn insights_page(
+    State(state): State<AppState>,
+    Query(q): Query<InsightsQuery>,
+) -> Html<String> {
+    let period = q.since.as_deref().unwrap_or("all");
+    let since = since_from_period(period);
+    let base = state.base_path.as_str();
+
+    let report = match crate::insights::compute(&state.eventlog_db_path(), since) {
+        Ok(r) => r,
+        Err(e) => {
+            let body = format!(
+                "<p class=\"empty\">Failed to compute insights: {}</p>",
+                escape(&e.to_string())
+            );
+            return Html(page_shell(
+                "insights",
+                "/insights",
+                &body,
+                "",
+                base,
+                state.chat_enabled,
+            ));
+        }
+    };
+
+    let periods = [
+        ("all", "All time"),
+        ("7d", "7d"),
+        ("30d", "30d"),
+        ("90d", "90d"),
+    ];
+    let selector: String = periods
+        .iter()
+        .map(|(value, label)| {
+            let class = if *value == period {
+                " class=\"active\""
+            } else {
+                ""
+            };
+            format!(r#"<a href="{base}/insights?since={value}"{class}>{label}</a>"#)
+        })
+        .collect();
+
+    let dimensions: String = report
+        .dimensions
+        .iter()
+        .map(|dim| {
+            let rows: String = dim
+                .metrics
+                .iter()
+                .map(|m| {
+                    let value = match &m.value {
+                        crate::insights::MetricValue::Number(n) => format!("{n}"),
+                        crate::insights::MetricValue::Unknown(_) => {
+                            "<span class=\"empty\">unknown</span>".to_string()
+                        }
+                    };
+                    let reason = match &m.value {
+                        crate::insights::MetricValue::Unknown(reason) => {
+                            format!(" &mdash; <span class=\"empty\">{}</span>", escape(reason))
+                        }
+                        crate::insights::MetricValue::Number(_) => String::new(),
+                    };
+                    format!(
+                        "<tr><td title=\"{formula}\">{label}</td><td>{value}{reason}</td></tr>",
+                        formula = escape(m.formula),
+                        label = escape(m.label),
+                    )
+                })
+                .collect();
+            format!(
+                "<section>\n<h3>{label}</h3>\n<div class=\"table-wrap\">\n<table>\n\
+                 <thead><tr><th>Measure</th><th>Value</th></tr></thead>\n<tbody>{rows}</tbody>\n\
+                 </table>\n</div>\n</section>",
+                label = escape(dim.label),
+            )
+        })
+        .collect();
+
+    let body = format!(
+        r#"<div class="filters">{selector}</div>
+<p class="empty">Since {since} &middot; as of {until} &middot; hover a measure for its exact formula.</p>
+{dimensions}"#,
+        selector = selector,
+        since = escape(
+            &report
+                .since
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| "the beginning of history".to_string())
+        ),
+        until = escape(&report.until.to_rfc3339()),
+    );
+    Html(page_shell(
+        "insights",
+        "/insights",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
+}
+
+async fn metrics_endpoint(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let report = crate::insights::compute(&state.eventlog_db_path(), None).unwrap_or_else(|_| {
+        crate::insights::InsightsReport {
+            since: None,
+            until: chrono::Utc::now(),
+            dimensions: Vec::new(),
+        }
+    });
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        crate::insights::render_prometheus(&report),
+    )
+}
+
+/// One consumption bar per configured scope (`budgets.application`/`budgets.platform`)
+/// -- the "known token consumption and AI cost" the roadmap's acceptance criteria ask
+/// for, made visible without reading logs or SQLite. Empty string when no `budgets:`
+/// block is configured at all, so a project that never opted in sees nothing extra on
+/// `/usage`.
+fn render_budget_panel(workflow_dir: &Path, db_path: &Path) -> String {
+    let Some(view) = load_budget_view(workflow_dir) else {
+        return String::new();
+    };
+    if view.budgets.application.is_none() && view.budgets.platform.is_none() {
+        return String::new();
+    }
+    let since = crate::budget::window_start(view.budgets.window, chrono::Utc::now()).to_rfc3339();
+    let usage = eventlog::usage_summary_since(db_path, &since).unwrap_or_default();
+    let token_usage = crate::agent::TokenUsage {
+        input_tokens: usage.input_tokens.max(0) as u64,
+        output_tokens: usage.output_tokens.max(0) as u64,
+        total_tokens: usage.total_tokens.max(0) as u64,
+    };
+    let cost = crate::budget::compute_cost(&token_usage, &view.model_key, &view.pricing);
+
+    let mut bars = String::new();
+    if let Some(limits) = &view.budgets.application {
+        bars.push_str(&budget_bar(
+            "Application",
+            &token_usage,
+            cost,
+            limits,
+            &view.budgets.currency,
+        ));
+    }
+    if let Some(limits) = &view.budgets.platform {
+        bars.push_str(&budget_bar(
+            "Platform (this project's own share)",
+            &token_usage,
+            cost,
+            limits,
+            &view.budgets.currency,
+        ));
+    }
+    format!(
+        r#"<section>
+<h3>Budgets <span class="empty">rolling {window}, since {since}</span></h3>
+{bars}
+</section>"#,
+        window = match view.budgets.window {
+            config::BudgetWindow::Daily => "daily",
+            config::BudgetWindow::Weekly => "weekly",
+            config::BudgetWindow::Monthly => "monthly",
+        },
+        since = escape(&since),
+        bars = bars,
+    )
+}
+
+fn budget_bar(
+    label: &str,
+    usage: &crate::agent::TokenUsage,
+    cost: crate::budget::Cost,
+    limits: &config::BudgetLimits,
+    currency: &str,
+) -> String {
+    let token_pct = limits
+        .tokens
+        .filter(|l| *l > 0)
+        .map(|l| ((usage.total_tokens as f64 / l as f64) * 100.0).min(100.0))
+        .unwrap_or(0.0);
+    let tokens_line = match limits.tokens {
+        Some(l) => format!("{} / {} tokens", usage.total_tokens, l),
+        None => format!("{} tokens (no token limit set)", usage.total_tokens),
+    };
+    let cost_line = match (limits.cost, cost) {
+        (Some(l), crate::budget::Cost::Known(spent)) => {
+            format!("{spent:.2} / {l:.2} {currency}")
+        }
+        (Some(l), crate::budget::Cost::Unknown) => {
+            format!("cost unknown (unpriced model) / {l:.2} {currency} budget")
+        }
+        (None, crate::budget::Cost::Known(spent)) => {
+            format!("{spent:.2} {currency} (no cost limit set)")
+        }
+        (None, crate::budget::Cost::Unknown) => "cost unknown (unpriced model)".to_string(),
+    };
+    format!(
+        r#"<div class="row"><b>{label}</b></div>
+<div class="meter"><div class="meter-fill" style="width:{pct:.1}%"></div></div>
+<div class="row">{tokens_line} &middot; {cost_line}</div>"#,
+        label = escape(label),
+        pct = token_pct,
+        tokens_line = escape(&tokens_line),
+        cost_line = escape(&cost_line),
+    )
+}
+
+#[derive(Deserialize)]
+struct ExtendBudgetForm {
+    issue_id: String,
+}
+
+/// Human action for a cycle an `escalate`/`stop` budget decision parked in
+/// `pipeline.blocked_state` (AIR-11): moves it back to the project's first configured
+/// `tracker.active_states` entry so the normal dispatch loop picks it up again. Gated
+/// by `SYMPHONY_ADMIN_TOKEN` when one is set (always true under `symphony serve`, see
+/// `service.rs`); the single-project CLI dashboard has no admin-token concept at all
+/// today (same "not hardened for exposure" posture the rest of this module already
+/// documents), so it stays open there rather than inventing a second auth story.
+async fn extend_budget(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ExtendBudgetForm>,
+) -> Response {
+    if !crate::web::admin_token_ok(&headers) {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    }
+    let Some(view) = load_budget_view(&state.workflow_dir) else {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    };
+    let Some(active_state) = view.active_states.first().cloned() else {
+        return Redirect::to(&format!("{}/", state.base_path)).into_response();
+    };
+    match state
+        .tracker
+        .set_issue_state(&form.issue_id, &active_state)
+        .await
+    {
+        Ok(()) => {
+            let db_path = state.eventlog_db_path();
+            let issue_id = form.issue_id.clone();
+            // Best-effort (`eventlog::record_now`'s own doc comment) -- a lost history
+            // row here isn't worth failing the actual unblock over.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = eventlog::record_now(
+                    &db_path,
+                    &eventlog::NewEvent {
+                        issue_id: issue_id.clone(),
+                        identifier: issue_id,
+                        title: String::new(),
+                        session_id: None,
+                        event_type: "budget_extended".to_string(),
+                        message: Some(format!("resumed into '{active_state}' by an operator")),
+                        input_tokens: None,
+                        output_tokens: None,
+                        total_tokens: None,
+                    },
+                );
+            })
+            .await;
+        }
+        Err(e) => {
+            tracing::warn!(issue_id = %form.issue_id, error = %e, "/budget/extend: failed to resume issue");
+        }
+    }
+    Redirect::to(&format!("{}/", state.base_path)).into_response()
+}
+
+// --------------------------------------------------------------------------------
+// /observability -- pre-merge telemetry evidence + post-deploy production
+// validation (AIR-10), from eventlog::recent_events_of_types
+// --------------------------------------------------------------------------------
+
+async fn observability_page(State(state): State<AppState>) -> Html<String> {
+    let rows = eventlog::recent_events_of_types(
+        &state.eventlog_db_path(),
+        &["telemetry_evidence", "production_validation"],
+        100,
+    )
+    .unwrap_or_default();
+    let base = state.base_path.as_str();
+
+    let can_rescan = state
+        .observability
+        .as_ref()
+        .is_some_and(|o| o.repo.is_some());
+    let rescan_form = if can_rescan {
+        format!(
+            r#"<form method="post" action="{base}/observability/rescan">
+<button type="submit" class="btn">Rescan open PRs now</button></form>"#
+        )
+    } else {
+        String::new()
+    };
+
+    let listing: String = if rows.is_empty() {
+        "<p class=\"empty\">No observability evidence recorded yet.</p>".to_string()
+    } else {
+        rows.iter().map(observability_row).collect()
+    };
+
+    let body = format!(
+        r#"<div class="meta">Pre-merge telemetry evidence and post-deploy production
+validation verdicts (AIR-10). "unknown" means the backend was unreachable or
+returned no data -- never treated as healthy.</div>
+{rescan_form}
+<div class="grid">
+{listing}
+</div>"#
+    );
+    Html(page_shell(
+        "observability",
+        "/observability",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
+}
+
+/// One card per event: `production_validation` shows the verdict badge, each check's
+/// pass/fail against its threshold, and the recorded reason (the "why" constraint 2
+/// asks for); `telemetry_evidence` shows every detected signal and any secret/PII
+/// findings.
+fn observability_row(r: &eventlog::EventRow) -> String {
+    let value: serde_json::Value = r
+        .message
+        .as_deref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    match r.event_type.as_str() {
+        "production_validation" => {
+            let verdict = value
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let checks_html: String = value
+                .get("checks")
+                .and_then(|v| v.as_array())
+                .map(|checks| {
+                    checks
+                        .iter()
+                        .map(|c| {
+                            let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                            let val = c
+                                .get("value")
+                                .and_then(|v| v.as_f64())
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "no data".to_string());
+                            let max = c.get("max").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let passed = c.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+                            format!(
+                                r#"<li class="{cls}">{name}: {val} (max {max}) &mdash; {status}</li>"#,
+                                cls = if passed { "ok" } else { "bad" },
+                                name = escape(name),
+                                val = escape(&val),
+                                max = max,
+                                status = if passed { "pass" } else { "fail" },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="card">
+  <h2><span class="badge verdict-{verdict_class}">{verdict}</span> {identifier}</h2>
+  <div class="row">{reason}</div>
+  <ul>{checks_html}</ul>
+  <div class="row"><b>when</b> {created}</div>
+</div>"#,
+                verdict_class = escape(verdict),
+                verdict = escape(verdict),
+                identifier = escape(&r.identifier),
+                reason = escape(reason),
+                checks_html = checks_html,
+                created = escape(&r.created_at),
+            )
+        }
+        "telemetry_evidence" => {
+            let signals_html: String = value
+                .get("signals")
+                .and_then(|v| v.as_array())
+                .map(|signals| {
+                    signals
+                        .iter()
+                        .map(|s| {
+                            let kind = s.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                            let location =
+                                s.get("location").and_then(|v| v.as_str()).unwrap_or("?");
+                            let requirement = s
+                                .get("requirement_id")
+                                .and_then(|v| v.as_str())
+                                .map(|r| format!(" (satisfies {})", escape(r)))
+                                .unwrap_or_default();
+                            format!(
+                                "<li>{kind} at {location}{requirement}</li>",
+                                kind = escape(kind),
+                                location = escape(location),
+                                requirement = requirement,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let findings_html: String = value
+                .get("findings")
+                .and_then(|v| v.as_array())
+                .filter(|f| !f.is_empty())
+                .map(|findings| {
+                    let items: String = findings
+                        .iter()
+                        .map(|f| {
+                            let location =
+                                f.get("location").and_then(|v| v.as_str()).unwrap_or("?");
+                            let description =
+                                f.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+                            format!(
+                                r#"<li class="bad">{location}: {description}</li>"#,
+                                location = escape(location),
+                                description = escape(description),
+                            )
+                        })
+                        .collect();
+                    format!(r#"<div class="row"><b>Findings</b><ul>{items}</ul></div>"#)
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="card">
+  <h2>{identifier}</h2>
+  <div class="row"><b>Signals</b><ul>{signals_html}</ul></div>
+  {findings_html}
+  <div class="row"><b>when</b> {created}</div>
+</div>"#,
+                identifier = escape(&r.identifier),
+                signals_html = signals_html,
+                findings_html = findings_html,
+                created = escape(&r.created_at),
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// The dashboard's only observability mutation: run one pre-merge scan immediately
+/// instead of waiting for the background poller's next tick. Fire-and-forget
+/// (spawned, not awaited) since a real scan clones a repo and can take longer than a
+/// request should block on -- the redirect lands before it finishes, and the new
+/// evidence shows up on the page's next load (or its own next `/observability` visit)
+/// once the spawned scan completes.
+async fn observability_rescan(State(state): State<AppState>) -> Response {
+    let base = state.base_path.clone();
+    if let Some(handle) = state.observability.clone()
+        && let Some(repo) = handle.repo.clone()
+    {
+        tokio::spawn(async move {
+            if let Ok(host) = crate::repo_host::build(&repo) {
+                let mut seen = std::collections::HashSet::new();
+                if let Err(e) = crate::observability::pre_merge::poll_once(
+                    &repo,
+                    host.as_ref(),
+                    &handle.event_tx,
+                    &mut seen,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "observability: on-demand rescan failed");
+                }
+            }
+        });
+    }
+    Redirect::to(&format!("{base}/observability")).into_response()
 }
 
 // --------------------------------------------------------------------------------
@@ -1772,6 +2417,284 @@ fn approval_history_row(r: &approvals::ApprovalRow, base: &str) -> String {
     )
 }
 
+// /security -- AIR-8: security_findings artifacts, blocking state, human override.
+//
+// `orchestrator::run_pipeline`'s `evaluate_security_stage` records three event types
+// per evaluation, always in this order: `security_findings` (the full redacted
+// artifact, first line `stage=<id> risk=<risk>` then the JSON), and then at most one
+// of `security_blocked` or `security_override_consumed`. `security_status_rows` below
+// reconstructs "is this issue currently blocked" from nothing but relative event ids
+// (the latest of the three per issue wins) -- no extra table, same one `events` log
+// every other page here already reads.
+// --------------------------------------------------------------------------------
+
+struct SecurityRow {
+    issue_id: String,
+    identifier: String,
+    title: String,
+    created_at: String,
+    findings: Option<SecurityFindings>,
+    blocked: bool,
+    /// A previous block on this same evaluation round was overridden (rather than
+    /// this round having no blocking findings at all) -- shown as a distinct badge
+    /// from plain "clear" so the override stays visible after it's been applied.
+    overridden: bool,
+    override_pending: bool,
+}
+
+fn security_status_rows(db_path: &std::path::Path) -> Vec<SecurityRow> {
+    let findings_events =
+        eventlog::latest_events_by_type(db_path, "security_findings").unwrap_or_default();
+    let blocked_ids: std::collections::HashMap<String, i64> =
+        eventlog::latest_events_by_type(db_path, "security_blocked")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.issue_id, e.id))
+            .collect();
+    let consumed_ids: std::collections::HashMap<String, i64> =
+        eventlog::latest_events_by_type(db_path, "security_override_consumed")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.issue_id, e.id))
+            .collect();
+
+    findings_events
+        .into_iter()
+        .map(|e| {
+            let findings = e
+                .message
+                .as_deref()
+                .and_then(|m| m.split_once('\n'))
+                .and_then(|(_, json)| serde_json::from_str::<SecurityFindings>(json).ok());
+            // `security_findings` is always recorded before the `security_blocked` /
+            // `security_override_consumed` that (may) follow it for the same
+            // evaluation, so "id newer than this findings row" is exactly "belongs to
+            // this evaluation, not a stale earlier one."
+            let blocked = blocked_ids.get(&e.issue_id).is_some_and(|&b| b > e.id);
+            let overridden = consumed_ids.get(&e.issue_id).is_some_and(|&c| c > e.id);
+            let override_pending = eventlog::pending_override(db_path, &e.issue_id)
+                .ok()
+                .flatten()
+                .is_some();
+            SecurityRow {
+                issue_id: e.issue_id,
+                identifier: e.identifier,
+                title: e.title,
+                created_at: e.created_at,
+                findings,
+                blocked,
+                overridden,
+                override_pending,
+            }
+        })
+        .collect()
+}
+
+async fn security_page(State(state): State<AppState>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let rows = security_status_rows(&state.eventlog_db_path());
+
+    let banner = if state.security.is_none() {
+        web::error_banner(
+            "This project has no security stage configured, or its dashboard was mounted \
+             without tracker access -- findings below are read-only and overrides are disabled.",
+        )
+    } else {
+        String::new()
+    };
+
+    let cards: String = if rows.is_empty() {
+        "<p class=\"empty\">No security stage has run yet.</p>".to_string()
+    } else {
+        rows.iter()
+            .map(|r| security_card(r, &state, base))
+            .collect()
+    };
+
+    let body = format!("{banner}<div class=\"grid\">{cards}</div>");
+    Html(page_shell(
+        "security",
+        "/security",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
+}
+
+fn owasp_checklist_html(findings: &SecurityFindings) -> String {
+    if findings.owasp_checklist.is_empty() {
+        return "<p class=\"empty\">No OWASP checklist recorded.</p>".to_string();
+    }
+    let rows: String = findings
+        .owasp_checklist
+        .iter()
+        .map(|item| {
+            let status = match item.status {
+                crate::security::OwaspStatus::Pass => "pass",
+                crate::security::OwaspStatus::Fail => "fail",
+                crate::security::OwaspStatus::NotApplicable => "not_applicable",
+            };
+            format!(
+                "<tr><td>{id}</td><td>{name}</td><td>{status}</td><td>{evidence}</td></tr>",
+                id = escape(&item.id),
+                name = escape(&item.name),
+                status = escape(status),
+                evidence = escape(&item.evidence),
+            )
+        })
+        .collect();
+    format!(
+        "<div class=\"table-wrap\"><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+}
+
+fn findings_list_html(findings: &SecurityFindings) -> String {
+    if findings.findings.is_empty() {
+        return "<p class=\"empty\">No findings.</p>".to_string();
+    }
+    findings
+        .findings
+        .iter()
+        .map(|f| {
+            format!(
+                r#"<div class="card" id="finding-{id}">
+  <h2>{id} &middot; <span class="badge">{severity}</span></h2>
+  <div class="row">{summary}</div>
+  <div class="row"><b>location</b> {file}{line}</div>
+  <div class="row"><b>owasp</b> {owasp} &middot; <b>cwe</b> {cwe}</div>
+  <div class="msg"><b>exploit scenario:</b> {exploit}<br><b>remediation:</b> {remediation}</div>
+</div>"#,
+                id = escape(&f.id),
+                severity = escape(f.severity.as_str()),
+                summary = escape(&f.summary),
+                file = escape(f.file.as_deref().unwrap_or("-")),
+                line = f.line.map(|l| format!(":{l}")).unwrap_or_default(),
+                owasp = escape(f.owasp_id.as_deref().unwrap_or("-")),
+                cwe = escape(f.cwe.as_deref().unwrap_or("-")),
+                exploit = escape(f.exploit_scenario.as_deref().unwrap_or("-")),
+                remediation = escape(f.remediation.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect()
+}
+
+fn secrets_and_deps_html(findings: &SecurityFindings) -> String {
+    let secret_rows: String = if findings.secrets_scan.matches.is_empty() {
+        "<tr><td colspan=\"2\" class=\"empty\">none</td></tr>".to_string()
+    } else {
+        findings
+            .secrets_scan
+            .matches
+            .iter()
+            .map(|m| {
+                format!(
+                    "<tr><td>{file}</td><td>{line}</td></tr>",
+                    file = escape(&m.file),
+                    line = m.line,
+                )
+            })
+            .collect()
+    };
+    let advisories: String = if findings.dependency_scan.advisories.is_empty() {
+        "<span class=\"empty\">none</span>".to_string()
+    } else {
+        findings
+            .dependency_scan
+            .advisories
+            .iter()
+            .map(|a| escape(a))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let secrets_status = match findings.secrets_scan.status {
+        crate::security::ScanStatus::Clean => "clean",
+        crate::security::ScanStatus::Findings => "findings",
+        crate::security::ScanStatus::NotRun => "not_run",
+    };
+    let deps_status = match findings.dependency_scan.status {
+        crate::security::ScanStatus::Clean => "clean",
+        crate::security::ScanStatus::Findings => "findings",
+        crate::security::ScanStatus::NotRun => "not_run",
+    };
+    format!(
+        r#"<div class="row"><b>secrets scan</b> {secrets_status} -- file/line only, matched text is never stored</div>
+<div class="table-wrap"><table><thead><tr><th>File</th><th>Line</th></tr></thead><tbody>{secret_rows}</tbody></table></div>
+<div class="row"><b>dependency scan</b> ({tool}) {deps_status} -- {advisories}</div>"#,
+        tool = escape(&findings.dependency_scan.tool),
+    )
+}
+
+fn security_card(r: &SecurityRow, state: &AppState, base: &str) -> String {
+    let risk = r
+        .findings
+        .as_ref()
+        .map(|f| f.risk_classification.as_str())
+        .unwrap_or("unknown");
+    let status_badge = if r.blocked {
+        r#"<span class="badge closed">blocked</span>"#
+    } else if r.overridden {
+        r#"<span class="badge">overridden</span>"#
+    } else {
+        r#"<span class="badge">clear</span>"#
+    };
+    let pending_note = if r.override_pending {
+        r#"<div class="row">an override has been recorded and will be applied on the next run</div>"#
+    } else {
+        ""
+    };
+
+    let (checklist, findings_list, scans) = match &r.findings {
+        Some(f) => (
+            owasp_checklist_html(f),
+            findings_list_html(f),
+            secrets_and_deps_html(f),
+        ),
+        None => (String::new(), String::new(), String::new()),
+    };
+
+    let override_form = if r.blocked && state.security.is_some() {
+        format!(
+            r#"<form class="compose" method="post" action="{base}/security/override" data-confirm="Override this blocking security finding and resume the cycle?">
+  <input type="hidden" name="issue_id" value="{issue_id}">
+  <label for="reason-{id_attr}">Override reason (required)</label>
+  <textarea id="reason-{id_attr}" name="reason" maxlength="2000" required></textarea>
+  <label for="token-{id_attr}">Admin token</label>
+  <input type="password" id="token-{id_attr}" name="admin_token" required>
+  <button type="submit" class="btn">Override and resume</button>
+</form>"#,
+            issue_id = escape(&r.issue_id),
+            id_attr = escape(&r.issue_id),
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<div class="card" id="sec-{id_attr}" style="flex-basis: 100%;">
+  <h2><a href="{base}/events?issue={issue_link}">{identifier}</a> &mdash; {title} {status_badge}</h2>
+  <div class="row"><b>risk</b> {risk} &middot; <b>evaluated</b> {created_at} &middot; <b>blocked_state</b> {blocked_state}</div>
+  {pending_note}
+  <section><h3>OWASP checklist</h3>{checklist}</section>
+  <section><h3>Findings</h3>{findings_list}</section>
+  <section><h3>Scanners</h3>{scans}</section>
+  {override_form}
+</div>"#,
+        id_attr = escape(&r.issue_id),
+        base = base,
+        issue_link = urlencode(&r.issue_id),
+        identifier = escape(&r.identifier),
+        title = escape(&r.title),
+        risk = escape(risk),
+        created_at = escape(&r.created_at),
+        blocked_state = state
+            .security
+            .as_ref()
+            .map(|s| escape(&s.blocked_state))
+            .unwrap_or_else(|| "-".to_string()),
+    )
+}
+
 #[derive(Deserialize)]
 struct DecideForm {
     decision: String,
@@ -1819,15 +2742,366 @@ async fn approvals_decide(
     Redirect::to(&format!("{}/approvals", state.base_path)).into_response()
 }
 
+#[derive(Deserialize)]
+struct OverrideForm {
+    issue_id: String,
+    reason: String,
+    admin_token: String,
+}
+
+/// POST-only, admin-token gated (per-request token field rather than the cookie-based
+/// login `service.rs` uses for its own admin routes -- this dashboard has no login
+/// page of its own, single-project or nested). Records a `security_override` event
+/// (consumed one-shot by the next `evaluate_security_stage` run, see
+/// `eventlog::pending_override`) and, when a resume state is configured, moves the
+/// issue out of `pipeline.blocked_state` immediately so the dispatcher picks it back
+/// up without waiting for the next poll to notice a state nothing changed.
+async fn security_override(
+    State(state): State<AppState>,
+    Form(form): Form<OverrideForm>,
+) -> Response {
+    let base = state.base_path.clone();
+    let Some(security) = &state.security else {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("This project's dashboard has no tracker access configured; overrides are disabled."),
+            "",
+            &base,
+            state.chat_enabled,
+        ))
+        .into_response();
+    };
+
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.is_empty() || form.admin_token != expected {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("Invalid admin token."),
+            "",
+            &base,
+            state.chat_enabled,
+        ))
+        .into_response();
+    }
+    if form.reason.trim().is_empty() {
+        return Html(page_shell(
+            "security",
+            "/security",
+            &web::error_banner("A reason is required to override a blocking security finding."),
+            "",
+            &base,
+            state.chat_enabled,
+        ))
+        .into_response();
+    }
+
+    let db_path = state.eventlog_db_path();
+    if let Err(e) = eventlog::insert_event(
+        &db_path,
+        &eventlog::NewEvent {
+            issue_id: form.issue_id.clone(),
+            identifier: form.issue_id.clone(),
+            title: String::new(),
+            session_id: None,
+            event_type: "security_override".to_string(),
+            message: Some(form.reason.clone()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        },
+    ) {
+        tracing::warn!(error = %e, issue_id = %form.issue_id, "failed to record security override");
+    }
+
+    if let Some(resume_state) = &security.resume_state
+        && let Err(e) = security
+            .tracker
+            .set_issue_state(&form.issue_id, resume_state)
+            .await
+    {
+        tracing::warn!(error = %e, issue_id = %form.issue_id, "failed to resume issue after security override");
+    }
+
+    Redirect::to(&format!("{base}/security")).into_response()
+}
+
+// --------------------------------------------------------------------------------
+// /evidence -- AIR-9 release evidence bundles, persisted by
+// `orchestrator::finalize_release_evidence` under `<workflow_dir>/.symphony/release/
+// <key>.json` (`key` is `workspace::derive_workspace_key(issue_id)`, the same
+// sanitized key `issue-<key>` branch names use -- see that function's own doc
+// comment). Live-updates by re-fetching `/evidence/<key>/fragment` off the same
+// `/fragment-stream` connection the dashboard already holds open (`dashboard`'s own
+// doc comment), rather than opening a second stream just for this page.
+// --------------------------------------------------------------------------------
+
+fn release_dir(workflow_dir: &std::path::Path) -> PathBuf {
+    workflow_dir.join(".symphony").join("release")
+}
+
+fn load_bundle(workflow_dir: &std::path::Path, key: &str) -> Option<EvidenceBundle> {
+    let bytes = std::fs::read(release_dir(workflow_dir).join(format!("{key}.json"))).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_bundle(
+    workflow_dir: &std::path::Path,
+    key: &str,
+    bundle: &EvidenceBundle,
+) -> std::io::Result<()> {
+    let dir = release_dir(workflow_dir);
+    std::fs::create_dir_all(&dir)?;
+    let json = serde_json::to_vec_pretty(bundle).unwrap_or_default();
+    std::fs::write(dir.join(format!("{key}.json")), json)
+}
+
+/// Every persisted bundle's key, newest first by file modification time -- a plain
+/// directory scan, not an index: there are at most a handful of open cycles at once,
+/// so scanning on every request is cheap enough (same posture `eventlog`'s
+/// per-request connection open takes -- see that module's own doc comment).
+fn list_bundle_keys(workflow_dir: &std::path::Path) -> Vec<String> {
+    let mut entries: Vec<(std::time::SystemTime, String)> =
+        std::fs::read_dir(release_dir(workflow_dir))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    return None;
+                }
+                let key = path.file_stem()?.to_str()?.to_string();
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((modified, key))
+            })
+            .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.0));
+    entries.into_iter().map(|(_, k)| k).collect()
+}
+
+fn verdict_badge(v: Verdict) -> String {
+    let (class, label) = match v {
+        Verdict::Ready => ("badge", "READY"),
+        Verdict::ReadyWithRisk => ("badge warn", "READY WITH RISK"),
+        Verdict::Blocked => ("badge closed", "BLOCKED"),
+    };
+    format!(r#"<span class="{class}">{label}</span>"#)
+}
+
+/// Render a bundle's evidence sections as HTML for the dashboard view (the "why"
+/// surface the global constraints require: verdict badge, the rule(s) that produced
+/// it, then every section `release::render_markdown` builds). Reuses
+/// `release::render_markdown`'s own Markdown -- already redacted -- and converts it
+/// with `pulldown-cmark` rather than hand-rolling a second HTML renderer (see
+/// `release.rs`'s own doc comment: "reuse pulldown-cmark only for HTML views").
+fn render_evidence_content(bundle: &EvidenceBundle) -> String {
+    let verdict = release::compute_verdict(bundle);
+    let matrix = release::build_traceability_matrix(bundle);
+    let markdown =
+        release::render_markdown(bundle, verdict, &matrix, &std::collections::BTreeMap::new());
+    let mut options = pulldown_cmark::Options::empty();
+    options.insert(pulldown_cmark::Options::ENABLE_TABLES);
+    let parser = pulldown_cmark::Parser::new_ext(&markdown, options);
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, parser);
+    format!(
+        r#"<div class="row">{badge}</div>
+<div class="post-body">{html}</div>"#,
+        badge = verdict_badge(verdict),
+    )
+}
+
+async fn evidence_index(State(state): State<AppState>) -> Html<String> {
+    let base = state.base_path.as_str();
+    let keys = list_bundle_keys(&state.workflow_dir);
+    let rows: String = if keys.is_empty() {
+        "<p class=\"empty\">No release evidence bundles recorded yet.</p>".to_string()
+    } else {
+        keys.iter()
+            .filter_map(|k| load_bundle(&state.workflow_dir, k).map(|b| (k, b)))
+            .map(|(key, bundle)| {
+                let verdict = release::compute_verdict(&bundle);
+                format!(
+                    r#"<div class="thread-row"><a href="{base}/evidence/{key_link}">{title}</a>{badge}</div>"#,
+                    key_link = urlencode(key),
+                    title = escape(&bundle.title),
+                    badge = verdict_badge(verdict),
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        r#"<section><h3>Release evidence</h3><div class="thread-list">{rows}</div></section>"#
+    );
+    Html(page_shell(
+        "release evidence",
+        "/evidence",
+        &body,
+        "",
+        base,
+        state.chat_enabled,
+    ))
+}
+
+async fn evidence_page(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Html<String> {
+    let base = state.base_path.as_str();
+    let Some(bundle) = load_bundle(&state.workflow_dir, &key) else {
+        return Html(page_shell(
+            "release evidence",
+            "/evidence",
+            &error_banner(&format!(
+                "No evidence bundle found for &lsquo;{}&rsquo;.",
+                escape(&key)
+            )),
+            "",
+            base,
+            state.chat_enabled,
+        ));
+    };
+    let script = format!(
+        r#"<script>
+new EventSource('{base}/fragment-stream').onmessage = function () {{
+  fetch('{base}/evidence/{key_link}/fragment').then(function (r) {{ return r.text(); }}).then(function (html) {{
+    document.getElementById('evidence-content').innerHTML = html;
+  }});
+}};
+</script>"#,
+        base = base,
+        key_link = urlencode(&key),
+    );
+    let body = format!(
+        r#"<div class="meta">generated {generated} &middot; live-updates when a new bundle lands (no page reload)</div>
+<div id="evidence-content">{content}</div>
+<form class="admin" method="post" action="{base}/evidence/{key_link}/override" data-confirm="Override every unresolved blocking security finding with this justification?">
+  <label for="reason">Override unresolved blocking security findings (admin token required)</label>
+  <input id="reason" name="reason" required maxlength="500">
+  <button type="submit">Override &amp; re-verdict</button>
+</form>"#,
+        generated = escape(&bundle.generated_at),
+        content = render_evidence_content(&bundle),
+        base = base,
+        key_link = urlencode(&key),
+    );
+    Html(page_shell(
+        &format!("evidence: {}", bundle.title),
+        "/evidence",
+        &body,
+        &script,
+        base,
+        state.chat_enabled,
+    ))
+}
+
+async fn evidence_fragment(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+) -> Html<String> {
+    match load_bundle(&state.workflow_dir, &key) {
+        Some(bundle) => Html(render_evidence_content(&bundle)),
+        None => Html(error_banner("No evidence bundle found for this cycle.")),
+    }
+}
+
+#[derive(Deserialize)]
+struct EvidenceOverrideForm {
+    reason: String,
+}
+
+/// `SYMPHONY_ADMIN_TOKEN` must be set and match `Authorization: Bearer <token>` --
+/// mirrors `service.rs::extract_admin_token`'s bearer-token check (that module's own
+/// cookie/login-form half doesn't apply here: the single-project dashboard has no
+/// login flow, only this one state-changing action). Unlike `service.rs`, an unset
+/// token means "reject", not "allow": `service.rs` refuses to even start without one
+/// because registering/removing whole repos is destructive; this dashboard stays
+/// read-only by default (its own module doc comment) and this is the one exception,
+/// so the safer default when nobody configured a token is "this action is off."
+fn evidence_override_authorized(headers: &HeaderMap) -> bool {
+    let expected = std::env::var("SYMPHONY_ADMIN_TOKEN").unwrap_or_default();
+    if expected.trim().is_empty() {
+        return false;
+    }
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected)
+}
+
+/// Human override with justification (Roadmap §4's "security checklist, risk
+/// classification and any human override with justification"): marks every currently
+/// unresolved blocking security finding as overridden with `reason`, moving a
+/// `Blocked` verdict to `ReadyWithRisk` (`release::compute_verdict`'s own rule --
+/// nothing here computes a verdict directly, so this can never silently disagree with
+/// what the bundle itself would report). A no-op, but not an error, when there's
+/// nothing blocking to override (e.g. before AIR-8 ever records a security finding).
+async fn evidence_override(
+    State(state): State<AppState>,
+    AxumPath(key): AxumPath<String>,
+    headers: HeaderMap,
+    Form(form): Form<EvidenceOverrideForm>,
+) -> Response {
+    if !evidence_override_authorized(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin token required (SYMPHONY_ADMIN_TOKEN)",
+        )
+            .into_response();
+    }
+    let Some(mut bundle) = load_bundle(&state.workflow_dir, &key) else {
+        return (StatusCode::NOT_FOUND, "no evidence bundle for this cycle").into_response();
+    };
+    let reason = form.reason.trim();
+    if reason.is_empty() {
+        return (StatusCode::BAD_REQUEST, "reason is required").into_response();
+    }
+    for finding in bundle
+        .security_findings
+        .iter_mut()
+        .filter(|f| f.blocking && f.override_reason.is_none())
+    {
+        finding.override_reason = Some(reason.to_string());
+    }
+    if let Err(e) = save_bundle(&state.workflow_dir, &key, &bundle) {
+        tracing::warn!(key = %key, error = %e, "failed to persist evidence override");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to save override").into_response();
+    }
+    Redirect::to(&format!("{}/evidence/{}", state.base_path, urlencode(&key))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_tracker(dir: &Path) -> Arc<dyn TrackerAdapter> {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            serde_yaml::Value::from("dir"),
+            serde_yaml::Value::from(dir.to_string_lossy().to_string()),
+        );
+        Arc::new(
+            crate::tracker::local::LocalTrackerAdapter::new(&serde_yaml::Value::Mapping(map), dir)
+                .unwrap(),
+        )
+    }
 
     #[tokio::test]
     async fn fragment_stream_pushes_initial_snapshot_then_updates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.path().to_path_buf(), "", false);
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1862,6 +3136,7 @@ mod tests {
                 last_event: None,
                 last_message: None,
                 stage: None,
+                budget_note: None,
             }],
             retrying: vec![],
         })
@@ -1914,7 +3189,15 @@ mod tests {
 
     async fn spawn_router_with_chat(dir: &std::path::Path, chat_enabled: bool) -> String {
         let (_tx, rx) = watch::channel(StatusSnapshot::default());
-        let app = router(rx, dir.to_path_buf(), "", chat_enabled);
+        let app = router(
+            rx,
+            dir.to_path_buf(),
+            test_tracker(dir),
+            "",
+            chat_enabled,
+            None,
+            None,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2100,6 +3383,7 @@ mod tests {
             last_event: None,
             last_message: None,
             stage: None,
+            budget_note: None,
         };
         let html = running_card(&row, "");
         assert!(!html.contains("<script>alert"));
@@ -2178,6 +3462,7 @@ mod tests {
             last_event: None,
             last_message: None,
             stage: None,
+            budget_note: None,
         };
         let html = running_card(&row, "/projects/p1");
         assert!(html.contains(r#"<a href="/projects/p1/events?issue=issue-42">AR-1</a>"#));
@@ -2323,6 +3608,105 @@ mod tests {
         assert!(html.contains("&lt;script&gt;"));
     }
 
+    // -----------------------------------------------------------------------------
+    // AIR-8: /security
+    // -----------------------------------------------------------------------------
+
+    fn sample_findings_json(risk: &str) -> String {
+        format!(
+            r#"{{"schema_version":1,"risk_classification":"{risk}","owasp_checklist":[],
+            "findings":[{{"id":"S1","severity":"{risk}","owasp_id":"A03:2021","cwe":"CWE-89",
+                "file":"src/x.rs","line":10,"summary":"sql injection","exploit_scenario":"...",
+                "remediation":"..."}}],
+            "secrets_scan":{{"status":"clean","matches":[]}},
+            "dependency_scan":{{"tool":"","status":"not_run","advisories":[]}}}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn security_status_rows_derives_blocked_overridden_and_clear_from_event_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(eventlog::DB_FILENAME);
+
+        let findings_event = |issue: &str, risk: &str| eventlog::NewEvent {
+            issue_id: issue.to_string(),
+            identifier: issue.to_string(),
+            title: "t".to_string(),
+            session_id: None,
+            event_type: "security_findings".to_string(),
+            message: Some(format!(
+                "stage=security risk={risk}\n{}",
+                sample_findings_json(risk)
+            )),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        };
+        let marker_event = |issue: &str, event_type: &str| eventlog::NewEvent {
+            issue_id: issue.to_string(),
+            identifier: issue.to_string(),
+            title: "t".to_string(),
+            session_id: None,
+            event_type: event_type.to_string(),
+            message: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        };
+
+        // A: findings then blocked -> currently blocked.
+        eventlog::insert_event(&db, &findings_event("A", "critical")).unwrap();
+        eventlog::insert_event(&db, &marker_event("A", "security_blocked")).unwrap();
+        // B: findings then override-consumed -> overridden, not blocked.
+        eventlog::insert_event(&db, &findings_event("B", "critical")).unwrap();
+        eventlog::insert_event(&db, &marker_event("B", "security_override_consumed")).unwrap();
+        // C: findings only, nothing blocking -> clear.
+        eventlog::insert_event(&db, &findings_event("C", "low")).unwrap();
+
+        let rows = security_status_rows(&db);
+        assert_eq!(
+            rows.len(),
+            3,
+            "{:?}",
+            rows.iter().map(|r| &r.issue_id).collect::<Vec<_>>()
+        );
+
+        let a = rows.iter().find(|r| r.issue_id == "A").unwrap();
+        assert!(a.blocked);
+        assert!(!a.overridden);
+
+        let b = rows.iter().find(|r| r.issue_id == "B").unwrap();
+        assert!(!b.blocked);
+        assert!(b.overridden);
+
+        let c = rows.iter().find(|r| r.issue_id == "C").unwrap();
+        assert!(!c.blocked);
+        assert!(!c.overridden);
+        assert_eq!(
+            c.findings.as_ref().unwrap().risk_classification,
+            crate::security::Severity::Low
+        );
+    }
+
+    #[test]
+    fn owasp_checklist_html_escapes_evidence_text() {
+        let findings: SecurityFindings = serde_json::from_str(&sample_findings_json("low"))
+            .map(|mut f: SecurityFindings| {
+                f.owasp_checklist.push(crate::security::OwaspItem {
+                    id: "A01:2021".to_string(),
+                    name: "Broken Access Control".to_string(),
+                    applicable: false,
+                    status: crate::security::OwaspStatus::NotApplicable,
+                    evidence: "<script>alert(1)</script>".to_string(),
+                });
+                f
+            })
+            .unwrap();
+        let html = owasp_checklist_html(&findings);
+        assert!(!html.contains("<script>alert"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
     #[test]
     fn rework_round_row_shows_the_round_number_and_escalated_badge() {
         let event = eventlog::EventRow {
@@ -2415,6 +3799,9 @@ mod tests {
             workflow_dir: dir.path().to_path_buf(),
             base_path: String::new(),
             chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(dir.path()),
         };
         let Html(body) = reviews_page(State(state), Query(ReviewsQuery { issue: None })).await;
         assert!(body.contains("Pass an issue id"));
@@ -2445,6 +3832,9 @@ mod tests {
             workflow_dir: workflow_dir.clone(),
             base_path: String::new(),
             chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(&workflow_dir),
         };
         let Html(body) = reviews_page(
             State(state),
@@ -2470,9 +3860,12 @@ mod tests {
         .unwrap();
         let state = AppState {
             status_rx: rx,
-            workflow_dir,
+            workflow_dir: workflow_dir.clone(),
             base_path: String::new(),
             chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(&workflow_dir),
         };
         let Html(body) = reviews_page(
             State(state),
@@ -2485,5 +3878,475 @@ mod tests {
         assert!(body.contains("/reviews/1/unblock"));
         assert!(body.contains("<td>1</td>"));
         assert!(body.contains("<td>2</td>"));
+    }
+
+    #[test]
+    fn findings_list_html_never_contains_the_word_secret_value_placeholder() {
+        // Regression guard: findings/secrets rendering must never echo raw secret
+        // text -- `SecretMatch` structurally can't hold it (see `security` module's
+        // own tests), so this just checks the rendered HTML sticks to file/line.
+        let findings: SecurityFindings =
+            serde_json::from_str(&sample_findings_json("high")).unwrap();
+        let html = secrets_and_deps_html(&findings);
+        assert!(html.contains("clean"));
+        assert!(!html.contains("sk-"));
+    }
+
+    #[test]
+    fn security_override_form_requires_reason_and_admin_token_fields() {
+        let row = SecurityRow {
+            issue_id: "A".to_string(),
+            identifier: "A".to_string(),
+            title: "t".to_string(),
+            created_at: "now".to_string(),
+            findings: None,
+            blocked: true,
+            overridden: false,
+            override_pending: false,
+        };
+        let state = AppState {
+            status_rx: watch::channel(StatusSnapshot::default()).1,
+            workflow_dir: PathBuf::from("."),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: Some(SecurityContext {
+                tracker: Arc::new(
+                    crate::tracker::local::LocalTrackerAdapter::new(
+                        &serde_yaml::from_str("dir: .").unwrap(),
+                        std::path::Path::new("."),
+                    )
+                    .unwrap(),
+                ),
+                blocked_state: "blocked".to_string(),
+                resume_state: Some("todo".to_string()),
+            }),
+            observability: None,
+            tracker: test_tracker(Path::new(".")),
+        };
+        let html = security_card(&row, &state, "");
+        assert!(html.contains(r#"name="reason""#));
+        assert!(html.contains(r#"name="admin_token""#));
+        assert!(html.contains(r#"action="/security/override""#));
+    }
+
+    #[test]
+    fn security_override_form_is_absent_without_security_context() {
+        let row = SecurityRow {
+            issue_id: "A".to_string(),
+            identifier: "A".to_string(),
+            title: "t".to_string(),
+            created_at: "now".to_string(),
+            findings: None,
+            blocked: true,
+            overridden: false,
+            override_pending: false,
+        };
+        let state = AppState {
+            status_rx: watch::channel(StatusSnapshot::default()).1,
+            workflow_dir: PathBuf::from("."),
+            base_path: String::new(),
+            chat_enabled: false,
+            security: None,
+            observability: None,
+            tracker: test_tracker(Path::new(".")),
+        };
+        let html = security_card(&row, &state, "");
+        assert!(!html.contains("action=\"/security/override\""));
+    }
+
+    // -----------------------------------------------------------------------------
+    // AIR-9: /evidence
+    // -----------------------------------------------------------------------------
+
+    fn test_bundle(cycle_id: &str) -> EvidenceBundle {
+        release::assemble(
+            &crate::domain::Issue {
+                id: cycle_id.to_string(),
+                native_ref: None,
+                identifier: "AIR-9".to_string(),
+                title: "Release agent".to_string(),
+                description: Some("- [x] ships evidence bundle".to_string()),
+                priority: None,
+                state: "in_progress".to_string(),
+                branch_name: None,
+                url: None,
+                assignee_id: None,
+                labels: vec![],
+                blocked_by: vec![],
+                dispatchable: true,
+                created_at: None,
+                updated_at: None,
+            },
+            &[],
+            None,
+        )
+    }
+
+    #[test]
+    fn evidence_index_lists_no_bundles_when_none_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = list_bundle_keys(dir.path());
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_bundle_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = test_bundle("issue-1");
+        save_bundle(dir.path(), "issue-1", &bundle).unwrap();
+        let loaded = load_bundle(dir.path(), "issue-1").unwrap();
+        assert_eq!(loaded.cycle_id, "issue-1");
+        assert_eq!(list_bundle_keys(dir.path()), vec!["issue-1".to_string()]);
+    }
+
+    #[test]
+    fn evidence_override_flips_blocked_to_ready_with_risk() {
+        let mut bundle = test_bundle("issue-1");
+        bundle.security_findings.push(release::SecurityFinding {
+            id: "S1".to_string(),
+            description: "sql injection".to_string(),
+            severity: release::SecuritySeverity::Critical,
+            blocking: true,
+            override_reason: None,
+        });
+        assert_eq!(release::compute_verdict(&bundle), Verdict::Blocked);
+
+        for finding in bundle
+            .security_findings
+            .iter_mut()
+            .filter(|f| f.blocking && f.override_reason.is_none())
+        {
+            finding.override_reason = Some("accepted, ticket SEC-1".to_string());
+        }
+        assert_eq!(release::compute_verdict(&bundle), Verdict::ReadyWithRisk);
+    }
+
+    #[tokio::test]
+    async fn evidence_page_shows_not_found_for_an_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/evidence/does-not-exist"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("No evidence bundle found"));
+    }
+
+    #[tokio::test]
+    async fn insights_page_renders_all_five_dimensions_and_a_period_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "/base",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let body = reqwest::get(format!("http://{addr}/insights"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        for label in ["Flow", "Quality", "Autonomy", "Economics", "Reliability"] {
+            assert!(body.contains(label), "missing dimension {label}: {body}");
+        }
+        // Period selector links, nested correctly under this router's base_path.
+        assert!(body.contains("/base/insights?since=7d"), "{body}");
+        assert!(body.contains("/base/insights?since=30d"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_valid_prometheus_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("# HELP symphony_autonomy_successful_parallel_cycles"));
+        assert!(body.contains("# TYPE symphony_autonomy_successful_parallel_cycles gauge"));
+        assert!(body.contains("symphony_reliability_repeated_failures 0"));
+        assert!(body.contains("symphony_flow_deployment_frequency NaN"));
+    }
+
+    #[tokio::test]
+    async fn evidence_page_renders_a_persisted_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        save_bundle(dir.path(), "issue-1", &test_bundle("issue-1")).unwrap();
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/evidence/issue-1"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("READY"));
+        assert!(body.contains("ships evidence bundle"));
+    }
+
+    /// One test, not two: `SYMPHONY_ADMIN_TOKEN` is a process-global env var, and
+    /// cargo runs tests concurrently by default -- two tests each setting it to a
+    /// different expected value would race. Exercising "wrong token rejected" then
+    /// "correct token accepted" sequentially, inside a single test, sidesteps that
+    /// entirely rather than trying to serialize two separate test functions.
+    #[tokio::test]
+    async fn evidence_override_requires_a_matching_admin_token() {
+        // SAFETY: test-only env var, scoped to this test's own token value.
+        unsafe {
+            std::env::set_var("SYMPHONY_ADMIN_TOKEN", "test-token-air9-override");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut bundle = test_bundle("issue-1");
+        bundle.security_findings.push(release::SecurityFinding {
+            id: "S1".to_string(),
+            description: "sql injection".to_string(),
+            severity: release::SecuritySeverity::Critical,
+            blocking: true,
+            override_reason: None,
+        });
+        save_bundle(dir.path(), "issue-1", &bundle).unwrap();
+
+        let (_tx, rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let rejected = client
+            .post(format!("http://{addr}/evidence/issue-1/override"))
+            .bearer_auth("wrong-token")
+            .form(&[("reason", "accepted")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(
+            load_bundle(dir.path(), "issue-1")
+                .unwrap()
+                .security_findings[0]
+                .override_reason
+                .is_none(),
+            "a rejected request must not modify the bundle"
+        );
+
+        let accepted = client
+            .post(format!("http://{addr}/evidence/issue-1/override"))
+            .bearer_auth("test-token-air9-override")
+            .form(&[("reason", "accepted, ticket SEC-1")])
+            .send()
+            .await
+            .unwrap();
+        assert!(accepted.status().is_redirection(), "{}", accepted.status());
+
+        let updated = load_bundle(dir.path(), "issue-1").unwrap();
+        assert_eq!(
+            updated.security_findings[0].override_reason.as_deref(),
+            Some("accepted, ticket SEC-1")
+        );
+        assert_eq!(release::compute_verdict(&updated), Verdict::ReadyWithRisk);
+
+        unsafe {
+            std::env::remove_var("SYMPHONY_ADMIN_TOKEN");
+        }
+    }
+
+    #[test]
+    fn observability_row_renders_a_degraded_verdict_with_its_failing_check() {
+        let message = serde_json::json!({
+            "verdict": "degraded",
+            "window_minutes": 30,
+            "checks": [{"name": "error_rate", "value": 0.5, "max": 0.01, "passed": false}],
+            "reason": "check(s) exceeded threshold: error_rate",
+        })
+        .to_string();
+        let row = event_row_fixture("production_validation", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("verdict-degraded"));
+        assert!(html.contains("error_rate"));
+        assert!(html.contains("fail"));
+    }
+
+    #[test]
+    fn observability_row_renders_unknown_distinctly_from_healthy() {
+        let message = serde_json::json!({
+            "verdict": "unknown",
+            "window_minutes": 30,
+            "checks": [],
+            "reason": "no data returned for check 'error_rate'",
+        })
+        .to_string();
+        let row = event_row_fixture("production_validation", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("verdict-unknown"));
+        assert!(!html.contains("verdict-healthy"));
+    }
+
+    #[test]
+    fn observability_row_renders_telemetry_evidence_signals_and_findings() {
+        let message = serde_json::json!({
+            "signals": [{"kind": "log", "location": "src/lib.rs:1", "snippet": "x", "requirement_id": "R1"}],
+            "findings": [{"location": "src/lib.rs:2", "description": "possible secret"}],
+        })
+        .to_string();
+        let row = event_row_fixture("telemetry_evidence", Some(&message));
+        let html = observability_row(&row);
+        assert!(html.contains("src/lib.rs:1"));
+        assert!(html.contains("satisfies R1"));
+        assert!(html.contains("possible secret"));
+    }
+
+    #[tokio::test]
+    async fn observability_page_lists_recorded_evidence_and_verdicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(eventlog::DB_FILENAME);
+        let tx = eventlog::spawn_writer(db.clone());
+        tx.send(eventlog::NewEvent {
+            issue_id: "1".to_string(),
+            identifier: "AIR-10".to_string(),
+            title: "deploy abc123".to_string(),
+            session_id: None,
+            event_type: "production_validation".to_string(),
+            message: Some(r#"{"verdict":"healthy","window_minutes":30,"checks":[],"reason":"all checks within threshold"}"#.to_string()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+        })
+        .unwrap();
+        // Give the writer task a moment to persist before the page reads it back.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let app = router(
+            status_rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            None,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/observability"))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("verdict-healthy"));
+        assert!(!body.contains("Rescan open PRs now"));
+    }
+
+    #[tokio::test]
+    async fn observability_page_shows_the_rescan_button_only_when_a_repo_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_status_tx, status_rx) = watch::channel(StatusSnapshot::default());
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = ObservabilityHandle {
+            repo: Some(crate::config::RepoConfig {
+                url: "https://github.com/owner/name.git".to_string(),
+                default_branch: "main".to_string(),
+                ..Default::default()
+            }),
+            event_tx,
+        };
+        let app = router(
+            status_rx,
+            dir.path().to_path_buf(),
+            test_tracker(dir.path()),
+            "",
+            false,
+            None,
+            Some(handle),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resp = reqwest::get(format!("http://{addr}/observability"))
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Rescan open PRs now"));
     }
 }

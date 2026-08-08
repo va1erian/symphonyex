@@ -106,6 +106,26 @@ pub trait RepoHost: DiscussionHost {
         workspace_dir: &Path,
     ) -> ToolResult;
 
+    // --- AIR-9: release evidence consolidation (repo.release_evidence) ---
+    /// Overwrite an already-open PR/MR's body (title untouched) -- used to append
+    /// the evidence bundle onto whatever the agent itself wrote, without needing the
+    /// original title (which `execute_agent_tool`'s `open_pull_request` path doesn't
+    /// hand back -- see `SymphonyPullRequest`, which carries `body` but not `title`).
+    async fn update_pr_body(&self, pr_number: u64, body: &str) -> Result<(), String>;
+    /// Upload arbitrary bytes (not just an image) to this repo's ticket branch via
+    /// the same content-hashed path convention `attach_evidence` uses, and hand back
+    /// the raw content URL (not a markdown snippet -- callers decide how to present
+    /// it, e.g. a plain link for an oversized coverage report or the durable copy of
+    /// a whole `release::EvidenceBundle`). Both implementations share their
+    /// `attach_evidence`'s own upload plumbing rather than duplicating it.
+    async fn upload_artifact(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String>;
+
     // --- SweBot: PR/MR review ---
     async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String>;
     async fn has_reviewed_sha(&self, pr_number: u64, head_sha: &str) -> Result<bool, String>;
@@ -116,6 +136,24 @@ pub trait RepoHost: DiscussionHost {
         verdict: ReviewVerdict,
         summary: &str,
     ) -> Result<ReviewOutcome, String>;
+
+    // --- Observability Agent (AIR-10): post-deploy validation trigger ---
+    /// The most recent deployment/pipeline run against `repo.default_branch` that
+    /// completed successfully, if any (`observability::deploy::HostDeploySignal`).
+    /// `Ok(None)` means "reachable, nothing successfully deployed yet" -- never an
+    /// error; an unreachable host API is `Err`.
+    async fn latest_successful_deploy(&self) -> Result<Option<DeployRecord>, String>;
+}
+
+/// One successful deployment/pipeline run, as reported by the code host's own
+/// deployment (GitHub) or pipeline (GitLab) status API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployRecord {
+    pub sha: String,
+    /// Provider-native id (a GitHub deployment id or GitLab pipeline id), opaque --
+    /// used only to dedupe "have we already validated this one" without needing to
+    /// re-derive it from `sha` alone.
+    pub identifier: String,
 }
 
 /// Construct the configured repo host from `repo.provider`.

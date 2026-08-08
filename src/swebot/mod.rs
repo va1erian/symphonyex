@@ -25,7 +25,10 @@
 
 pub mod chat;
 pub mod drafting;
-mod git;
+/// `pub(crate)`, not private: `observability::pre_merge` (AIR-10) reuses these same
+/// clone/diff helpers for its own pre-merge telemetry scan, rather than duplicating
+/// git plumbing that already exists here for PR review's diffing needs.
+pub(crate) mod git;
 pub mod qa;
 pub mod review;
 

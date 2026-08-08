@@ -208,6 +208,7 @@ mod tests {
             token_env: Some("SYMPHONY_TEST_GH_CHAT_TOKEN".to_string()),
             pull_request: false,
             evidence: false,
+            release_evidence: false,
             provider: crate::config::RepoProvider::Github,
             api_base_url: None,
         })

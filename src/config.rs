@@ -51,6 +51,12 @@ pub enum ConfigError {
     )]
     EvidenceRequiresPullRequest,
     #[error(
+        "invalid_config: repo.release_evidence requires repo.pull_request to be true -- the \
+         evidence bundle is consolidated into a pull/merge request Symphony itself opens, so \
+         there has to be one"
+    )]
+    ReleaseEvidenceRequiresPullRequest,
+    #[error(
         "invalid_config: swebot.enabled with repo.provider: github (the default) requires repo.url to be a github.com URL (owner/name)"
     )]
     SwebotRequiresGithubRepo,
@@ -96,6 +102,22 @@ pub enum ConfigError {
     UnknownStageRole(usize, String, String),
     #[error("invalid_config: roles.{0}.prompt_file '{1}' could not be read: {2}")]
     UnreadableRolePromptFile(String, String, String),
+    #[error(
+        "invalid_config: pipeline.security.block_on[{0}] is '{1}', not one of low|medium|high|critical"
+    )]
+    InvalidSecurityBlockOn(usize, String),
+    #[error(
+        "invalid_config: pipeline.security.scanners[{0}] is missing a non-empty 'name' or 'command' field"
+    )]
+    InvalidSecurityScanner(usize),
+    #[error(
+        "unsupported_observability_backend: '{0}' is not a supported backend (expected 'none', 'otlp', 'prometheus' or 'datadog')"
+    )]
+    UnsupportedObservabilityBackend(String),
+    #[error(
+        "invalid_config: observability.token must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidObservabilityToken,
 }
 
 /// AIR-5: `pipeline.approval.auto_approve_when` -- every condition set (non-`None`)
@@ -285,6 +307,17 @@ pub struct RepoConfig {
     /// this commits a real file to the real repo.
     #[serde(default)]
     pub evidence: bool,
+    /// Opt-in (AIR-9): after a cycle ends, assemble a `release::EvidenceBundle` from
+    /// the issue and its event history, and rewrite the open pull/merge request's
+    /// body to lead with the agent's own narrative followed by the evidence sections
+    /// (requirements/AC verdicts, findings, tokens, timeline, traceability matrix,
+    /// deployment-readiness verdict) instead of leaving the body purely
+    /// agent-authored. Requires `pull_request: true`, same reasoning as `evidence`:
+    /// there's nothing to consolidate into without a PR/MR Symphony itself opened.
+    /// Off by default -- this rewrites the body of a real PR/MR on every qualifying
+    /// cycle, a real behavior change a project opts into deliberately.
+    #[serde(default)]
+    pub release_evidence: bool,
 }
 
 /// Which code host `repo.url` points at (`repo.provider`, e.g. `provider: gitlab`).
@@ -411,6 +444,107 @@ pub struct SwebotChatConfig {
     pub first_text_deadline_ms: u64,
 }
 
+/// Extension (AIR-11): a rolling window a `budgets.application`/`budgets.platform` limit
+/// is measured over -- `budgets.window` in `WORKFLOW.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetWindow {
+    Daily,
+    Weekly,
+    #[default]
+    Monthly,
+}
+
+impl BudgetWindow {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "daily" => BudgetWindow::Daily,
+            "weekly" => BudgetWindow::Weekly,
+            _ => BudgetWindow::Monthly,
+        }
+    }
+}
+
+/// What happens when a budget's `tokens` or `cost` limit is exceeded
+/// (`budgets.on_exceeded`) -- one setting shared by every scope (stage/cycle/
+/// application/platform), so a project picks one posture rather than reasoning about
+/// four independent ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BudgetAction {
+    /// Record an event and show a dashboard banner; the cycle keeps running.
+    Warn,
+    /// Park the cycle in `pipeline.blocked_state`, same as `Stop`, but tagged
+    /// distinctly so a human knows it's asking for a budget extension rather than
+    /// reporting a hard stop (`status.rs`'s `/budget/extend` control resumes it).
+    Escalate,
+    /// End the cycle cleanly (the current turn finishes, `after_run` still runs) and
+    /// park the issue in `pipeline.blocked_state`.
+    #[default]
+    Stop,
+}
+
+impl BudgetAction {
+    fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "warn" => BudgetAction::Warn,
+            "escalate" => BudgetAction::Escalate,
+            _ => BudgetAction::Stop,
+        }
+    }
+}
+
+/// A token and/or currency ceiling for one budget scope. Either half can be omitted;
+/// `None` on both (the zero value) means "no limit at this scope."
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BudgetLimits {
+    pub tokens: Option<u64>,
+    pub cost: Option<f64>,
+}
+
+impl BudgetLimits {
+    fn parse(v: &Value) -> Option<Self> {
+        let tokens = get(v, "tokens").and_then(|x| x.as_u64());
+        let cost = get_f64(v, "cost");
+        if tokens.is_none() && cost.is_none() {
+            None
+        } else {
+            Some(BudgetLimits { tokens, cost })
+        }
+    }
+}
+
+/// Extension (AIR-11): `stop_conditions.*` -- ways a cycle stops itself independent of
+/// any budget, both aimed at the same failure mode (an agent looping to `max_turns`
+/// while accomplishing nothing). `None` disables the corresponding check; the zero
+/// value disables both, so a project that never sets `stop_conditions:` sees no
+/// behavior change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StopConditionsConfig {
+    /// Stop after this many consecutive turns produce neither a tool call nor a
+    /// workspace diff.
+    pub no_progress_turns: Option<u32>,
+    /// Stop after the same turn-failure signature repeats this many times in a row.
+    pub repeated_error: Option<u32>,
+}
+
+/// Extension (AIR-11): `budgets.*` -- token/cost ceilings at four scopes
+/// (platform/application/cycle/stage) enforced after every turn against
+/// `eventlog::usage_summary`-style rollups, per `src/budget.rs`. Every field defaults
+/// to "no limit" (`BudgetLimits::default()`'s `None`/`None`), so a project that never
+/// sets `budgets:` sees no behavior change -- `budget::check_after_turn` short-circuits
+/// to "not exceeded" whenever a scope's limits are both `None`.
+#[derive(Debug, Clone, Default)]
+pub struct BudgetsConfig {
+    pub currency: String,
+    pub platform: Option<BudgetLimits>,
+    pub application: Option<BudgetLimits>,
+    pub window: BudgetWindow,
+    pub cycle: Option<BudgetLimits>,
+    /// Default stage budget, applied to every stage that doesn't set its own
+    /// `pipeline.stages[].budget` override.
+    pub stage: Option<BudgetLimits>,
+    pub on_exceeded: BudgetAction,
+}
+
 /// Extension: the AI Roadmap 2026 delivery pipeline (AIR-1) -- run a ticket through an
 /// ordered sequence of stages within one workspace instead of a single undifferentiated
 /// agent run. Off by default (`enabled: false`, the zero value `Default` produces):
@@ -439,6 +573,38 @@ pub struct PipelineConfig {
     /// through the hook plumbing instead of (in addition to) the agent's own turns.
     pub test: Option<TestConfig>,
     pub review: ReviewConfig,
+    /// AIR-8: settings for any stage whose `role` is `security`. Kept as its own
+    /// struct (not flattened into `PipelineConfig`) so the next role-specific config
+    /// block (e.g. AIR-6's test stage) has an obvious sibling to follow instead of a
+    /// second top-level shape.
+    pub security: SecurityConfig,
+}
+
+/// `pipeline.security.*` (AIR-8). Applies to every stage whose `role` is `security` --
+/// there is exactly one security stage in practice, but nothing here assumes that.
+#[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    /// A finding at or above one of these severities blocks the cycle (park in
+    /// `pipeline.blocked_state`, no PR opened) unless a human override has been
+    /// recorded for this issue through the dashboard. Defaults to `[critical, high]`.
+    pub block_on: Vec<crate::security::Severity>,
+    /// Deterministic scanner commands run through the hook plumbing (Docker mode
+    /// included) after the security stage's own turns complete, folded into the
+    /// `security_findings` artifact. Empty by default -- a project opts a scanner in
+    /// explicitly, same posture as every other opt-in extension in this file.
+    pub scanners: Vec<crate::security::ScannerConfig>,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            block_on: vec![
+                crate::security::Severity::Critical,
+                crate::security::Severity::High,
+            ],
+            scanners: Vec::new(),
+        }
+    }
 }
 
 /// `pipeline.test` (AIR-6): the project declares how its own suites and coverage tool
@@ -531,6 +697,9 @@ pub struct StageConfig {
     /// human decision (dashboard or issue-comment `/approve`/`/changes`/`/reject`),
     /// unless `pipeline.approval.auto_approve_when` matches the stage's output first.
     pub requires_approval: bool,
+    /// Overrides `budgets.stage` for this one stage; `None` falls back to the
+    /// project-wide default.
+    pub budget: Option<BudgetLimits>,
 }
 
 /// AIR-2: a project's override of one of the eight built-in roadmap roles
@@ -551,6 +720,80 @@ pub struct RoleConfig {
     pub model: Option<String>,
     pub max_turns: Option<u32>,
     pub tool_policy: crate::agent::ToolPolicy,
+}
+
+/// Extension: the Observability Agent (AIR-10) -- provider-neutral behind
+/// `ObservabilityBackend` (`src/observability/mod.rs`) so migrating from Datadog to
+/// the Open Observability Platform (Roadmap §2) is a config change, not a rewrite.
+/// `backend: none` (the default, `Default` produces it via `ObservabilityBackendKind`'s
+/// own `#[default]`) leaves the daemon's behavior unchanged: no production-validation
+/// poller is spawned (see `orchestrator::run_inner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObservabilityBackendKind {
+    #[default]
+    None,
+    Otlp,
+    Prometheus,
+    Datadog,
+}
+
+impl ObservabilityBackendKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "otlp" => Some(Self::Otlp),
+            "prometheus" => Some(Self::Prometheus),
+            "datadog" => Some(Self::Datadog),
+            _ => None,
+        }
+    }
+}
+
+/// One `observability.validation.checks[]` entry: a query evaluated against the
+/// configured backend over the validation window, healthy when its returned value is
+/// `<= max`.
+#[derive(Debug, Clone)]
+pub struct ObservabilityCheck {
+    pub name: String,
+    pub query: String,
+    pub max: f64,
+}
+
+/// Post-deploy validation config (`observability.validation`). Off unless
+/// `after_deploy: true` -- production validation is opt-in even when a backend is
+/// configured, since a project might configure `observability:` purely for the
+/// pre-merge stage.
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityValidationConfig {
+    pub after_deploy: bool,
+    pub window_minutes: u64,
+    pub checks: Vec<ObservabilityCheck>,
+    /// A shell command polled for deploy detection, alongside (not instead of) the
+    /// code host's own deployment/pipeline status API -- see
+    /// `observability::deploy::DeploySignal`. `None` means only the host API is used.
+    pub deploy_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityConfig {
+    pub backend: ObservabilityBackendKind,
+    pub query_url: Option<String>,
+    /// Name of an env var holding the backend credential -- never resolved here, same
+    /// `$VAR_NAME` convention as `RepoConfig::token_env` (see that field's doc
+    /// comment): referencing it by name is enough for `envsub::collect_var_refs` to
+    /// pick it up and forward it into Docker-mode containers, without this value ever
+    /// being embedded in config or logged.
+    pub token_env: Option<String>,
+    /// Directory a project declares its dashboard/SLO definitions in. Purely
+    /// informational to Symphony itself: the pre-merge stage may propose changes
+    /// there as ordinary code in the same MR, reviewed by humans like any other
+    /// diff -- never applied through a live API. Parsed and validated (path
+    /// resolution) today; not read anywhere beyond that, the same "documents a
+    /// convention, doesn't yet drive logic" posture `ClaudeConfig::api_key_env`'s
+    /// own doc comment describes.
+    #[allow(dead_code)]
+    pub definitions_dir: Option<PathBuf>,
+    pub validation: ObservabilityValidationConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -582,6 +825,14 @@ pub struct EffectiveConfig {
     /// falls back to its built-in default (`src/roles/builtin`) entirely -- see
     /// `roles::resolve`.
     pub roles: HashMap<String, RoleConfig>,
+    pub observability: ObservabilityConfig,
+    pub budgets: BudgetsConfig,
+    pub stop_conditions: StopConditionsConfig,
+    /// `<backend>/<model>` -> price per million tokens, resolved once at config time
+    /// (default table merged with a project's own `pricing:` overrides) -- see
+    /// `budget::resolve_pricing`. Never consulted deep inside a backend module; cost is
+    /// only ever computed from this at the one place `budget::compute_cost` is called.
+    pub pricing: crate::budget::PricingTable,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -626,6 +877,19 @@ impl EffectiveConfig {
             AgentBackendKind::Codex => self.codex.stall_timeout_ms,
             AgentBackendKind::OpenCode => self.opencode.stall_timeout_ms,
         }
+    }
+
+    /// `<backend>/<model>` pricing-table key for whichever backend/model this run
+    /// actually uses (Section AIR-11) -- `None` model (the CLI's own default) resolves
+    /// to a key nothing in `default_pricing()` matches, which is deliberate: an unpriced
+    /// model must show cost `unknown`, never silently `0`.
+    pub fn effective_model_key(&self) -> String {
+        let (backend, model) = match self.agent_backend {
+            AgentBackendKind::Claude => ("claude", self.claude.model.as_deref()),
+            AgentBackendKind::Codex => ("codex", None),
+            AgentBackendKind::OpenCode => ("opencode", self.opencode.model.as_deref()),
+        };
+        crate::budget::model_key(backend, model)
     }
 
     /// The backend SweBot's own sessions run on: `swebot.backend` when set, else the
@@ -675,6 +939,18 @@ fn get_u64(v: &Value, key: &str, default: u64) -> u64 {
 
 fn get_i64(v: &Value, key: &str, default: i64) -> i64 {
     get(v, key).and_then(|x| x.as_i64()).unwrap_or(default)
+}
+
+/// Unlike `serde_yaml::Value::as_f64` alone, also accepts a bare integer (`cost: 40`)
+/// -- YAML doesn't tag `40` as a float just because the schema expects one, and a
+/// budget/price value written without a decimal point is a completely normal thing for
+/// a human to type.
+fn get_f64(v: &Value, key: &str) -> Option<f64> {
+    get(v, key).and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_i64().map(|i| i as f64))
+            .or_else(|| x.as_u64().map(|u| u as f64))
+    })
 }
 
 fn get_vec_str(v: &Value, key: &str) -> Vec<String> {
@@ -791,6 +1067,12 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
             if evidence && !pull_request {
                 return Err(ConfigError::EvidenceRequiresPullRequest);
             }
+            let release_evidence = get(r, "release_evidence")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if release_evidence && !pull_request {
+                return Err(ConfigError::ReleaseEvidenceRequiresPullRequest);
+            }
             Ok(RepoConfig {
                 url,
                 provider,
@@ -799,6 +1081,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                 token_env,
                 pull_request,
                 evidence,
+                release_evidence,
             })
         })
         .transpose()?;
@@ -1002,6 +1285,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
                         requires_approval: get(s, "requires_approval")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false),
+                        budget: get(s, "budget").and_then(BudgetLimits::parse),
                     })
                 })
                 .collect()
@@ -1052,6 +1336,47 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
     });
 
     let review_raw = get(pipeline_raw, "review").unwrap_or(&empty);
+
+    let security_raw = get(pipeline_raw, "security").unwrap_or(&empty);
+    let block_on_raw = get_vec_str(security_raw, "block_on");
+    let block_on = if block_on_raw.is_empty() {
+        SecurityConfig::default().block_on
+    } else {
+        block_on_raw
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                crate::security::Severity::parse(s)
+                    .ok_or_else(|| ConfigError::InvalidSecurityBlockOn(i, s.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let scanners = get(security_raw, "scanners")
+        .and_then(|v| v.as_sequence())
+        .map(
+            |seq| -> Result<Vec<crate::security::ScannerConfig>, ConfigError> {
+                seq.iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let name = get_str(s, "name")
+                            .filter(|v| !v.trim().is_empty())
+                            .ok_or(ConfigError::InvalidSecurityScanner(i))?;
+                        let command = get_str(s, "command")
+                            .filter(|v| !v.trim().is_empty())
+                            .ok_or(ConfigError::InvalidSecurityScanner(i))?;
+                        let format = get_str(s, "format").unwrap_or_default();
+                        Ok(crate::security::ScannerConfig {
+                            name,
+                            command,
+                            format,
+                        })
+                    })
+                    .collect()
+            },
+        )
+        .transpose()?
+        .unwrap_or_default();
+
     let pipeline_cfg = PipelineConfig {
         enabled: pipeline_enabled,
         stages: pipeline_stages,
@@ -1064,6 +1389,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         review: ReviewConfig {
             max_rework_rounds: (get_u64(review_raw, "max_rework_rounds", 2) as u32).max(1),
         },
+        security: SecurityConfig { block_on, scanners },
     };
 
     let roles_raw = get(config, "roles").unwrap_or(&empty);
@@ -1128,6 +1454,99 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         }
     }
 
+    let observability_raw = get(config, "observability").unwrap_or(&empty);
+    let observability_backend = get_str(observability_raw, "backend")
+        .map(|s| {
+            ObservabilityBackendKind::parse(&s)
+                .ok_or(ConfigError::UnsupportedObservabilityBackend(s))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let observability_token_env = get_str(observability_raw, "token")
+        .map(|t| {
+            envsub::var_name_of(&t)
+                .map(|s| s.to_string())
+                .ok_or(ConfigError::InvalidObservabilityToken)
+        })
+        .transpose()?;
+    let observability_validation_raw = get(observability_raw, "validation").unwrap_or(&empty);
+    let observability_checks = get(observability_validation_raw, "checks")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|c| {
+                    let name = get_str(c, "name")?;
+                    let query = get_str(c, "query").unwrap_or_default();
+                    let max = get(c, "max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                    Some(ObservabilityCheck { name, query, max })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let observability_cfg = ObservabilityConfig {
+        backend: observability_backend,
+        query_url: get_str(observability_raw, "query_url"),
+        token_env: observability_token_env,
+        definitions_dir: get_str(observability_raw, "definitions_dir")
+            .map(|d| envsub::resolve_path(&d, workflow_dir)),
+        validation: ObservabilityValidationConfig {
+            after_deploy: get(observability_validation_raw, "after_deploy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            window_minutes: get_u64(observability_validation_raw, "window_minutes", 30),
+            checks: observability_checks,
+            deploy_command: get_str(observability_validation_raw, "deploy_command"),
+        },
+    };
+
+    let budgets_raw = get(config, "budgets").unwrap_or(&empty);
+    let budgets_cfg = BudgetsConfig {
+        currency: get_str(budgets_raw, "currency").unwrap_or_else(|| "USD".to_string()),
+        platform: get(budgets_raw, "platform").and_then(BudgetLimits::parse),
+        application: get(budgets_raw, "application").and_then(BudgetLimits::parse),
+        window: get_str(budgets_raw, "window")
+            .map(|v| BudgetWindow::parse(&v))
+            .unwrap_or_default(),
+        cycle: get(budgets_raw, "cycle").and_then(BudgetLimits::parse),
+        stage: get(budgets_raw, "stage").and_then(BudgetLimits::parse),
+        on_exceeded: get_str(budgets_raw, "on_exceeded")
+            .map(|v| BudgetAction::parse(&v))
+            .unwrap_or_default(),
+    };
+
+    let stop_conditions_raw = get(config, "stop_conditions").unwrap_or(&empty);
+    let stop_conditions_cfg = StopConditionsConfig {
+        no_progress_turns: get(stop_conditions_raw, "no_progress_turns")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        repeated_error: get(stop_conditions_raw, "repeated_error")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    };
+
+    let pricing_overrides: crate::budget::PricingTable = get(config, "pricing")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let key = k.as_str()?.trim().to_lowercase();
+                    let input = get_f64(v, "input")?;
+                    let output = get_f64(v, "output")?;
+                    let cache = get_f64(v, "cache");
+                    Some((
+                        key,
+                        crate::budget::PriceEntry {
+                            input_per_million: input,
+                            output_per_million: output,
+                            cache_per_million: cache,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let pricing = crate::budget::resolve_pricing(&pricing_overrides);
+
     let cfg = EffectiveConfig {
         tracker_kind,
         tracker_provider: get_map(tracker, "provider"),
@@ -1147,6 +1566,10 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         swebot: swebot_cfg,
         pipeline: pipeline_cfg,
         roles: roles_cfg,
+        observability: observability_cfg,
+        budgets: budgets_cfg,
+        stop_conditions: stop_conditions_cfg,
+        pricing,
 
         hook_after_create,
         hook_before_run,
@@ -1599,6 +2022,41 @@ mod tests {
         let repo = cfg.repo.unwrap();
         assert!(repo.pull_request);
         assert!(repo.evidence);
+    }
+
+    #[test]
+    fn release_evidence_defaults_to_false() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_RELEASE_EVIDENCE_DEFAULT\n  pull_request: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert!(!cfg.repo.unwrap().release_evidence);
+    }
+
+    #[test]
+    fn release_evidence_requires_pull_request_to_be_true() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_RELEASE_EVIDENCE_REQUIRES_PR\n  release_evidence: true\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::ReleaseEvidenceRequiresPullRequest)
+        ));
+    }
+
+    #[test]
+    fn release_evidence_true_with_pull_request_true_resolves() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nrepo:\n  url: https://github.com/o/r.git\n  \
+             token: $SYMPHONY_TEST_RELEASE_EVIDENCE_OK\n  pull_request: true\n  \
+             release_evidence: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        let repo = cfg.repo.unwrap();
+        assert!(repo.pull_request);
+        assert!(repo.release_evidence);
     }
 
     #[test]
@@ -2583,5 +3041,145 @@ mod tests {
             vec![("unit".to_string(), "cargo test".to_string())]
         );
         assert!(test.coverage.is_none());
+    }
+
+    #[test]
+    fn security_block_on_and_scanners_default() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.pipeline.security.block_on,
+            vec![
+                crate::security::Severity::Critical,
+                crate::security::Severity::High
+            ]
+        );
+        assert!(cfg.pipeline.security.scanners.is_empty());
+    }
+
+    #[test]
+    fn security_block_on_and_scanners_parse() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    \
+             block_on: [critical]\n    scanners:\n      \
+             - name: cargo-audit\n        command: cargo audit --json\n        format: cargo_audit_json\n      \
+             - name: gitleaks\n        command: gitleaks detect -f json\n        format: gitleaks_json\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.pipeline.security.block_on,
+            vec![crate::security::Severity::Critical]
+        );
+        assert_eq!(cfg.pipeline.security.scanners.len(), 2);
+        assert_eq!(cfg.pipeline.security.scanners[0].name, "cargo-audit");
+        assert_eq!(cfg.pipeline.security.scanners[1].format, "gitleaks_json");
+    }
+
+    #[test]
+    fn security_block_on_rejects_an_unknown_severity() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    block_on: [extreme]\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidSecurityBlockOn(0, s)) if s == "extreme"
+        ));
+    }
+
+    #[test]
+    fn security_scanner_missing_command_errors() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\npipeline:\n  security:\n    scanners:\n      \
+             - name: cargo-audit\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidSecurityScanner(0))
+        ));
+    }
+
+    #[test]
+    fn observability_absent_resolves_to_backend_none() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.observability.backend, ObservabilityBackendKind::None);
+        assert!(!cfg.observability.validation.after_deploy);
+    }
+
+    #[test]
+    fn observability_unknown_backend_errors() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nobservability:\n  backend: splunk\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::UnsupportedObservabilityBackend(b)) if b == "splunk"
+        ));
+    }
+
+    #[test]
+    fn observability_token_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: otlp\n  token: not-a-var\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidObservabilityToken)
+        ));
+    }
+
+    #[test]
+    fn observability_token_var_reference_resolves_and_is_collected_for_passthrough() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: datadog\n  \
+             token: $SYMPHONY_TEST_OBS_TOKEN\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.observability.token_env.as_deref(),
+            Some("SYMPHONY_TEST_OBS_TOKEN")
+        );
+        assert!(
+            envsub::collect_var_refs(&cfg_yaml).contains(&"SYMPHONY_TEST_OBS_TOKEN".to_string()),
+            "collect_var_refs must pick up observability.token so it gets forwarded into \
+             Docker-mode containers via env_passthrough, per this ticket's implementation notes"
+        );
+    }
+
+    #[test]
+    fn observability_validation_parses_checks_and_defaults() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: prometheus\n  \
+             query_url: https://prom.internal\n  validation:\n    after_deploy: true\n    \
+             window_minutes: 15\n    checks:\n      \
+             - {name: error_rate, query: \"rate(errors[5m])\", max: 0.01}\n      \
+             - {name: p95_latency_ms, query: \"histogram_quantile(...)\", max: 400}\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.observability.backend,
+            ObservabilityBackendKind::Prometheus
+        );
+        assert_eq!(
+            cfg.observability.query_url.as_deref(),
+            Some("https://prom.internal")
+        );
+        assert!(cfg.observability.validation.after_deploy);
+        assert_eq!(cfg.observability.validation.window_minutes, 15);
+        assert_eq!(cfg.observability.validation.checks.len(), 2);
+        assert_eq!(cfg.observability.validation.checks[0].name, "error_rate");
+        assert_eq!(cfg.observability.validation.checks[0].max, 0.01);
+    }
+
+    #[test]
+    fn observability_backend_none_is_the_default_even_with_a_validation_block() {
+        // `backend: none` must leave behavior unchanged regardless of what else is
+        // configured underneath it -- `observability::build_backend` returns `None`
+        // whenever `backend` is `None`, independent of `query_url`/`validation`.
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  query_url: https://example.invalid\n  \
+             validation:\n    after_deploy: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.observability.backend, ObservabilityBackendKind::None);
+        assert!(crate::observability::build_backend(&cfg.observability).is_none());
     }
 }
