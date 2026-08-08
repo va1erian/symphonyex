@@ -420,6 +420,9 @@ pub struct ProjectHandles {
     /// tracker-backed `/security` override action into this project's nested
     /// dashboard that the single-project path gets above.
     pub security: status::SecurityContext,
+    /// Backs the nested `/observability` page's "rescan now" action -- see
+    /// `status::ObservabilityHandle`.
+    pub observability: status::ObservabilityHandle,
 }
 
 /// Single-project entry point (Section 5): runs until the process is killed or the
@@ -508,6 +511,12 @@ async fn run_inner(
     // HTTP surface is gated on a port).
     let chat = crate::swebot::chat::start(shared.config.clone(), shared.tracker.clone());
 
+    // Backs `/observability`'s "rescan now" action -- see `status::ObservabilityHandle`.
+    let observability_handle = status::ObservabilityHandle {
+        repo: shared.config.repo.clone(),
+        event_tx: shared.event_tx.clone(),
+    };
+
     if let Some(port) = status_port {
         // Same daemonized-Symphony signal used for MountSource above: inside its own
         // container, loopback-only binding would make the dashboard unreachable even
@@ -527,6 +536,7 @@ async fn run_inner(
             blocked_state: shared.config.pipeline.blocked_state.clone(),
             resume_state: shared.config.active_states.first().cloned(),
         };
+        let observability_for_serve = observability_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = status::serve_composite(
                 port,
@@ -535,6 +545,7 @@ async fn run_inner(
                 workflow_dir_for_serve,
                 chat_router,
                 Some(security_context),
+                Some(observability_for_serve),
             )
             .await
             {
@@ -552,6 +563,7 @@ async fn run_inner(
                 blocked_state: shared.config.pipeline.blocked_state.clone(),
                 resume_state: shared.config.active_states.first().cloned(),
             },
+            observability: observability_handle,
         });
     }
 
@@ -563,6 +575,25 @@ async fn run_inner(
         let swebot_tracker = shared.tracker.clone();
         tokio::spawn(async move {
             crate::swebot::run(swebot_cfg, swebot_tracker).await;
+        });
+    }
+
+    // AIR-10 Observability Agent: both halves are gated on `observability.backend`
+    // not being `none` (the default) -- see `observability::pre_merge::run`'s doc
+    // comment for why the pre-merge scan (which needs no backend of its own) is
+    // gated the same way as post-deploy validation (which does).
+    if shared.config.observability.backend != crate::config::ObservabilityBackendKind::None {
+        let pre_merge_cfg = shared.config.clone();
+        let pre_merge_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::pre_merge::run(pre_merge_cfg, pre_merge_events).await;
+        });
+
+        let validation_cfg = shared.config.clone();
+        let validation_events = shared.event_tx.clone();
+        tokio::spawn(async move {
+            crate::observability::production_validation::run(validation_cfg, validation_events)
+                .await;
         });
     }
 

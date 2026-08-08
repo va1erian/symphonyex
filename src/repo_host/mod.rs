@@ -136,6 +136,24 @@ pub trait RepoHost: DiscussionHost {
         verdict: ReviewVerdict,
         summary: &str,
     ) -> Result<ReviewOutcome, String>;
+
+    // --- Observability Agent (AIR-10): post-deploy validation trigger ---
+    /// The most recent deployment/pipeline run against `repo.default_branch` that
+    /// completed successfully, if any (`observability::deploy::HostDeploySignal`).
+    /// `Ok(None)` means "reachable, nothing successfully deployed yet" -- never an
+    /// error; an unreachable host API is `Err`.
+    async fn latest_successful_deploy(&self) -> Result<Option<DeployRecord>, String>;
+}
+
+/// One successful deployment/pipeline run, as reported by the code host's own
+/// deployment (GitHub) or pipeline (GitLab) status API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployRecord {
+    pub sha: String,
+    /// Provider-native id (a GitHub deployment id or GitLab pipeline id), opaque --
+    /// used only to dedupe "have we already validated this one" without needing to
+    /// re-derive it from `sha` alone.
+    pub identifier: String,
 }
 
 /// Construct the configured repo host from `repo.provider`.

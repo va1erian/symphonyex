@@ -110,6 +110,14 @@ pub enum ConfigError {
         "invalid_config: pipeline.security.scanners[{0}] is missing a non-empty 'name' or 'command' field"
     )]
     InvalidSecurityScanner(usize),
+    #[error(
+        "unsupported_observability_backend: '{0}' is not a supported backend (expected 'none', 'otlp', 'prometheus' or 'datadog')"
+    )]
+    UnsupportedObservabilityBackend(String),
+    #[error(
+        "invalid_config: observability.token must be a $VAR_NAME reference (naming an env var), not a literal value"
+    )]
+    InvalidObservabilityToken,
 }
 
 /// AIR-5: `pipeline.approval.auto_approve_when` -- every condition set (non-`None`)
@@ -610,6 +618,80 @@ pub struct RoleConfig {
     pub tool_policy: crate::agent::ToolPolicy,
 }
 
+/// Extension: the Observability Agent (AIR-10) -- provider-neutral behind
+/// `ObservabilityBackend` (`src/observability/mod.rs`) so migrating from Datadog to
+/// the Open Observability Platform (Roadmap §2) is a config change, not a rewrite.
+/// `backend: none` (the default, `Default` produces it via `ObservabilityBackendKind`'s
+/// own `#[default]`) leaves the daemon's behavior unchanged: no production-validation
+/// poller is spawned (see `orchestrator::run_inner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObservabilityBackendKind {
+    #[default]
+    None,
+    Otlp,
+    Prometheus,
+    Datadog,
+}
+
+impl ObservabilityBackendKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "otlp" => Some(Self::Otlp),
+            "prometheus" => Some(Self::Prometheus),
+            "datadog" => Some(Self::Datadog),
+            _ => None,
+        }
+    }
+}
+
+/// One `observability.validation.checks[]` entry: a query evaluated against the
+/// configured backend over the validation window, healthy when its returned value is
+/// `<= max`.
+#[derive(Debug, Clone)]
+pub struct ObservabilityCheck {
+    pub name: String,
+    pub query: String,
+    pub max: f64,
+}
+
+/// Post-deploy validation config (`observability.validation`). Off unless
+/// `after_deploy: true` -- production validation is opt-in even when a backend is
+/// configured, since a project might configure `observability:` purely for the
+/// pre-merge stage.
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityValidationConfig {
+    pub after_deploy: bool,
+    pub window_minutes: u64,
+    pub checks: Vec<ObservabilityCheck>,
+    /// A shell command polled for deploy detection, alongside (not instead of) the
+    /// code host's own deployment/pipeline status API -- see
+    /// `observability::deploy::DeploySignal`. `None` means only the host API is used.
+    pub deploy_command: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityConfig {
+    pub backend: ObservabilityBackendKind,
+    pub query_url: Option<String>,
+    /// Name of an env var holding the backend credential -- never resolved here, same
+    /// `$VAR_NAME` convention as `RepoConfig::token_env` (see that field's doc
+    /// comment): referencing it by name is enough for `envsub::collect_var_refs` to
+    /// pick it up and forward it into Docker-mode containers, without this value ever
+    /// being embedded in config or logged.
+    pub token_env: Option<String>,
+    /// Directory a project declares its dashboard/SLO definitions in. Purely
+    /// informational to Symphony itself: the pre-merge stage may propose changes
+    /// there as ordinary code in the same MR, reviewed by humans like any other
+    /// diff -- never applied through a live API. Parsed and validated (path
+    /// resolution) today; not read anywhere beyond that, the same "documents a
+    /// convention, doesn't yet drive logic" posture `ClaudeConfig::api_key_env`'s
+    /// own doc comment describes.
+    #[allow(dead_code)]
+    pub definitions_dir: Option<PathBuf>,
+    pub validation: ObservabilityValidationConfig,
+}
+
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub tracker_kind: String,
@@ -639,6 +721,7 @@ pub struct EffectiveConfig {
     /// falls back to its built-in default (`src/roles/builtin`) entirely -- see
     /// `roles::resolve`.
     pub roles: HashMap<String, RoleConfig>,
+    pub observability: ObservabilityConfig,
 
     pub hook_after_create: Option<String>,
     pub hook_before_run: Option<String>,
@@ -1234,6 +1317,51 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         }
     }
 
+    let observability_raw = get(config, "observability").unwrap_or(&empty);
+    let observability_backend = get_str(observability_raw, "backend")
+        .map(|s| {
+            ObservabilityBackendKind::parse(&s)
+                .ok_or(ConfigError::UnsupportedObservabilityBackend(s))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let observability_token_env = get_str(observability_raw, "token")
+        .map(|t| {
+            envsub::var_name_of(&t)
+                .map(|s| s.to_string())
+                .ok_or(ConfigError::InvalidObservabilityToken)
+        })
+        .transpose()?;
+    let observability_validation_raw = get(observability_raw, "validation").unwrap_or(&empty);
+    let observability_checks = get(observability_validation_raw, "checks")
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|c| {
+                    let name = get_str(c, "name")?;
+                    let query = get_str(c, "query").unwrap_or_default();
+                    let max = get(c, "max").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                    Some(ObservabilityCheck { name, query, max })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let observability_cfg = ObservabilityConfig {
+        backend: observability_backend,
+        query_url: get_str(observability_raw, "query_url"),
+        token_env: observability_token_env,
+        definitions_dir: get_str(observability_raw, "definitions_dir")
+            .map(|d| envsub::resolve_path(&d, workflow_dir)),
+        validation: ObservabilityValidationConfig {
+            after_deploy: get(observability_validation_raw, "after_deploy")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            window_minutes: get_u64(observability_validation_raw, "window_minutes", 30),
+            checks: observability_checks,
+            deploy_command: get_str(observability_validation_raw, "deploy_command"),
+        },
+    };
+
     let cfg = EffectiveConfig {
         tracker_kind,
         tracker_provider: get_map(tracker, "provider"),
@@ -1253,6 +1381,7 @@ pub fn resolve(config: &Value, workflow_dir: &Path) -> Result<EffectiveConfig, C
         swebot: swebot_cfg,
         pipeline: pipeline_cfg,
         roles: roles_cfg,
+        observability: observability_cfg,
 
         hook_after_create,
         hook_before_run,
@@ -2779,5 +2908,90 @@ mod tests {
             resolve(&cfg_yaml, Path::new(".")),
             Err(ConfigError::InvalidSecurityScanner(0))
         ));
+    }
+
+    #[test]
+    fn observability_absent_resolves_to_backend_none() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\n");
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.observability.backend, ObservabilityBackendKind::None);
+        assert!(!cfg.observability.validation.after_deploy);
+    }
+
+    #[test]
+    fn observability_unknown_backend_errors() {
+        let cfg_yaml = parse_yaml("tracker:\n  kind: local\nobservability:\n  backend: splunk\n");
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::UnsupportedObservabilityBackend(b)) if b == "splunk"
+        ));
+    }
+
+    #[test]
+    fn observability_token_must_be_var_reference_not_a_literal() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: otlp\n  token: not-a-var\n",
+        );
+        assert!(matches!(
+            resolve(&cfg_yaml, Path::new(".")),
+            Err(ConfigError::InvalidObservabilityToken)
+        ));
+    }
+
+    #[test]
+    fn observability_token_var_reference_resolves_and_is_collected_for_passthrough() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: datadog\n  \
+             token: $SYMPHONY_TEST_OBS_TOKEN\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.observability.token_env.as_deref(),
+            Some("SYMPHONY_TEST_OBS_TOKEN")
+        );
+        assert!(
+            envsub::collect_var_refs(&cfg_yaml).contains(&"SYMPHONY_TEST_OBS_TOKEN".to_string()),
+            "collect_var_refs must pick up observability.token so it gets forwarded into \
+             Docker-mode containers via env_passthrough, per this ticket's implementation notes"
+        );
+    }
+
+    #[test]
+    fn observability_validation_parses_checks_and_defaults() {
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  backend: prometheus\n  \
+             query_url: https://prom.internal\n  validation:\n    after_deploy: true\n    \
+             window_minutes: 15\n    checks:\n      \
+             - {name: error_rate, query: \"rate(errors[5m])\", max: 0.01}\n      \
+             - {name: p95_latency_ms, query: \"histogram_quantile(...)\", max: 400}\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(
+            cfg.observability.backend,
+            ObservabilityBackendKind::Prometheus
+        );
+        assert_eq!(
+            cfg.observability.query_url.as_deref(),
+            Some("https://prom.internal")
+        );
+        assert!(cfg.observability.validation.after_deploy);
+        assert_eq!(cfg.observability.validation.window_minutes, 15);
+        assert_eq!(cfg.observability.validation.checks.len(), 2);
+        assert_eq!(cfg.observability.validation.checks[0].name, "error_rate");
+        assert_eq!(cfg.observability.validation.checks[0].max, 0.01);
+    }
+
+    #[test]
+    fn observability_backend_none_is_the_default_even_with_a_validation_block() {
+        // `backend: none` must leave behavior unchanged regardless of what else is
+        // configured underneath it -- `observability::build_backend` returns `None`
+        // whenever `backend` is `None`, independent of `query_url`/`validation`.
+        let cfg_yaml = parse_yaml(
+            "tracker:\n  kind: local\nobservability:\n  query_url: https://example.invalid\n  \
+             validation:\n    after_deploy: true\n",
+        );
+        let cfg = resolve(&cfg_yaml, Path::new(".")).unwrap();
+        assert_eq!(cfg.observability.backend, ObservabilityBackendKind::None);
+        assert!(crate::observability::build_backend(&cfg.observability).is_none());
     }
 }

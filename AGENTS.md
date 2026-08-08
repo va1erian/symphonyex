@@ -976,6 +976,59 @@ reviewer's comment appended to its first prompt.
 Neither the dashboard handler nor the comment poller mutates tracker state directly —
 see `approvals.rs`'s module doc comment for why that split exists.
 
+## Observability Agent (AI Roadmap 2026 §4, AIR-10)
+
+Two independent jobs, `src/observability/`, both off by default (`observability.backend:
+none`) and running as their own background tasks (`orchestrator::run_inner`), not
+integrated into the delivery pipeline's stage/role system yet -- they don't need a role
+prompt, only a repo to diff and (for the second job) a backend to query.
+
+```yaml
+observability:
+  backend: otlp            # none (default) | otlp | prometheus | datadog
+  query_url: https://...
+  token: $OBS_TOKEN        # env var name, same $VAR_NAME convention as repo.token
+  definitions_dir: dashboards/   # optional; informational only today
+  validation:
+    after_deploy: true
+    window_minutes: 30
+    deploy_command: ./scripts/latest-deploy.sh   # optional, alongside the host API
+    checks:
+      - {name: error_rate, query: "...", max: 0.01}
+      - {name: p95_latency_ms, query: "...", max: 400}
+```
+
+**Pre-merge (`observability::pre_merge`).** Polls every open Symphony-authored
+PR/MR (`RepoHost::list_open_symphony_prs`, the same call PR review already makes),
+diffs it against the default branch (`swebot::git`, made `pub(crate)` so this module
+can reuse it), and statically scans the added lines for structured log/span/metric
+signals and secret/PII field names inside them (`observability::evidence`). Recorded
+as a `telemetry_evidence` event -- no agent turn needed, since "does a tracing call
+exist, does it look like it logs a credential" is a pattern match. Dedup is
+in-process (a restart just re-scans; harmless, since this only ever emits an event).
+
+**Post-deploy (`observability::production_validation`).** Off unless
+`validation.after_deploy: true`. Polls for a new deploy via either signal
+(`observability::deploy::DeploySignal`) -- the code host's own deployment/pipeline
+status API (`RepoHost::latest_successful_deploy`, `src/repo_host/{github,gitlab}.rs`)
+or `validation.deploy_command` -- waits `window_minutes`, then evaluates
+`validation.checks` against the configured backend and records a `healthy | degraded
+| unknown` verdict as a `production_validation` event. `unknown` (backend
+unreachable, or any check with no data) is never reported as `healthy`. Every backend
+(`otlp`, `prometheus`, `datadog`) shares the one check-evaluation function
+(`observability::validate`) -- migrating backends only changes how a check's raw
+value is fetched, never how pass/fail is decided.
+
+**Dashboard.** `/observability` (nav-linked from every project page) lists both event
+types with their full explanation -- each check's value against its threshold for a
+verdict, each signal's location and matched requirement, and any secret/PII findings
+-- backed by `eventlog::recent_events_of_types`. A "Rescan open PRs now" button (shown
+whenever `repo:` is configured) POSTs to `/observability/rescan` and runs one
+pre-merge scan immediately instead of waiting for the next poll tick.
+
+**Rollback stays out of scope**, per the roadmap guardrail -- a `degraded`/`unknown`
+verdict is recorded and surfaced, never acted on automatically.
+
 ## Provider-native tracker tool (Section 10.5)
 
 The coding agent only ever runs inside the per-issue workspace — it has no visibility

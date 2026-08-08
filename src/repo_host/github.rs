@@ -609,6 +609,66 @@ impl RepoHost for GithubRepoHost {
             Err(e) => Err(e),
         }
     }
+
+    /// GitHub's Deployments API: the most recent deployment against `default_branch`,
+    /// then that deployment's most recent status -- a deployment with no `success`
+    /// status yet (still in progress, or failed) is not reported as a deploy.
+    async fn latest_successful_deploy(&self) -> Result<Option<super::DeployRecord>, String> {
+        let url = format!(
+            "{}/repos/{}/{}/deployments",
+            self.base_url, self.owner, self.repo
+        );
+        let req = self
+            .client
+            .get(&url)
+            .query(&[("ref", self.default_branch.as_str()), ("per_page", "1")]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let deployments: Vec<GhDeployment> = resp.json().await.map_err(|e| e.to_string())?;
+        let Some(deployment) = deployments.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let statuses_url = format!("{url}/{}/statuses", deployment.id);
+        let req = self.client.get(&statuses_url).query(&[("per_page", "1")]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {statuses_url} -> {status}: {text}"));
+        }
+        let statuses: Vec<GhDeploymentStatus> = resp.json().await.map_err(|e| e.to_string())?;
+        match statuses.first() {
+            Some(s) if s.state == "success" => Ok(Some(super::DeployRecord {
+                sha: deployment.sha,
+                identifier: deployment.id.to_string(),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhDeployment {
+    id: u64,
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhDeploymentStatus {
+    state: String,
 }
 
 #[async_trait]
@@ -1415,6 +1475,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, "C_99");
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_reports_the_sha_when_status_is_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 42, "sha": "abc123"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments/42/statuses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"state": "success"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_1")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(
+            record,
+            Some(super::super::DeployRecord {
+                sha: "abc123".to_string(),
+                identifier: "42".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_the_latest_status_is_not_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 7, "sha": "def456"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments/7/statuses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"state": "in_progress"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_2")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_nothing_has_ever_deployed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/name/deployments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_RH_DEPLOY_3")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
     }
 
     use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};

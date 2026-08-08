@@ -44,6 +44,8 @@ struct RunningProject {
     /// AIR-8: backs the project's nested `/security` override action with a real
     /// tracker, same as the single-project `--port` path.
     security: status::SecurityContext,
+    /// Backs the project's nested `/observability` page's "rescan now" action.
+    observability: status::ObservabilityHandle,
 }
 
 #[derive(Clone)]
@@ -192,6 +194,7 @@ async fn spawn_project(
             workflow_dir: handles.workflow_dir,
             chat: handles.chat,
             security: handles.security,
+            observability: handles.observability,
         },
     );
     Ok(())
@@ -528,7 +531,7 @@ async fn project_proxy(
         Some(id) => id.clone(),
         None => return (StatusCode::NOT_FOUND, "missing project id").into_response(),
     };
-    let (status_rx, workflow_dir, chat, security) = {
+    let (status_rx, workflow_dir, chat, security, observability) = {
         let running = state.running.lock().await;
         match running.get(&id) {
             Some(p) => (
@@ -536,6 +539,7 @@ async fn project_proxy(
                 p.workflow_dir.clone(),
                 p.chat.clone(),
                 p.security.clone(),
+                p.observability.clone(),
             ),
             None => return (StatusCode::NOT_FOUND, "unknown or removed project").into_response(),
         }
@@ -553,7 +557,13 @@ async fn project_proxy(
         *req.uri_mut() = new_uri;
     }
 
-    let sub_router = status::router(status_rx, workflow_dir, &prefix, Some(security));
+    let sub_router = status::router(
+        status_rx,
+        workflow_dir,
+        &prefix,
+        Some(security),
+        Some(observability),
+    );
     let sub_router = match &chat {
         Some(handles) if handles.web_enabled => sub_router.nest(
             "/chat",

@@ -11,6 +11,7 @@ mod frontmatter;
 mod hooks;
 mod mcp;
 mod metrics;
+mod observability;
 mod orchestrator;
 mod quality;
 mod registry;

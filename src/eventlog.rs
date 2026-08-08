@@ -290,6 +290,41 @@ pub fn recent_events(
     rows.collect()
 }
 
+/// Rows carrying one of `event_types` (an `IN (...)` filter, unlike `EventFilter`'s
+/// single-type match), most-recent-first. Used by `status.rs`'s `/observability`
+/// page (AIR-10) to pull `telemetry_evidence`/`production_validation` rows together
+/// -- generic over the type list rather than a one-off "observability" query, so the
+/// next feature needing "recent rows of a few specific types" reuses this instead of
+/// writing its own `IN (...)` clause.
+pub fn recent_events_of_types(
+    db_path: &Path,
+    event_types: &[&str],
+    limit: i64,
+) -> rusqlite::Result<Vec<EventRow>> {
+    if event_types.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open(db_path)?;
+    let placeholders: Vec<String> = (0..event_types.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect();
+    let sql = format!(
+        "SELECT id, issue_id, identifier, title, session_id, event_type, \
+         importance, message, input_tokens, output_tokens, total_tokens, created_at \
+         FROM events WHERE event_type IN ({}) ORDER BY id DESC LIMIT ?{}",
+        placeholders.join(", "),
+        event_types.len() + 1
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = event_types
+        .iter()
+        .map(|t| t as &dyn rusqlite::ToSql)
+        .collect();
+    params.push(&limit);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), row_from)?;
+    rows.collect()
+}
+
 /// Distinct `event_type` values seen so far, most-recent-first -- feeds `/events`'s
 /// type filter `<datalist>` (`status.rs`) so an operator can pick from what's actually
 /// been recorded instead of guessing/misspelling a type name into a plain text box.
@@ -788,6 +823,37 @@ mod tests {
         let coverage = latest_message_by_type(&db, "coverage_summary").unwrap();
         assert_eq!(coverage.get("2").map(String::as_str), Some("90%"));
         assert!(!coverage.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn recent_events_of_types_filters_to_the_requested_types_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        insert(&conn, &new_event("1", "telemetry_evidence")).unwrap();
+        insert(&conn, &new_event("2", "production_validation")).unwrap();
+        drop(conn);
+
+        let rows =
+            recent_events_of_types(&db, &["telemetry_evidence", "production_validation"], 50)
+                .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(
+            |r| r.event_type == "telemetry_evidence" || r.event_type == "production_validation"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_events_of_types_with_no_types_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let conn = open(&db).unwrap();
+        insert(&conn, &new_event("1", "dispatched")).unwrap();
+        drop(conn);
+
+        let rows = recent_events_of_types(&db, &[], 50).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]

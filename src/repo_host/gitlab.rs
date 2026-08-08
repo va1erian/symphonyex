@@ -590,6 +590,39 @@ impl RepoHost for GitlabRepoHost {
             }
         }
     }
+
+    /// GitLab's Pipelines API, filtered to `status=success` directly (unlike
+    /// GitHub's Deployments API, which needs a second call for its status) -- the
+    /// most recent successful pipeline run against `default_branch`.
+    async fn latest_successful_deploy(&self) -> Result<Option<super::DeployRecord>, String> {
+        let url = format!("{}/projects/{}/pipelines", self.base_url, self.project);
+        let req = self.client.get(&url).query(&[
+            ("ref", self.default_branch.as_str()),
+            ("status", "success"),
+            ("per_page", "1"),
+        ]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let pipelines: Vec<GlPipeline> = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(pipelines.into_iter().next().map(|p| super::DeployRecord {
+            sha: p.sha,
+            identifier: p.id.to_string(),
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GlPipeline {
+    id: u64,
+    sha: String,
 }
 
 #[async_trait]
@@ -1196,6 +1229,48 @@ mod tests {
             .close_thread("1")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_reports_the_sha_of_the_latest_successful_pipeline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fname/pipelines"))
+            .and(query_param("status", "success"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 55, "sha": "cafe123"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_GL_DEPLOY_1")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(
+            record,
+            Some(super::super::DeployRecord {
+                sha: "cafe123".to_string(),
+                identifier: "55".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_no_pipeline_has_succeeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fname/pipelines"))
+            .and(query_param("status", "success"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_GL_DEPLOY_2")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
     }
 
     use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
