@@ -547,7 +547,8 @@ fn extract_usage(v: &Value) -> Option<TokenUsage> {
 fn truncate(s: &str) -> String {
     const MAX: usize = 500;
     if s.len() > MAX {
-        format!("{}...", &s[..MAX])
+        let end = (0..=MAX).rfind(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        format!("{}...", &s[..end])
     } else {
         s.to_string()
     }
@@ -562,6 +563,16 @@ mod tests {
     fn extracts_text_blocks() {
         let v = json!({"message": {"content": [{"type": "text", "text": "hello"}]}});
         assert_eq!(extract_text(&v).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn truncate_does_not_panic_when_the_cut_lands_mid_char() {
+        // A 500-byte cut through this string would land inside a multi-byte
+        // character; truncate must back off to the nearest char boundary
+        // instead of panicking on a non-boundary slice index.
+        let s: String = std::iter::repeat('€').take(300).collect();
+        let t = truncate(&s);
+        assert!(t.ends_with("..."));
     }
 
     #[test]

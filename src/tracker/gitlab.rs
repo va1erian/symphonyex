@@ -241,10 +241,10 @@ impl GitlabTrackerAdapter {
 
     /// This adapter's managed labels currently on `issue` (used so `update_issue_state`
     /// only ever removes labels it owns, never a project's unrelated labels).
-    fn managed_labels(&self) -> std::collections::HashSet<&str> {
+    fn managed_labels(&self) -> std::collections::HashSet<String> {
         self.active_state_labels
             .values()
-            .map(String::as_str)
+            .map(|l| l.trim().to_lowercase())
             .collect()
     }
 

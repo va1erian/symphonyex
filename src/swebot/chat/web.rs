@@ -112,6 +112,7 @@ struct SendForm {
 
 #[derive(Deserialize)]
 struct ReadForm {
+    conv: i64,
     ids: Vec<i64>,
 }
 
@@ -273,7 +274,11 @@ async fn mark_read(
     State(state): State<WebState>,
     Json(form): Json<ReadForm>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    state.store.mark_read(&form.ids).map_err(internal)?;
+    require_web_conversation(&state, form.conv).await?;
+    state
+        .store
+        .mark_read(form.conv, &form.ids)
+        .map_err(internal)?;
     Ok(Json(json!({})))
 }
 
@@ -538,7 +543,7 @@ async function poll() {
     fetch(BASE + "/read", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ids: readIds})
+      body: JSON.stringify({conv: currentConv, ids: readIds})
     });
   }
 }
@@ -916,7 +921,7 @@ mod tests {
                     .method("POST")
                     .uri("/read")
                     .header("content-type", "application/json")
-                    .body(Body::from(format!(r#"{{"ids":[{a},{u}]}}"#)))
+                    .body(Body::from(format!(r#"{{"conv":{conv},"ids":[{a},{u}]}}"#)))
                     .unwrap(),
             )
             .await

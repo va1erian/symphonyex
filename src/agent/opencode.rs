@@ -716,7 +716,8 @@ fn extract_usage_leniently(v: &Value) -> Option<TokenUsage> {
 fn truncate(s: &str) -> String {
     const MAX: usize = 500;
     if s.len() > MAX {
-        format!("{}...", &s[..MAX])
+        let end = (0..=MAX).rfind(|&i| s.is_char_boundary(i)).unwrap_or(0);
+        format!("{}...", &s[..end])
     } else {
         s.to_string()
     }
