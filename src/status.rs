@@ -906,11 +906,7 @@ fn bucket_stages(rows: &[eventlog::EventRow]) -> Vec<StageBucket<'_>> {
 }
 
 fn timestamp_second(ts: &str) -> &str {
-    if ts.len() >= 19 {
-        &ts[..19]
-    } else {
-        ts
-    }
+    if ts.len() >= 19 { &ts[..19] } else { ts }
 }
 
 fn collapse_same_second(events: &[&eventlog::EventRow], base: &str) -> String {
@@ -3707,7 +3703,11 @@ mod tests {
         let html = render_transcript(&rows, "");
         assert!(html.contains("00:00:02"), "newer second: {html}");
         assert!(html.contains("00:00:01"), "older second: {html}");
-        assert_eq!(html.matches("class=\"msg").count(), 2, "two separate bubbles: {html}");
+        assert_eq!(
+            html.matches("class=\"msg").count(),
+            2,
+            "two separate bubbles: {html}"
+        );
     }
 
     #[test]
@@ -3721,14 +3721,21 @@ mod tests {
         assert!(html.contains("session_started"), "{html}");
         assert!(html.contains("&middot;"), "collapsed separator: {html}");
         let bubble_count = html.matches("class=\"msg").count();
-        assert_eq!(bubble_count, 1, "two same-second events → one collapsed bubble, got {bubble_count}: {html}");
+        assert_eq!(
+            bubble_count, 1,
+            "two same-second events → one collapsed bubble, got {bubble_count}: {html}"
+        );
         assert!(html.contains("00:00:01"), "{html}");
     }
 
     #[test]
     fn feats_assistant_never_collapsed_even_when_same_second() {
         let rows = vec![
-            event_row_at("other_message", Some("Here's the fix"), "2026-01-01T00:00:01.100Z"),
+            event_row_at(
+                "other_message",
+                Some("Here's the fix"),
+                "2026-01-01T00:00:01.100Z",
+            ),
             event_row_at("turn_started", None, "2026-01-01T00:00:01Z"),
         ];
         let html = render_transcript(&rows, "");
@@ -3803,7 +3810,11 @@ mod tests {
     fn feats_multi_stage_events_grouped_into_sections_with_heading_and_outcome() {
         let rows = vec![
             // Stage "review" finished
-            event_row_at("stage_finished", Some("review: blocked: 1 critical"), "2026-01-01T00:00:06Z"),
+            event_row_at(
+                "stage_finished",
+                Some("review: blocked: 1 critical"),
+                "2026-01-01T00:00:06Z",
+            ),
             event_row_at("other_message", Some("here's why"), "2026-01-01T00:00:05Z"),
             event_row_at("tool_call", Some("Read"), "2026-01-01T00:00:04Z"),
             // Stage "implement" started
@@ -3811,7 +3822,11 @@ mod tests {
             event_row_at("tool_call", Some("Edit"), "2026-01-01T00:00:02Z"),
             event_row_at("tool_call", Some("Write"), "2026-01-01T00:00:02Z"),
             // Stage "implement" finished
-            event_row_at("stage_finished", Some("implement: completed"), "2026-01-01T00:00:01Z"),
+            event_row_at(
+                "stage_finished",
+                Some("implement: completed"),
+                "2026-01-01T00:00:01Z",
+            ),
             // Stage "implement" started
             event_row_at("stage_started", Some("implement"), "2026-01-01T00:00:00Z"),
         ];
@@ -3822,8 +3837,14 @@ mod tests {
         assert!(html.contains("<h3>implement"), "{html}");
         assert!(html.contains("completed"), "{html}");
         // stage_started/stage_finished are not rendered as individual bubbles
-        assert!(!html.contains("stage_started"), "boundary markers excluded: {html}");
-        assert!(!html.contains("stage_finished"), "boundary markers excluded: {html}");
+        assert!(
+            !html.contains("stage_started"),
+            "boundary markers excluded: {html}"
+        );
+        assert!(
+            !html.contains("stage_finished"),
+            "boundary markers excluded: {html}"
+        );
         // Tool events inside stages are still present
         assert!(html.contains("tool_call"), "{html}");
         assert!(html.contains("Read"), "{html}");
@@ -3836,8 +3857,7 @@ mod tests {
         let implement_section = &html[implement_start..];
         let bubbles_in_implement = implement_section.matches("class=\"msg").count();
         assert_eq!(
-            bubbles_in_implement,
-            1,
+            bubbles_in_implement, 1,
             "implement's two same-second tools collapsed into one: {implement_section}"
         );
     }
@@ -3852,7 +3872,10 @@ mod tests {
         ];
         let html = render_transcript(&rows, "");
         assert!(html.contains("<h3>plan"), "stage section: {html}");
-        assert!(html.contains("turn_started"), "pre-stage event inside plan: {html}");
+        assert!(
+            html.contains("turn_started"),
+            "pre-stage event inside plan: {html}"
+        );
         assert!(html.contains("dispatched"), "{html}");
         assert!(html.contains("hello"), "{html}");
         // stage_started boundary not rendered as a bubble
@@ -3866,14 +3889,17 @@ mod tests {
             event_row_at("tool_call", Some("Read"), "2026-01-01T00:00:05.010Z"),
             event_row_at("stage_started", Some("plan"), "2026-01-01T00:00:04Z"),
             event_row_at("tool_call", Some("Write"), "2026-01-01T00:00:04Z"),
-            event_row_at("stage_started", Some("requirements"), "2026-01-01T00:00:03Z"),
+            event_row_at(
+                "stage_started",
+                Some("requirements"),
+                "2026-01-01T00:00:03Z",
+            ),
             event_row_at("tool_call", Some("Grep"), "2026-01-01T00:00:04Z"),
         ];
         let html = render_transcript(&rows, "");
         let bubbles = html.matches("class=\"msg").count();
         assert_eq!(
-            bubbles,
-            3,
+            bubbles, 3,
             "bucketed by stage: requirements→1 Grep, plan→1 Write, plan_stage→1 turn_started+Read collapsed: {html}"
         );
     }
