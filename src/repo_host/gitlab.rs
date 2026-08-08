@@ -245,7 +245,34 @@ impl GitlabRepoHost {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("evidence.png");
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        match self
+            .put_content_hashed(
+                issue_id,
+                file_name,
+                &bytes,
+                &format!("Attach evidence: {caption}"),
+            )
+            .await
+        {
+            Ok(raw_url) => ToolResult::ok(format!(
+                "Evidence uploaded. Paste this into the merge request body to embed it:\n\n![{caption}]({raw_url})"
+            )),
+            Err(e) => ToolResult::error(e),
+        }
+    }
+
+    /// GitLab counterpart of `github::GithubRepoHost::put_content_hashed` -- shared
+    /// upload plumbing behind both `attach_evidence` and `RepoHost::upload_artifact`
+    /// (AIR-9). See `attach_evidence`'s own doc comment for why the path is
+    /// content-hashed.
+    async fn put_content_hashed(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
         let short_hash = digest
             .iter()
             .take(8)
@@ -262,32 +289,27 @@ impl GitlabRepoHost {
             self.project,
             encode_project_path(&repo_path)
         );
-        let content_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let content_b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
         let req = self.client.post(&url).json(&json!({
             "branch": branch,
             "content": content_b64,
             "encoding": "base64",
-            "commit_message": format!("Attach evidence: {caption}"),
+            "commit_message": commit_message,
         }));
         match self.auth_headers(req).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let raw_url = format!(
-                    "{}/{}/-/raw/{branch}/{repo_path}",
-                    self.origin(),
-                    self.project.replace("%2F", "/")
-                );
-                ToolResult::ok(format!(
-                    "Evidence uploaded. Paste this into the merge request body to embed it:\n\n![{caption}]({raw_url})"
-                ))
-            }
+            Ok(resp) if resp.status().is_success() => Ok(format!(
+                "{}/{}/-/raw/{branch}/{repo_path}",
+                self.origin(),
+                self.project.replace("%2F", "/")
+            )),
             Ok(resp) => {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                ToolResult::error(format!(
+                Err(format!(
                     "POST {url} -> {status}: {text} (has this branch been pushed yet?)"
                 ))
             }
-            Err(e) => ToolResult::error(e.to_string()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -427,6 +449,34 @@ impl RepoHost for GitlabRepoHost {
         }
     }
 
+    async fn update_pr_body(&self, pr_number: u64, body: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/projects/{}/merge_requests/{pr_number}",
+            self.base_url, self.project
+        );
+        let req = self.client.put(&url).json(&json!({"description": body}));
+        match self.auth_headers(req).send().await {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!("PUT {url} -> {status}: {text}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn upload_artifact(
+        &self,
+        issue_id: &str,
+        file_name: &str,
+        bytes: &[u8],
+        commit_message: &str,
+    ) -> Result<String, String> {
+        self.put_content_hashed(issue_id, file_name, bytes, commit_message)
+            .await
+    }
+
     async fn list_open_symphony_prs(&self) -> Result<Vec<SymphonyPullRequest>, String> {
         let url = format!("{}/projects/{}/merge_requests", self.base_url, self.project);
         let req = self
@@ -540,6 +590,39 @@ impl RepoHost for GitlabRepoHost {
             }
         }
     }
+
+    /// GitLab's Pipelines API, filtered to `status=success` directly (unlike
+    /// GitHub's Deployments API, which needs a second call for its status) -- the
+    /// most recent successful pipeline run against `default_branch`.
+    async fn latest_successful_deploy(&self) -> Result<Option<super::DeployRecord>, String> {
+        let url = format!("{}/projects/{}/pipelines", self.base_url, self.project);
+        let req = self.client.get(&url).query(&[
+            ("ref", self.default_branch.as_str()),
+            ("status", "success"),
+            ("per_page", "1"),
+        ]);
+        let resp = self
+            .auth_headers(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("GET {url} -> {status}: {text}"));
+        }
+        let pipelines: Vec<GlPipeline> = resp.json().await.map_err(|e| e.to_string())?;
+        Ok(pipelines.into_iter().next().map(|p| super::DeployRecord {
+            sha: p.sha,
+            identifier: p.id.to_string(),
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GlPipeline {
+    id: u64,
+    sha: String,
 }
 
 #[async_trait]
@@ -910,6 +993,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_pr_body_puts_just_the_description() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/projects/group%2Fname/merge_requests/9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "iid": 9, "web_url": "https://gitlab.com/group/name/-/merge_requests/9"
+            })))
+            .mount(&server)
+            .await;
+
+        set_token("SYMPHONY_TEST_GL_UPDATE_BODY", "t");
+        let h = GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/group/name.git".to_string(),
+            api_base_url: Some(server.uri()),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_GL_UPDATE_BODY".to_string()),
+            pull_request: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let result = h.update_pr_body(9, "new body").await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn upload_artifact_returns_the_raw_content_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/projects/group%2Fname/repository/files/.*$"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"file_path": "x"})))
+            .mount(&server)
+            .await;
+
+        set_token("SYMPHONY_TEST_GL_UPLOAD_ARTIFACT", "t");
+        let h = GitlabRepoHost::new(&RepoConfig {
+            url: "https://gitlab.com/group/name.git".to_string(),
+            api_base_url: Some(server.uri()),
+            default_branch: "main".to_string(),
+            token_env: Some("SYMPHONY_TEST_GL_UPLOAD_ARTIFACT".to_string()),
+            pull_request: true,
+            release_evidence: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let url = h
+            .upload_artifact(
+                "42",
+                "bundle.json",
+                b"{}",
+                "Persist release evidence bundle",
+            )
+            .await
+            .unwrap();
+        assert!(url.contains("/group/name/-/raw/issue-42/"));
+        assert!(url.ends_with("bundle.json"));
+    }
+
+    #[tokio::test]
     async fn lists_only_symphony_authored_open_mrs() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1086,6 +1229,48 @@ mod tests {
             .close_thread("1")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_reports_the_sha_of_the_latest_successful_pipeline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fname/pipelines"))
+            .and(query_param("status", "success"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": 55, "sha": "cafe123"}
+            ])))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_GL_DEPLOY_1")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(
+            record,
+            Some(super::super::DeployRecord {
+                sha: "cafe123".to_string(),
+                identifier: "55".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_successful_deploy_is_none_when_no_pipeline_has_succeeded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fname/pipelines"))
+            .and(query_param("status", "success"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let record = host(&server, "SYMPHONY_TEST_GL_DEPLOY_2")
+            .latest_successful_deploy()
+            .await
+            .unwrap();
+        assert_eq!(record, None);
     }
 
     use wiremock::matchers::{body_string_contains, method, path, path_regex, query_param};
