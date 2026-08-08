@@ -77,6 +77,13 @@ struct RunningEntry {
     last_event: Option<String>,
     last_event_at: Option<Instant>,
     last_message: Option<String>,
+    /// The last genuine assistant notification (from `notification`-type events), never
+    /// overwritten by housekeeping noise (`other_message`, `rate_limit_event`, etc.).
+    /// Distinct from `last_tool_call` -- both survive independently.
+    last_notification: Option<String>,
+    /// The last tool call name (from `tool_call` events). Independent of
+    /// `last_notification` -- a card shows both at once, not whichever arrived last.
+    last_tool_call: Option<String>,
     tokens: TokenUsage,
     turn_count: u32,
     tool_call_count: u32,
@@ -675,6 +682,8 @@ fn build_status_snapshot(state: &OrchestratorState) -> status::StatusSnapshot {
             tool_call_count: e.tool_call_count,
             last_event: e.last_event.clone(),
             last_message: e.last_message.clone(),
+            last_notification: e.last_notification.clone(),
+            last_tool_call: e.last_tool_call.clone(),
             stage: e.current_stage.clone(),
             budget_note: e.budget_note.clone(),
         })
@@ -904,6 +913,8 @@ async fn dispatch_issue(
             last_event: None,
             last_event_at: None,
             last_message: None,
+            last_notification: None,
+            last_tool_call: None,
             tokens: TokenUsage::default(),
             turn_count: 0,
             tool_call_count: 0,
@@ -1561,8 +1572,16 @@ async fn handle_msg(
                 if !is_full_report {
                     e.last_event = Some(event.event.clone());
                     e.last_event_at = Some(Instant::now());
-                    if let Some(m) = &event.message {
-                        e.last_message = Some(m.clone());
+                    match event.event.as_str() {
+                        "notification" => {
+                            if let Some(m) = &event.message {
+                                e.last_notification = Some(m.clone());
+                            }
+                        }
+                        "tool_call" => {
+                            e.last_tool_call = event.message.clone();
+                        }
+                        _ => {}
                     }
                 }
                 let (identifier, title) = (e.issue.identifier.clone(), e.issue.title.clone());
@@ -4919,6 +4938,8 @@ mod tests {
                 last_event: None,
                 last_event_at: None,
                 last_message: None,
+                last_notification: None,
+                last_tool_call: None,
                 tokens: TokenUsage::default(),
                 turn_count: 0,
                 tool_call_count: 0,
@@ -4955,6 +4976,104 @@ mod tests {
             retry.attempt, 1,
             "attempt must not escalate for a rate-limit failure (not the ticket's fault)"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_and_tool_call_survive_independently_through_housekeeping_noise() {
+        let dir = tempdir().unwrap();
+        let tracker_dir = dir.path().join("issues");
+        std::fs::create_dir_all(&tracker_dir).unwrap();
+        let issue_id = "42".to_string();
+        let mut state = OrchestratorState::default();
+        let shared = Arc::new(test_shared("", dir.path().to_path_buf(), &tracker_dir));
+
+        let issue = Issue {
+            id: issue_id.clone(),
+            native_ref: None,
+            identifier: "FEAT-7".to_string(),
+            title: "test".to_string(),
+            description: None,
+            priority: None,
+            state: "todo".to_string(),
+            branch_name: None,
+            url: None,
+            assignee_id: None,
+            labels: vec![],
+            blocked_by: vec![],
+            dispatchable: true,
+            created_at: None,
+            updated_at: None,
+        };
+        let handle = tokio::spawn(async {});
+        state.running.insert(
+            issue_id.clone(),
+            RunningEntry {
+                issue,
+                started_at: Instant::now(),
+                session_id: String::new(),
+                last_event: None,
+                last_event_at: None,
+                last_message: None,
+                last_notification: None,
+                last_tool_call: None,
+                tokens: TokenUsage::default(),
+                turn_count: 0,
+                tool_call_count: 0,
+                handle,
+                retry_attempt: None,
+                current_stage: None,
+                budget_note: None,
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // notification arrives
+        handle_msg(
+            &shared,
+            &mut state,
+            &tx,
+            OrchMsg::AgentEvent {
+                issue_id: issue_id.clone(),
+                event: AgentEvent::new("notification").with_message("thinking through the design"),
+            },
+        )
+        .await;
+        // tool_call arrives -- must not clobber the notification
+        handle_msg(
+            &shared,
+            &mut state,
+            &tx,
+            OrchMsg::AgentEvent {
+                issue_id: issue_id.clone(),
+                event: AgentEvent::new("tool_call").with_message("Read"),
+            },
+        )
+        .await;
+        // housekeeping noise -- must not clobber either
+        handle_msg(
+            &shared,
+            &mut state,
+            &tx,
+            OrchMsg::AgentEvent {
+                issue_id: issue_id.clone(),
+                event: AgentEvent::new("other_message").with_message("rate_limit_event"),
+            },
+        )
+        .await;
+
+        let entry = state.running.get(&issue_id).unwrap();
+        assert_eq!(
+            entry.last_notification.as_deref(),
+            Some("thinking through the design"),
+            "notification survives tool_call + housekeeping"
+        );
+        assert_eq!(
+            entry.last_tool_call.as_deref(),
+            Some("Read"),
+            "tool call survives housekeeping"
+        );
+        // `last_event` still tracks the most recent event of any kind
+        assert_eq!(entry.last_event.as_deref(), Some("other_message"));
     }
 
     #[tokio::test]

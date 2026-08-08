@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-7
 title: Track the last notification and last tool call separately on the running card
-state: todo
+state: done
 priority: 2
 labels: [dashboard, ux, orchestrator]
 dispatchable: true
