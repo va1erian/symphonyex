@@ -65,6 +65,10 @@ pub struct RunningRow {
     pub tool_call_count: u32,
     pub last_event: Option<String>,
     pub last_message: Option<String>,
+    /// Last genuine assistant notification, never clobbered by housekeeping noise.
+    pub last_notification: Option<String>,
+    /// Last tool call name, independent of `last_notification`.
+    pub last_tool_call: Option<String>,
     /// Current pipeline stage id (`pipeline.stages[].id`), when the AI Roadmap delivery
     /// pipeline (`pipeline.enabled`) is on for this project. `None` for the legacy
     /// single-stage path, or before the first stage has started.
@@ -483,11 +487,8 @@ fn render_fragment(s: &StatusSnapshot, base: &str, eventlog_db_path: &Path) -> S
 }
 
 fn running_card(r: &RunningRow, base: &str) -> String {
-    let message = r.last_message.as_deref().unwrap_or("");
-    // Only hint "click to expand" when the message is actually long enough that the
-    // 4.5-line clamp (`.msg`'s `max-height` in web::STYLE) would clip it -- showing the
-    // hint on a one-line message would be misleading, since expanding it changes nothing.
-    let expandable_attr = if message.len() > 140 {
+    let notification = r.last_notification.as_deref().unwrap_or("");
+    let expandable_attr = if notification.len() > 140 {
         " data-expandable"
     } else {
         ""
@@ -497,8 +498,6 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         .as_deref()
         .map(|s| format!(r#"<div class="row"><b>stage</b> {}</div>"#, escape(s)))
         .unwrap_or_default();
-    // AIR-11: the "why" for whatever budget/stop-condition decision most recently fired
-    // against this cycle -- an explanation surface, not just a pass/fail badge.
     let budget_row = r
         .budget_note
         .as_deref()
@@ -509,6 +508,11 @@ fn running_card(r: &RunningRow, base: &str) -> String {
             )
         })
         .unwrap_or_default();
+    let tool_call_row = r
+        .last_tool_call
+        .as_deref()
+        .map(|t| format!(r#"<div class="row"><b>last tool</b> {}</div>"#, escape(t)))
+        .unwrap_or_default();
     format!(
         r#"<div class="card" id="run-{id_attr}">
   <h2><a href="{base}/events?issue={issue_link}">{identifier}</a></h2>
@@ -518,7 +522,8 @@ fn running_card(r: &RunningRow, base: &str) -> String {
   {stage_row}
   {budget_row}
   <div class="row"><b>last event</b> {event}</div>
-  <div class="msg"{expandable_attr}>{message}</div>
+  {tool_call_row}
+  <div class="msg"{expandable_attr}>{notification}</div>
 </div>"#,
         id_attr = escape(&r.issue_id),
         base = base,
@@ -532,7 +537,8 @@ fn running_card(r: &RunningRow, base: &str) -> String {
         stage_row = stage_row,
         budget_row = budget_row,
         event = escape(r.last_event.as_deref().unwrap_or("-")),
-        message = escape(message),
+        tool_call_row = tool_call_row,
+        notification = escape(notification),
     )
 }
 
@@ -3355,6 +3361,8 @@ mod tests {
                 tool_call_count: 0,
                 last_event: None,
                 last_message: None,
+                last_notification: None,
+                last_tool_call: None,
                 stage: None,
                 budget_note: None,
             }],
@@ -3602,6 +3610,8 @@ mod tests {
             tool_call_count: 0,
             last_event: None,
             last_message: None,
+            last_notification: None,
+            last_tool_call: None,
             stage: None,
             budget_note: None,
         };
@@ -3681,6 +3691,8 @@ mod tests {
             tool_call_count: 0,
             last_event: None,
             last_message: None,
+            last_notification: None,
+            last_tool_call: None,
             stage: None,
             budget_note: None,
         };

@@ -1,7 +1,7 @@
 ---
 identifier: FEAT-8
 title: Let the Planner reproduce an issue by running the app and writing a failing test, then hand that test to the Developer as a starting snippet
-state: todo
+state: done
 priority: 2
 labels: [pipeline, planner, developer, ai-roadmap]
 dispatchable: true
